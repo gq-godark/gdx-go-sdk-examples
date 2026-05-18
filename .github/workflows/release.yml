@@ -123,16 +123,16 @@ jobs:
 
           echo "=== file ==="
           file ./quickstart
-          file ./full_trader
+          file ./full_trader_example
 
           echo "=== ldd ==="
           # Static-ish Go binaries: ldd typically prints "not a dynamic
           # executable" which is fine. We DO require x86_64 ELF and
           # no unresolved deps.
-          ldd ./quickstart  || true
-          ldd ./full_trader || true
+          ldd ./quickstart           || true
+          ldd ./full_trader_example  || true
 
-          for bin in ./quickstart ./full_trader; do
+          for bin in ./quickstart ./full_trader_example; do
             if ! file "$bin" | grep -E 'ELF 64-bit LSB .*x86-64' >/dev/null; then
               echo "::error::$bin is not an ELF 64-bit Linux x86_64 binary"
               exit 1
@@ -162,10 +162,10 @@ jobs:
           export GOMODCACHE="$GOPATH/pkg/mod"
 
           go build ./examples/quickstart
-          go build ./examples/full_trader
+          go build ./examples/full_trader_example
 
           file ./quickstart
-          file ./full_trader
+          file ./full_trader_example
           echo "Source-build smoke OK: bundle rebuilds cleanly against bundled sdk/."
 
       - name: Upload zip as workflow artifact

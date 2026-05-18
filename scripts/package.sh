@@ -18,7 +18,7 @@
 #   5. Builds release binaries via `go build` against the vendored sdk/.
 #      The parity check above guarantees vendored sdk/ is bit-equal to
 #      upstream for every file actually compiled, so the resulting
-#      binaries are reproducible from the public upstream pin.
+#      binaries are reproducible from the recorded upstream pin.
 #   6. Stages the binaries + example sources + vendored sdk/ + top-level
 #      go.mod / go.sum + recipient docs from bundle/, then zips them.
 #      Recipients can either run the prebuilt binaries directly or
@@ -27,7 +27,7 @@
 # Output layout:
 #   <DIST_NAME>/
 #   |-- quickstart                 (prebuilt static-ish ELF, x86_64 Linux)
-#   |-- full_trader                (prebuilt)
+#   |-- full_trader_example        (prebuilt)
 #   |-- go.mod                     (workspace; godark = ./sdk)
 #   |-- go.sum
 #   |-- .env.example
@@ -35,7 +35,7 @@
 #   |-- SDK_REFERENCE.md           (from bundle/SDK_REFERENCE.md)
 #   |-- examples/
 #   |   |-- quickstart/main.go
-#   |   |-- full_trader/main.go
+#   |   |-- full_trader_example/main.go
 #   |   `-- internal/envloader/envloader.go
 #   `-- sdk/
 #       |-- UPSTREAM_REF           (the upstream commit the bundle was cut from)
@@ -71,7 +71,7 @@ if [[ -z "$PINNED_REF" ]]; then
 fi
 
 for required in bundle/README.md bundle/SDK_REFERENCE.md .env.example \
-                examples/quickstart/main.go examples/full_trader/main.go \
+                examples/quickstart/main.go examples/full_trader_example/main.go \
                 examples/internal/envloader/envloader.go; do
   if [[ ! -f "${REPO_ROOT}/${required}" ]]; then
     echo "error: required source file missing: ${required}" >&2
@@ -160,13 +160,13 @@ fi
 echo "Parity check passed: sdk/ matches $UPSTREAM_SRC"
 
 # ---- build release binaries ----------------------------------------------
-echo "Building release binaries (quickstart + full_trader)..."
+echo "Building release binaries (quickstart + full_trader_example)..."
 mkdir -p "$REPO_ROOT/build"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/quickstart"   ./examples/quickstart
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/full_trader"  ./examples/full_trader
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/quickstart"            ./examples/quickstart
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/full_trader_example"   ./examples/full_trader_example
 
 QUICKSTART_BIN="$REPO_ROOT/build/quickstart"
-FULL_TRADER_BIN="$REPO_ROOT/build/full_trader"
+FULL_TRADER_BIN="$REPO_ROOT/build/full_trader_example"
 
 for bin in "$QUICKSTART_BIN" "$FULL_TRADER_BIN"; do
   if [[ ! -x "$bin" ]]; then
@@ -181,12 +181,12 @@ DEST="$STAGING_DIR/$DIST_NAME"
 mkdir -p "$DEST"
 
 echo "Staging distribution at $DEST ..."
-mkdir -p "$DEST/examples/quickstart" "$DEST/examples/full_trader" \
+mkdir -p "$DEST/examples/quickstart" "$DEST/examples/full_trader_example" \
          "$DEST/examples/internal/envloader" "$DEST/sdk"
 
 # Prebuilt binaries.
 cp "$QUICKSTART_BIN"                          "$DEST/quickstart"
-cp "$FULL_TRADER_BIN"                         "$DEST/full_trader"
+cp "$FULL_TRADER_BIN"                         "$DEST/full_trader_example"
 
 # Recipient docs come from bundle/, never from the repo-root copies.
 cp "${REPO_ROOT}/.env.example"                "$DEST/.env.example"
@@ -199,9 +199,9 @@ cp "${REPO_ROOT}/go.mod"                      "$DEST/go.mod"
 cp "${REPO_ROOT}/go.sum"                      "$DEST/go.sum"
 
 # Example sources.
-cp "${REPO_ROOT}/examples/quickstart/main.go"            "$DEST/examples/quickstart/main.go"
-cp "${REPO_ROOT}/examples/full_trader/main.go"           "$DEST/examples/full_trader/main.go"
-cp "${REPO_ROOT}/examples/internal/envloader/envloader.go" "$DEST/examples/internal/envloader/envloader.go"
+cp "${REPO_ROOT}/examples/quickstart/main.go"                       "$DEST/examples/quickstart/main.go"
+cp "${REPO_ROOT}/examples/full_trader_example/main.go"              "$DEST/examples/full_trader_example/main.go"
+cp "${REPO_ROOT}/examples/internal/envloader/envloader.go"          "$DEST/examples/internal/envloader/envloader.go"
 
 # Vendored godark module -- mirror of $REPO_ROOT/sdk/ minus the parity-
 # checked drops. Use cp -a to keep .go files and the proto bindings tree.
@@ -227,13 +227,13 @@ fi
 # Every required path must be present.
 for required in \
   "${DIST_NAME}/quickstart" \
-  "${DIST_NAME}/full_trader" \
+  "${DIST_NAME}/full_trader_example" \
   "${DIST_NAME}/README\\.md" \
   "${DIST_NAME}/SDK_REFERENCE\\.md" \
   "${DIST_NAME}/go\\.mod" \
   "${DIST_NAME}/\\.env\\.example" \
   "${DIST_NAME}/examples/quickstart/main\\.go" \
-  "${DIST_NAME}/examples/full_trader/main\\.go" \
+  "${DIST_NAME}/examples/full_trader_example/main\\.go" \
   "${DIST_NAME}/sdk/UPSTREAM_REF" \
   "${DIST_NAME}/sdk/go\\.mod" \
   "${DIST_NAME}/sdk/client\\.go"; do

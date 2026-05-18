@@ -1,88 +1,113 @@
-# GoDark Go SDK -- MM Distribution
+# GoDark Go SDK
 
-This bundle is a self-contained darkpool trading distribution for the GoDark
-DEX. Two ready-to-run example binaries are included, plus the Go source
-they were built from and the vendored `godark` module so you can rebuild
-locally with only a standard Go toolchain (`go 1.22+`).
+This package provides two prebuilt market-maker examples for the GoDark Go
+SDK, **plus their full source tree and the vendored `godark` module** so you
+can rebuild the examples or scaffold your own bot directly against the
+shipped sources — no extra registries required, no `protoc` required (the
+SDK ships pre-generated protobuf bindings under `sdk/proto/`).
 
-```
-.
-├── quickstart                 prebuilt -- place + cancel happy path
-├── full_trader                prebuilt -- subscribe + place + modify + cancel + push drain
-├── go.mod                     workspace manifest (`replace godark => ./sdk`)
-├── go.sum
-├── .env.example
-├── README.md                  (this file)
-├── SDK_REFERENCE.md           API reference for the godark package
-├── examples/
-│   ├── quickstart/main.go
-│   ├── full_trader/main.go
-│   └── internal/envloader/    .env loader + OrderError pretty-print
-└── sdk/
-    ├── UPSTREAM_REF           pinned upstream commit
-    ├── go.mod
-    ├── shared/symbols.json
-    ├── proto/                 pre-generated protobuf bindings
-    └── *.go                   godark package source
-```
+Supported order types in this distribution: `MARKET`, `LIMIT`.
 
-## 1. Configure credentials
+## Package contents
+
+- `quickstart`, `full_trader_example` — **prebuilt Linux x86_64 binaries**
+  (run these directly with no toolchain installed)
+- `examples/` — example **source files** (`quickstart/main.go`,
+  `full_trader_example/main.go`, `internal/envloader/envloader.go`)
+- `sdk/` — **vendored `godark` module** source (with pre-generated
+  protobuf bindings under `sdk/proto/`); `sdk/UPSTREAM_REF` records the
+  upstream commit the binaries were built from
+- `go.mod`, `go.sum` — workspace manifest wiring
+  `replace github.com/gq-godark/gdx-go-sdk => ./sdk`, ready for
+  `go build ./examples/...`
+- `README.md`, `SDK_REFERENCE.md` — recipient docs
+- `.env.example` — environment template
+
+## 1) Prerequisites
+
+To **run the prebuilt binaries**, you only need the Linux runtime libs:
+
+| Item        | Requirement                                                                   |
+|-------------|-------------------------------------------------------------------------------|
+| OS / arch   | Linux x86_64 (built on Ubuntu, glibc ≥ 2.18)                                  |
+| TLS runtime | system OpenSSL / libssl is **not** required — `CGO_ENABLED=0` static-ish ELFs |
+| Other       | `libc` / `libpthread` (standard system libraries)                             |
+
+To **rebuild from source** (or build your own bot against the bundled
+`sdk/`), additionally install:
+
+| Item    | Requirement                                                                       |
+|---------|-----------------------------------------------------------------------------------|
+| Go      | stable ≥ 1.22 (`https://go.dev/dl/`)                                              |
+| Network | a Go module proxy (default `proxy.golang.org`) for the standard runtime modules (`coder/websocket`, `google/uuid`, `golang.org/x/crypto`, `google.golang.org/protobuf`); the `godark` module itself is bundled |
+
+> **macOS / Windows / aarch64?** The prebuilt binaries are Linux x86_64 only,
+> but the source-build path works on any platform Go supports — unzip this
+> bundle and run `go build ./examples/...`.
+
+## 2) Create testnet credentials
+
+1. Open the testnet frontend: `https://app.godark-dex.com`
+2. Create an account using email sign-up.
+3. Fund the account using the faucet: `https://faucet.godark-dex.com`
+4. In the frontend, go to **Settings → API Key Management** and click
+   **Create API Key**.
+
+## 3) Configure environment
+
+Copy `.env.example` to `.env` and set:
+
+- `GODARK_API_KEY_ID`
+- `GODARK_API_SECRET`
 
 ```bash
 cp .env.example .env
-# then edit .env to fill in:
-#   GODARK_API_KEY_ID=gdk_...
-#   GODARK_API_SECRET=...
-#   # GODARK_EDGE_URL=wss://api.godark-dex.com   (optional override)
+$EDITOR .env       # fill in your testnet creds
 ```
 
-Credentials come from your GoDark dashboard. The OS environment always
-wins over `.env`, so CI / container deployments can pass them in via
-`-e GODARK_API_KEY_ID=... -e GODARK_API_SECRET=...` etc.
+Optional override:
 
-## 2. Run the prebuilt binaries
+- `GODARK_EDGE_URL` — defaults to `wss://api.godark-dex.com` if unset.
 
-The prebuilt binaries are static-ish Linux x86_64 ELFs (`CGO_ENABLED=0`)
-that link only against the resolver and standard system libs.
+The OS environment always wins over `.env`.
+
+## 4) Run quickstart
+
+Run the prebuilt binary directly:
 
 ```bash
 ./quickstart
-./full_trader
 ```
 
-`quickstart` places a far-from-mid SELL and immediately cancels it -- it's
-the smallest possible round-trip against the encrypted trading API.
-
-`full_trader` walks through the full lifecycle: subscribe to private
-order + position streams, place a LIMIT BUY, modify its price, place +
-cancel a SELL, cancel the BUY, then drain all the buffered push streams
-(positions snapshots, system health, balance updates, margin alerts,
-funding rates, settlement batches) before disconnecting.
-
-## 3. Rebuild from source (optional)
-
-The bundle ships every Go file the prebuilt binaries were compiled from,
-so you can rebuild against the bundled `sdk/` without network access to
-the upstream repo:
+Or the full trader example:
 
 ```bash
-go build ./examples/quickstart   # produces ./quickstart
-go build ./examples/full_trader  # produces ./full_trader
+./full_trader_example
 ```
 
-The `replace github.com/gq-godark/gdx-go-sdk => ./sdk` directive in
-`go.mod` ensures `go build` resolves the SDK from the bundled vendored
-copy (no GOPROXY hit required for the godark module itself; transitive
-dependencies like `github.com/coder/websocket` come from `go.sum` and your
-configured GOPROXY).
+To rebuild from the included sources instead (e.g. on a non-Linux host or
+after editing `examples/*/main.go`):
 
-## 4. Use the SDK in your own code
+```bash
+go build ./examples/quickstart            # produces ./quickstart
+go build ./examples/full_trader_example   # produces ./full_trader_example
+```
 
-Copy the bundled `sdk/` into your project (or unpack the bundle next to
-your repository) and add the same `replace` directive to your own
-`go.mod`:
+The bundled `go.mod` already wires
+`replace github.com/gq-godark/gdx-go-sdk => ./sdk`, so the build resolves
+the `godark` module entirely from the bundled vendored copy; `go` only
+fetches the third-party runtime modules (`coder/websocket`,
+`google/uuid`, `golang.org/x/crypto`, `google.golang.org/protobuf`) from
+the configured GOPROXY.
+
+## Go integration (your own bot)
+
+The bundle includes a vendored `godark` module under `sdk/`. To build your
+own bot against the same SDK revision, point your `go.mod` at the bundled
+module via a path-based `replace` directive:
 
 ```go
+// go.mod — your own bot
 module github.com/your-org/your-mm-bot
 
 go 1.22
@@ -92,29 +117,61 @@ require github.com/gq-godark/gdx-go-sdk v0.1.0
 replace github.com/gq-godark/gdx-go-sdk => ./vendor/godark/sdk
 ```
 
-Then import:
+(Or copy `sdk/` into your own project and reference it as
+`replace ... => ./sdk`.)
+
+Then in `cmd/bot/main.go`:
 
 ```go
-import "github.com/gq-godark/gdx-go-sdk"
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+
+    "github.com/gq-godark/gdx-go-sdk"
+)
+
+func main() {
+    client, err := godark.NewClient(godark.ClientConfig{
+        APIKeyID:  os.Getenv("GODARK_API_KEY_ID"),
+        APISecret: os.Getenv("GODARK_API_SECRET"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    ctx := context.Background()
+    if err := client.Connect(ctx); err != nil {
+        log.Fatal(err)
+    }
+    defer client.Disconnect()
+
+    ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
+        Symbol:    "BTC-USDC-PERP",
+        Side:      godark.SideSell,
+        OrderType: godark.OrderTypeLimit,
+        Price:     999_999,
+        Quantity:  0.01,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if _, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP"); err != nil {
+        log.Fatal(err)
+    }
+}
 ```
 
-See `SDK_REFERENCE.md` for the full API surface (trading client, REST
-client, market-data client, push streams, error types).
+If you'd rather pin against the upstream `gdx-go-sdk` repository directly
+(useful if you're tracking a moving branch rather than a release pin), the
+bundled `sdk/UPSTREAM_REF` file records the exact commit this distribution
+was built from:
 
-## 5. Pinned upstream
+```go
+replace github.com/gq-godark/gdx-go-sdk => github.com/gq-godark/gdx-go-sdk <contents of sdk/UPSTREAM_REF>
+```
 
-The Go sources under `sdk/` came from a specific commit of the public
-`gq-godark/gdx-go-sdk` repository. The exact SHA is recorded in
-`sdk/UPSTREAM_REF`; the release pipeline parity-checks the vendored copy
-against that pin on every build so this bundle is reproducible from
-upstream source.
-
-## 6. Support
-
-If you hit a wire-format issue, a session/handshake error, or a missing
-SDK feature, please contact your GoDark Capital integrator contact with:
-
-  - the contents of `sdk/UPSTREAM_REF` (so we know which SDK revision)
-  - the operation that failed
-  - any error code or symbolic reason the SDK surfaced
-  - whether you can reproduce against `quickstart` or `full_trader`
+See `SDK_REFERENCE.md` for the full client API.

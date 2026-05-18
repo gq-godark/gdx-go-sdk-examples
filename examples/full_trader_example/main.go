@@ -13,9 +13,9 @@
 //
 // Run with:
 //
-//	go run ./examples/full_trader
+//	go run ./examples/full_trader_example
 //	# or, against the prebuilt bundle binary:
-//	./full_trader
+//	./full_trader_example
 package main
 
 import (

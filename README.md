@@ -22,7 +22,7 @@ gdx-go-sdk-examples/
 │   └── SDK_REFERENCE.md                  ships in the zip as ./SDK_REFERENCE.md
 ├── examples/
 │   ├── quickstart/main.go                place + cancel
-│   ├── full_trader/main.go               subscribe + place + modify + cancel
+│   ├── full_trader_example/main.go       subscribe + place + modify + cancel
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
 │   ├── refresh_sdk.sh                    vendor a gdx-go-sdk checkout into sdk/
@@ -44,7 +44,7 @@ gdx-go-sdk-examples/
 go build ./examples/...                  # compile both example binaries
 go vet ./...                             # static checks
 go run ./examples/quickstart             # run quickstart against testnet
-go run ./examples/full_trader            # run full trader against testnet
+go run ./examples/full_trader_example    # run full trader against testnet
 ```
 
 The `replace github.com/gq-godark/gdx-go-sdk => ./sdk` directive in
@@ -82,7 +82,7 @@ local hand-edits to `sdk/` can never silently make it into a release zip.
   2. runs `scripts/package.sh`, which:
      - parity-checks `sdk/` against the upstream pin,
      - builds the two example binaries (`CGO_ENABLED=0 GOOS=linux GOARCH=amd64`),
-     - stages everything into `<bundle>/{quickstart, full_trader, examples/, sdk/, README.md, SDK_REFERENCE.md, go.mod, go.sum, .env.example}`,
+     - stages everything into `<bundle>/{quickstart, full_trader_example, examples/, sdk/, README.md, SDK_REFERENCE.md, go.mod, go.sum, .env.example}`,
      - zips the staging dir.
   3. recipient-smoke-tests the zip: `unzip` into a clean dir, run `file`
      + `ldd` against the prebuilt binaries (must be static-ish Linux x86_64
