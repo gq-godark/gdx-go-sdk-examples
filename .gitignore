@@ -1,0 +1,9 @@
+.env
+*.zip
+/dist/
+/bin/
+/build/
+*.test
+*.out
+.idea/
+.vscode/

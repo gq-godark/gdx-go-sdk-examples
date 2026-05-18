@@ -1,0 +1,226 @@
+// Package rest is the HTTP transport for the GoDark REST API at /api/v1.
+//
+// Mirrors the python and rust reference implementations: every endpoint
+// returns a docs envelope `{ code, data, message?, request_id? }` which the
+// wrapper unwraps; non-zero `code` becomes a typed [EnvelopeError]. All
+// authenticated endpoints take a bearer token issued by `/auth/token`.
+package rest
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// EnvelopeError represents a docs envelope with code != 0.
+type EnvelopeError struct {
+	Code      int
+	Message   string
+	RequestID string
+}
+
+func (e *EnvelopeError) Error() string {
+	return fmt.Sprintf("rest envelope error code=%d message=%q", e.Code, e.Message)
+}
+
+// Transport is a thin net/http wrapper that asserts the docs envelope shape.
+type Transport struct {
+	base    string
+	client  *http.Client
+	timeout time.Duration
+}
+
+// New returns a Transport rooted at base (e.g. "https://api.godark-dex.com").
+// Pass nil for client to use a default 30s-timeout http.Client.
+func New(base string, client *http.Client) *Transport {
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	return &Transport{
+		base:    strings.TrimRight(base, "/"),
+		client:  client,
+		timeout: 30 * time.Second,
+	}
+}
+
+// BaseURL returns the configured root URL (no trailing slash).
+func (t *Transport) BaseURL() string { return t.base }
+
+// SetClient swaps the underlying http.Client (useful for tests that need a
+// transport with a custom transport.RoundTripper or shorter timeout).
+func (t *Transport) SetClient(c *http.Client) { t.client = c }
+
+// -----------------------------------------------------------------------
+// Generic verbs
+// -----------------------------------------------------------------------
+
+func (t *Transport) doJSON(ctx context.Context, method, path string, bearer string, body any, query url.Values) (map[string]any, error) {
+	u := t.base + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal body: %w", err)
+		}
+		reader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, u, reader)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, u, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("%s %s: server status %d: %s", method, u, resp.StatusCode, string(respBody))
+	}
+	if resp.StatusCode >= 400 && len(respBody) == 0 {
+		return nil, fmt.Errorf("%s %s: status %d (empty body)", method, u, resp.StatusCode)
+	}
+
+	var env map[string]any
+	if err := json.Unmarshal(respBody, &env); err != nil {
+		return nil, fmt.Errorf("%s %s: bad JSON (status %d): %w", method, u, resp.StatusCode, err)
+	}
+	return unwrap(env)
+}
+
+func unwrap(env map[string]any) (map[string]any, error) {
+	code := envCode(env)
+	if code != 0 {
+		msg, _ := env["message"].(string)
+		reqID, _ := env["request_id"].(string)
+		return nil, &EnvelopeError{Code: code, Message: msg, RequestID: reqID}
+	}
+	data, ok := env["data"].(map[string]any)
+	if !ok {
+		reqID, _ := env["request_id"].(string)
+		return nil, &EnvelopeError{Code: 1500, Message: "missing data object", RequestID: reqID}
+	}
+	return data, nil
+}
+
+func envCode(env map[string]any) int {
+	switch v := env["code"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	}
+	return 1
+}
+
+// -----------------------------------------------------------------------
+// Endpoints
+// -----------------------------------------------------------------------
+
+// TimePublic calls `GET /api/v1/time`.
+func (t *Transport) TimePublic(ctx context.Context) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/time", "", nil, nil)
+}
+
+// AuthTokenClientCredentials performs the docs RFC-6749 client-credentials
+// grant against `/api/v1/auth/token`.
+func (t *Transport) AuthTokenClientCredentials(ctx context.Context, clientID, clientSecret, passphrase string) (map[string]any, error) {
+	body := map[string]any{
+		"grant_type":    "client_credentials",
+		"client_id":     clientID,
+		"client_secret": clientSecret,
+	}
+	if passphrase != "" {
+		body["passphrase"] = passphrase
+	}
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token", "", body, nil)
+}
+
+// AuthTokenLegacy issues `POST /api/v1/auth/token` with the legacy single
+// opaque token (the python SDK's `api_key` constructor).
+func (t *Transport) AuthTokenLegacy(ctx context.Context, token string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token", "", map[string]any{"token": token}, nil)
+}
+
+// SessionSetup performs the ECDH session-setup handshake.
+func (t *Transport) SessionSetup(ctx context.Context, bearer, clientECDHPubKey string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/session/setup", bearer, map[string]any{
+		"client_ecdh_pubkey": clientECDHPubKey,
+	}, nil)
+}
+
+// PostOrdersEncrypted issues `POST /api/v1/orders` with an already-encrypted
+// body. The header + ciphertext layout is constructed by the SDK.
+func (t *Transport) PostOrdersEncrypted(ctx context.Context, bearer string, body map[string]any) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/orders", bearer, body, nil)
+}
+
+// DeleteOrderEncrypted issues `DELETE /api/v1/orders/{order_id}` with an
+// encrypted body.
+func (t *Transport) DeleteOrderEncrypted(ctx context.Context, bearer, orderID string, body map[string]any) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodDelete, "/api/v1/orders/"+url.PathEscape(orderID), bearer, body, nil)
+}
+
+// PatchOrderEncrypted issues `PATCH /api/v1/orders/{order_id}` with an
+// encrypted modify body.
+func (t *Transport) PatchOrderEncrypted(ctx context.Context, bearer, orderID string, body map[string]any) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPatch, "/api/v1/orders/"+url.PathEscape(orderID), bearer, body, nil)
+}
+
+// GetOrder issues `GET /api/v1/orders/{order_id}`.
+func (t *Transport) GetOrder(ctx context.Context, bearer, orderID string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/orders/"+url.PathEscape(orderID), bearer, nil, nil)
+}
+
+// GetOrderByClientOrderID issues `GET /api/v1/orders?client_order_id=`.
+func (t *Transport) GetOrderByClientOrderID(ctx context.Context, bearer, clientOrderID string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("client_order_id", clientOrderID)
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/orders", bearer, nil, q)
+}
+
+// RegisterClientOrderMapping pushes the `(coid, order_id)` mapping the SDK
+// learned post-decrypt back to the edge so future coid lookups resolve.
+func (t *Transport) RegisterClientOrderMapping(ctx context.Context, bearer, clientOrderID, orderID string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/orders/_register_coid", bearer, map[string]any{
+		"client_order_id": clientOrderID,
+		"order_id":        orderID,
+	}, nil)
+}
+
+// RevokeToken issues `POST /api/v1/auth/token/revoke`. Best-effort: errors
+// are typically silenced by callers.
+func (t *Transport) RevokeToken(ctx context.Context, bearer string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token/revoke", bearer, nil, nil)
+}
+
+// IsEnvelopeError reports whether err is (or wraps) an *EnvelopeError.
+func IsEnvelopeError(err error) bool {
+	var e *EnvelopeError
+	return errors.As(err, &e)
+}
