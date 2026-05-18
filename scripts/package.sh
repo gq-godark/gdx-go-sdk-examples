@@ -24,13 +24,16 @@
 #      Recipients can either run the prebuilt binaries directly or
 #      `go build ./examples/...` from the unzipped bundle.
 #
-# Output layout:
+# Output layout (mirrors the cpp / python bundle shape; `sdk/` is the Go-
+# idiomatic equivalent of cpp's `lib/libgodark.a + include/` -- the
+# importable package source only, no upstream repo docs / tests / examples):
+#
 #   <DIST_NAME>/
 #   |-- quickstart                 (prebuilt static-ish ELF, x86_64 Linux)
 #   |-- full_trader_example        (prebuilt)
 #   |-- go.mod                     (workspace; godark = ./sdk)
 #   |-- go.sum
-#   |-- .env.example
+#   |-- .env.example               (bundle template; tuned for the examples here)
 #   |-- README.md                  (from bundle/README.md)
 #   |-- SDK_REFERENCE.md           (from bundle/SDK_REFERENCE.md)
 #   |-- examples/
@@ -41,9 +44,10 @@
 #       |-- UPSTREAM_REF           (the upstream commit the bundle was cut from)
 #       |-- go.mod                 (godark module manifest)
 #       |-- go.sum
-#       |-- shared/symbols.json
+#       |-- shared/symbols.json    (//go:embed asset)
 #       |-- proto/...              (pre-generated bindings)
-#       `-- *.go                   (godark package source)
+#       |-- internal/...           (private support packages)
+#       `-- *.go                   (godark package source -- no tests, no docs)
 #
 # Usage:
 #   bash scripts/package.sh
@@ -136,7 +140,9 @@ fi
 echo "Upstream verified at pin: $PINNED_REF ($upstream_head_sha)"
 
 # ---- parity check: vendored sdk/ must match upstream  ---------------------
-# Excludes mirror the rsync drops in refresh_sdk.sh.
+# Excludes mirror the rsync drops in refresh_sdk.sh. Vendored sdk/ ships
+# only the importable Go package -- the equivalent of cpp's lib/.a +
+# include/ -- not the upstream repo's docs / tests / in-repo examples.
 PARITY_EXCLUDES=(
   --exclude='.git'
   --exclude='.github'
@@ -144,6 +150,14 @@ PARITY_EXCLUDES=(
   --exclude='gdx-proto'
   --exclude='.gitmodules'
   --exclude='.gitignore'
+  --exclude='README.md'
+  --exclude='CHANGELOG.md'
+  --exclude='SECURITY.md'
+  --exclude='.env'
+  --exclude='.env.example'
+  --exclude='.env.*'
+  --exclude='examples'
+  --exclude='testdata'
   --exclude='*_test.go'
   --exclude='UPSTREAM_REF'
 )
@@ -219,11 +233,36 @@ echo "Package created: $ARCHIVE"
 LISTING="$(unzip -l "$ARCHIVE")"
 echo "$LISTING"
 
-# Recipient contract: no maintainer-only directories must leak.
-if echo "$LISTING" | grep -E "${DIST_NAME}/(scripts|build|bundle|\.git)/" >/dev/null; then
+# Recipient contract: no maintainer-only directories must leak at the
+# bundle root.
+if echo "$LISTING" | grep -E "${DIST_NAME}/(scripts|build|bundle|\.git|\.github)/" >/dev/null; then
   echo "error: bundle contains forbidden internal directory" >&2
   exit 1
 fi
+
+# Recipient contract: sdk/ ships only the importable Go package, not the
+# upstream repo's docs / examples / VCS / CI cruft. Any of these creeping
+# back in means refresh_sdk.sh's rsync excludes drifted.
+FORBIDDEN_SDK=(
+  "sdk/README\\.md"
+  "sdk/CHANGELOG\\.md"
+  "sdk/SECURITY\\.md"
+  "sdk/\\.env([. ]|$)"
+  "sdk/examples/"
+  "sdk/scripts/"
+  "sdk/\\.github/"
+  "sdk/\\.gitignore"
+  "sdk/\\.gitmodules"
+  "sdk/testdata/"
+  "sdk/.*_test\\.go"
+)
+for f in "${FORBIDDEN_SDK[@]}"; do
+  if echo "$LISTING" | grep -E "${DIST_NAME}/${f}" >/dev/null; then
+    echo "error: vendored sdk/ contains forbidden upstream cruft matching: ${f}" >&2
+    echo "       (refresh_sdk.sh excludes must keep this out)" >&2
+    exit 1
+  fi
+done
 # Every required path must be present.
 for required in \
   "${DIST_NAME}/quickstart" \
