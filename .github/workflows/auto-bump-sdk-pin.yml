@@ -102,9 +102,14 @@ jobs:
             changes -- this workflow only refreshes the wire layer."
           git push --force origin "$BRANCH"
 
-          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
-            echo "Existing PR force-pushed; no new PR opened."
-            gh pr view "$BRANCH" --json url --jq .url
+          # NB: `gh pr view BRANCH` matches by head ref name and returns the
+          # most-recent PR for that branch regardless of state, which means
+          # an already-merged PR will mask the need to open a fresh one
+          # after the next merge. Filter to open PRs only.
+          open_count=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$open_count" -gt 0 ]; then
+            echo "Existing open PR force-pushed; no new PR opened."
+            gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url'
           else
             gh pr create \
               --title "auto: bump vendored SDK to ${SDK_SHA:0:7}" \
