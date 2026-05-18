@@ -55,16 +55,30 @@ echo "  upstream HEAD: $UPSTREAM_SHA${UPSTREAM_TAG:+ (tag $UPSTREAM_TAG)}"
 rm -rf "$DEST"
 mkdir -p "$DEST"
 
-# Copy SDK source. Deliberately drop:
-#   - .git/, .github/                            (VCS + CI)
-#   - scripts/                                   (SDK maintainer tooling)
-#   - gdx-proto/                                 (submodule; pre-generated
-#                                                 bindings under proto/ are
-#                                                 committed, so consumers
-#                                                 don't need protoc)
-#   - *_test.go                                  (huge size win; recipient
-#                                                 doesn't run upstream tests)
-#   - mock_integration_test.go / rest/transport_test.go (same as above)
+# Copy SDK source. The goal is to vendor *only* what is needed to import
+# `github.com/gq-godark/gdx-go-sdk` and compile against it from inside the
+# bundle -- the Go-idiomatic equivalent of a .whl / .a artifact. Concretely:
+#
+# Drop repo-level cruft (not part of the importable package):
+#   - .git/, .github/                  VCS + CI
+#   - scripts/                         SDK maintainer tooling
+#   - gdx-proto/                       proto submodule (we ship pre-generated
+#                                      bindings under proto/, so consumers
+#                                      don't need protoc)
+#   - .gitmodules, .gitignore          VCS artefacts
+#   - README.md, CHANGELOG.md,         repo docs -- recipients use the
+#     SECURITY.md                        bundle/ docs at the zip root
+#   - .env.example                     upstream's repo-level template; the
+#                                      bundle ships its own .env.example
+#                                      at the zip root that's tuned for the
+#                                      bundled examples
+#   - examples/                        upstream's in-repo examples are a
+#                                      maintainer-facing convenience; the
+#                                      bundle ships its own examples/ at
+#                                      the zip root and `replace`s godark
+#                                      to ./sdk
+#   - *_test.go, testdata/             huge size win; recipients don't run
+#                                      upstream tests
 rsync -a \
   --exclude='.git/' \
   --exclude='.github/' \
@@ -72,7 +86,15 @@ rsync -a \
   --exclude='gdx-proto/' \
   --exclude='.gitmodules' \
   --exclude='.gitignore' \
+  --exclude='README.md' \
+  --exclude='CHANGELOG.md' \
+  --exclude='SECURITY.md' \
+  --exclude='.env' \
+  --exclude='.env.example' \
+  --exclude='.env.*' \
+  --exclude='/examples/' \
   --exclude='*_test.go' \
+  --exclude='testdata/' \
   "$SRC/" "$DEST/"
 
 # Pin the commit (prefer tag for human readability if HEAD is on one).
