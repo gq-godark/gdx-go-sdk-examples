@@ -99,6 +99,8 @@ gdx-go-sdk/
 ├── proto/gdx/                          generated protobuf bindings (committed)
 ├── gdx-proto/                          git submodule pinned to v1/devnet
 ├── scripts/proto_gen.sh                regenerate Go bindings from gdx-proto
+├── examples/                           runnable in-repo examples (see below)
+├── .env.example                        environment template; copy to .env
 └── .github/workflows/                  CI + Layer-1/2 auto-publish chain
 ```
 
@@ -128,6 +130,85 @@ go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 
 # Each regen:
 bash scripts/proto_gen.sh
+```
+
+## Testing
+
+All tests are **offline by design** — every WebSocket / REST flow is
+exercised through an in-process `httptest.Server` mock edge, so the suite
+runs without credentials or network access. CI runs the full suite on
+Go 1.22 and Go 1.23.
+
+```bash
+go test ./...                              # entire suite
+go test ./... -count=1                     # disable result caching
+go test ./... -race                        # race detector
+go test ./... -cover                       # per-package coverage summary
+go test ./... -run TestMockIntegration -v  # one named test, verbose
+```
+
+The 82 test functions split across three layers:
+
+- **Public surface** (`client_test.go`, `rest_client_test.go`,
+  `market_data_test.go`, `proto_test.go`, `order_error_code_test.go`,
+  `symbols_test.go`) — proto bridge round-trips, the 34-entry order
+  error-code registry, enum / symbol-map embed, public type wiring.
+- **Internal primitives** (`internal/crypto/`, `internal/session/`,
+  `internal/identity/`, `internal/rest/`, `internal/transport/`) — X25519
+  ECDH + HKDF-SHA256 + AES-256-GCM, the session state machine, UUID
+  wire-format helpers, REST envelope unwrap, WS URL normalisation.
+- **Mock-WS / REST integration** (`mock_integration_test.go` and the
+  mock REST edge in `rest_client_test.go`) — spin up an in-process
+  `httptest.Server` that simulates the full handshake (login →
+  `session.setup` → encrypted place / cancel → encrypted
+  `positions_snapshot` push) and asserts the public API end-to-end,
+  including the auth-failure path.
+
+Generated protobuf code under `proto/` is excluded from coverage; the
+`Proto drift check` job in CI guards against regeneration drift instead.
+
+## Examples
+
+Runnable examples live under `examples/`. Each is its own `main` package
+under a per-example subdirectory, so `go run ./examples/<name>` builds and
+runs a single example without dragging the others in.
+
+Credentials and endpoints are resolved from the process environment first,
+then from a `.env` file at the repo root (see `examples/internal/envloader`).
+Copy the template:
+
+```bash
+cp .env.example .env
+# edit .env -- uncomment and fill in GODARK_API_KEY_ID + GODARK_API_SECRET
+```
+
+| Example                              | What it shows                                                                |
+|--------------------------------------|------------------------------------------------------------------------------|
+| `examples/quickstart`                | Minimal WS happy path: connect → place LIMIT → cancel.                       |
+| `examples/quickstart_docs`           | Same shape, but via `GodarkRestClient` using the docs onboarding fields.     |
+| `examples/full_trader_example`       | End-to-end WS trader: subscribe, place, modify, cancel, drain push streams.  |
+| `examples/full_trader_rest`          | REST equivalent: place → `get_order` → `await_terminal_status` → cancel.     |
+| `examples/market_data`               | Public `MarketDataClient` smoke: subscribe orderbook + trades for ~30s.      |
+| `examples/docs_ws_envelope`          | Raw WebSocket frames documenting the docs-wire envelope (no `GodarkClient`). |
+| `examples/docs_ws_trade`             | Local docs-wire encrypted probe: place / modify / cancel against localnet.   |
+| `examples/e2e_trading_smoke`         | Connect + ECDH smoke with `--auth-only`; exit codes for CI consumption.      |
+| `examples/local_e2e`                 | Localnet legacy-wire smoke using a static `test-key-N` API key.              |
+| `examples/local_positions`           | Two-user crossing-fill smoke: confirms PositionUpdates propagate.            |
+
+Run any example with:
+
+```bash
+go run ./examples/<name>
+# e.g.
+go run ./examples/quickstart
+go run ./examples/e2e_trading_smoke -- --auth-only
+```
+
+To verify all examples build (without running them):
+
+```bash
+go build ./examples/...
+go vet ./examples/...
 ```
 
 ## Wire protocol
