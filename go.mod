@@ -4,7 +4,7 @@
 // under `sdk/` (Go source with pre-generated protobuf bindings already
 // committed under `sdk/proto/`), so building this repository requires only
 // the standard Go toolchain plus the public modules referenced below --
-// no private registry, no `protoc`, no extra system dependencies.
+// no extra `protoc` tooling, no extra system dependencies.
 module github.com/gq-godark/gdx-go-sdk-examples
 
 go 1.22

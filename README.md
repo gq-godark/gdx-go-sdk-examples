@@ -49,7 +49,7 @@ go run ./examples/full_trader            # run full trader against testnet
 
 The `replace github.com/gq-godark/gdx-go-sdk => ./sdk` directive in
 `go.mod` resolves the SDK from the vendored copy, so `go build` never has
-to pull from a private GOPROXY for the godark module.
+to fetch the godark module from a GOPROXY at all.
 
 ## Refreshing the vendored SDK
 
@@ -92,7 +92,7 @@ local hand-edits to `sdk/` can never silently make it into a release zip.
   4. on `push` to `main`, attaches the zip to a tagged GitHub Release.
 
 The GitHub App (`godark-ci`) used for cross-repo access only requires
-`contents: read` on `gdx-go-sdk`; no PAT / private SSH key is needed.
+`contents: read` on `gdx-go-sdk`; no PAT or SSH key is needed in CI.
 
 ## Concurrency contract
 

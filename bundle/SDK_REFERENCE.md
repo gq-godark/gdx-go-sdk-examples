@@ -1,15 +1,33 @@
-# GoDark Go SDK -- API Reference (recipient-facing)
+# GoDark Go SDK Reference (MM Distribution)
 
-This reference covers the `github.com/gq-godark/gdx-go-sdk` public surface
-shipped under `sdk/` in this bundle. It is curated for MM integrators and
-shows the smallest set of calls you need to place, modify, cancel,
-subscribe, and decode order / position pushes from the encrypted edge.
+This reference covers the `godark` public surface shipped under `sdk/` in
+this bundle. It is curated for MM integrators and shows the smallest set
+of calls you need to place, modify, cancel, subscribe, and decode order
+and position pushes from the encrypted edge.
 
-For the upstream maintainer view (proto bridge, internal modules, CI
-chain, automation workflows), see `gdx-go-sdk/README.md` and
-`gdx-go-sdk/SDK_REFERENCE.md` in the public upstream repo.
+Everything required to build is included in this bundle: SDK source under
+`sdk/`, pre-generated protobuf bindings under `sdk/proto/`, and a
+top-level `go.mod` wired so a local `go build` resolves the SDK from the
+bundled copy.
 
 ## Module + import
+
+In your own `go.mod`, depend on the SDK via a path-based `replace`
+directive pointing at the vendored copy this bundle ships (or a copy you
+keep in your own repository):
+
+```go
+// go.mod
+module github.com/your-org/your-mm-bot
+
+go 1.22
+
+require github.com/gq-godark/gdx-go-sdk v0.1.0
+
+replace github.com/gq-godark/gdx-go-sdk => ./vendor/godark/sdk
+```
+
+Then import as usual:
 
 ```go
 import "github.com/gq-godark/gdx-go-sdk"
@@ -202,8 +220,16 @@ client, _ := godark.NewClient(godark.ClientConfig{
 
 ## Versioning
 
-This bundle was cut from a specific upstream commit of
-`gq-godark/gdx-go-sdk`; the SHA is recorded in `sdk/UPSTREAM_REF`. Newer
-bundles bump that pin and ship under a new release tag. Wire compatibility
-with the production sequencer is the contract `gdx-proto@v1/devnet` (and
-later revisions) maintains.
+This bundle was cut from a specific upstream SDK commit; the SHA is
+recorded in `sdk/UPSTREAM_REF`. Newer bundles bump that pin and ship
+under a new release tag. Wire compatibility with the production
+sequencer is the contract `gdx-proto@v1/devnet` (and later revisions)
+maintains.
+
+To upgrade your project to a newer SDK revision:
+
+1. Download the new release zip.
+2. Replace your local copy of the vendored `sdk/` (wherever your
+   `replace` directive points) with the `sdk/` directory from the new
+   zip.
+3. `go build ./...` and re-run your regression tests.
