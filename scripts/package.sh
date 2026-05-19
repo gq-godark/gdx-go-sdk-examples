@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MM bundle packager -- Linux x86_64 zip distribution, built strictly from
+# MM bundle packager -- source-only zip distribution, built strictly from
 # the pinned upstream gdx-go-sdk commit recorded in sdk/UPSTREAM_REF.
 #
 # What this script does:
@@ -11,26 +11,22 @@
 #        - Else clone gq-godark/gdx-go-sdk@<pinned-ref> into a temp dir.
 #   3. Verifies the resolved upstream is at exactly the pinned ref.
 #   4. Parity check: vendored sdk/ must match $UPSTREAM_SRC for every Go
-#      source file (excluding *_test.go, .git/, .github/, scripts/,
-#      gdx-proto/ -- the same exclusions refresh_sdk.sh enforces). Drift
-#      here means somebody hand-edited the vendored copy or forgot to
-#      bump UPSTREAM_REF after a refresh -- fail loudly.
-#   5. Builds release binaries via `go build` against the vendored sdk/.
-#      The parity check above guarantees vendored sdk/ is bit-equal to
-#      upstream for every file actually compiled, so the resulting
-#      binaries are reproducible from the recorded upstream pin.
-#   6. Stages the binaries + example sources + vendored sdk/ + top-level
-#      go.mod / go.sum + recipient docs from bundle/, then zips them.
-#      Recipients can either run the prebuilt binaries directly or
-#      `go build ./examples/...` from the unzipped bundle.
+#      source file the bundle ships (excluding *_test.go, .git/, .github/,
+#      scripts/, gdx-proto/, README.md, CHANGELOG.md, SECURITY.md,
+#      .env*, examples/, testdata/ -- the same exclusions refresh_sdk.sh
+#      enforces). Drift here means somebody hand-edited the vendored copy
+#      or forgot to bump UPSTREAM_REF after a refresh -- fail loudly.
+#   5. Stages example sources + vendored sdk/ + top-level go.mod / go.sum +
+#      recipient docs from bundle/, then zips them. Recipients run
+#      `go build ./examples/...` from the unzipped bundle to produce the
+#      example binaries on their platform.
 #
 # Output layout (mirrors the cpp / python bundle shape; `sdk/` is the Go-
-# idiomatic equivalent of cpp's `lib/libgodark.a + include/` -- the
-# importable package source only, no upstream repo docs / tests / examples):
+# equivalent of cpp's `lib/libgodark.a + include/` -- the importable package
+# source only, no upstream repo docs / tests / examples). The bundle is
+# platform-agnostic; consumers can build on any OS/arch Go supports:
 #
 #   <DIST_NAME>/
-#   |-- quickstart                 (prebuilt static-ish ELF, x86_64 Linux)
-#   |-- full_trader_example        (prebuilt)
 #   |-- go.mod                     (workspace; godark = ./sdk)
 #   |-- go.sum
 #   |-- .env.example               (bundle template; tuned for the examples here)
@@ -59,7 +55,7 @@ UPSTREAM_REPO="gq-godark/gdx-go-sdk"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DIST_NAME="${1:-gdx-go-sdk-linux-x86_64}"
+DIST_NAME="${1:-gdx-go-sdk}"
 
 cd "$REPO_ROOT"
 
@@ -84,10 +80,6 @@ for required in bundle/README.md bundle/SDK_REFERENCE.md .env.example \
 done
 if ! command -v zip >/dev/null 2>&1; then
   echo "error: 'zip' not found in PATH (apt-get install zip)" >&2
-  exit 1
-fi
-if ! command -v go >/dev/null 2>&1; then
-  echo "error: 'go' not found in PATH (install Go 1.22+)" >&2
   exit 1
 fi
 
@@ -173,23 +165,12 @@ if ! diff -r --brief "${PARITY_EXCLUDES[@]}" \
 fi
 echo "Parity check passed: sdk/ matches $UPSTREAM_SRC"
 
-# ---- build release binaries ----------------------------------------------
-echo "Building release binaries (quickstart + full_trader_example)..."
-mkdir -p "$REPO_ROOT/build"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/quickstart"            ./examples/quickstart
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o "$REPO_ROOT/build/full_trader_example"   ./examples/full_trader_example
-
-QUICKSTART_BIN="$REPO_ROOT/build/quickstart"
-FULL_TRADER_BIN="$REPO_ROOT/build/full_trader_example"
-
-for bin in "$QUICKSTART_BIN" "$FULL_TRADER_BIN"; do
-  if [[ ! -x "$bin" ]]; then
-    echo "error: expected binary missing or non-executable: $bin" >&2
-    exit 1
-  fi
-done
-
 # ---- stage ----------------------------------------------------------------
+# This bundle is source-only: recipients build the example binaries on
+# their own platform with `go build ./examples/...`. No prebuilt binaries
+# are shipped, which keeps the artifact platform-agnostic (works on every
+# OS/arch Go supports) and aligns with the python / cpp / java / rust
+# bundles in this family.
 STAGING_DIR="$(mktemp -d)"
 DEST="$STAGING_DIR/$DIST_NAME"
 mkdir -p "$DEST"
@@ -197,10 +178,6 @@ mkdir -p "$DEST"
 echo "Staging distribution at $DEST ..."
 mkdir -p "$DEST/examples/quickstart" "$DEST/examples/full_trader_example" \
          "$DEST/examples/internal/envloader" "$DEST/sdk"
-
-# Prebuilt binaries.
-cp "$QUICKSTART_BIN"                          "$DEST/quickstart"
-cp "$FULL_TRADER_BIN"                         "$DEST/full_trader_example"
 
 # Recipient docs come from bundle/, never from the repo-root copies.
 cp "${REPO_ROOT}/.env.example"                "$DEST/.env.example"
@@ -263,18 +240,27 @@ for f in "${FORBIDDEN_SDK[@]}"; do
     exit 1
   fi
 done
+# Recipient contract: source-only bundle must NOT ship any binaries.
+# (Catches accidental reintroduction of a `go build` step in CI.)
+if echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ && $4 !~ /UPSTREAM_REF$/ {print}' | grep -v "${DIST_NAME}/$" >/dev/null; then
+  echo "error: bundle contains non-source artifacts (binaries or unexpected files):" >&2
+  echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ && $4 !~ /UPSTREAM_REF$/ {print "  " $4}' >&2
+  exit 1
+fi
+
 # Every required path must be present.
 for required in \
-  "${DIST_NAME}/quickstart" \
-  "${DIST_NAME}/full_trader_example" \
   "${DIST_NAME}/README\\.md" \
   "${DIST_NAME}/SDK_REFERENCE\\.md" \
   "${DIST_NAME}/go\\.mod" \
+  "${DIST_NAME}/go\\.sum" \
   "${DIST_NAME}/\\.env\\.example" \
   "${DIST_NAME}/examples/quickstart/main\\.go" \
   "${DIST_NAME}/examples/full_trader_example/main\\.go" \
+  "${DIST_NAME}/examples/internal/envloader/envloader\\.go" \
   "${DIST_NAME}/sdk/UPSTREAM_REF" \
   "${DIST_NAME}/sdk/go\\.mod" \
+  "${DIST_NAME}/sdk/go\\.sum" \
   "${DIST_NAME}/sdk/client\\.go"; do
   if ! echo "$LISTING" | grep -E "${required}" >/dev/null; then
     echo "error: bundle missing required entry: ${required}" >&2

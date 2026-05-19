@@ -26,7 +26,7 @@ gdx-go-sdk-examples/
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
 │   ├── refresh_sdk.sh                    vendor a gdx-go-sdk checkout into sdk/
-│   └── package.sh                        produce the Linux x86_64 zip artifact
+│   └── package.sh                        produce the source-only release zip
 ├── sdk/                                  vendored gdx-go-sdk source
 │   ├── UPSTREAM_REF
 │   ├── go.mod
@@ -81,14 +81,11 @@ local hand-edits to `sdk/` can never silently make it into a release zip.
   1. checks out this repo + the pinned upstream `gdx-go-sdk` ref,
   2. runs `scripts/package.sh`, which:
      - parity-checks `sdk/` against the upstream pin,
-     - builds the two example binaries (`CGO_ENABLED=0 GOOS=linux GOARCH=amd64`),
-     - stages everything into `<bundle>/{quickstart, full_trader_example, examples/, sdk/, README.md, SDK_REFERENCE.md, go.mod, go.sum, .env.example}`,
+     - stages `<bundle>/{examples/, sdk/, README.md, SDK_REFERENCE.md, go.mod, go.sum, .env.example}`,
      - zips the staging dir.
-  3. recipient-smoke-tests the zip: `unzip` into a clean dir, run `file`
-     + `ldd` against the prebuilt binaries (must be static-ish Linux x86_64
-     ELFs), and `go build ./examples/...` from the bundled go.mod (must
-     produce equivalent binaries with only crates.io / GOPROXY hits for
-     transitive deps).
+  3. recipient-smoke-tests the zip: `unzip` into a clean dir and
+     `go build ./examples/...` against the bundled go.mod (must produce
+     working binaries with only GOPROXY hits for transitive deps).
   4. on `push` to `main`, attaches the zip to a tagged GitHub Release.
 
 The GitHub App (`godark-ci`) used for cross-repo access only requires
