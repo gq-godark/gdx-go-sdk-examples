@@ -63,14 +63,15 @@ The release pipeline (`scripts/package.sh` + `.github/workflows/release.yml`)
 guarantees:
 
   - Vendored `sdk/` is **bit-equal** to `gq-godark/gdx-go-sdk@<UPSTREAM_REF>`
-    for every file actually compiled, modulo the rsync excludes documented
-    in `scripts/refresh_sdk.sh`.
-  - The release binaries are built with `CGO_ENABLED=0 GOOS=linux
-    GOARCH=amd64 -trimpath -ldflags='-s -w'`, producing statically-linked
-    ELFs that recipients can run on any glibc / musl system without a
-    matching toolchain.
-  - The zip's structure is asserted post-build (every required file must be
-    present; no maintainer-only directories may leak).
+    for every file the bundle ships, modulo the rsync excludes documented
+    in `scripts/refresh_sdk.sh` (tests, repo docs, in-repo examples,
+    `.env*`, VCS/CI metadata).
+  - The bundle is source-only and platform-agnostic; recipients build the
+    example binaries on their own platform with `go build
+    ./examples/quickstart` (works on any OS / arch Go supports).
+  - The zip's structure is asserted post-build: every required file must
+    be present, no maintainer-only directories may leak, and the bundle
+    must not contain any compiled artifacts or unexpected file types.
 
 ## Layer-2 automation
 

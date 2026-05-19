@@ -1,22 +1,20 @@
 # GoDark Go SDK
 
-This package provides two prebuilt market-maker examples for the GoDark Go
-SDK, **plus their full source tree and the vendored `godark` module** so you
-can rebuild the examples or scaffold your own bot directly against the
-shipped sources — no extra registries required, no `protoc` required (the
-SDK ships pre-generated protobuf bindings under `sdk/proto/`).
+This package provides two market-maker example sources for the GoDark Go
+SDK, **plus the vendored `godark` module**, so you can build the examples
+or scaffold your own bot directly against the shipped sources — no
+private registry, no `protoc` (the SDK ships pre-generated protobuf
+bindings under `sdk/proto/`).
 
 Supported order types in this distribution: `MARKET`, `LIMIT`.
 
 ## Package contents
 
-- `quickstart`, `full_trader_example` — **prebuilt Linux x86_64 binaries**
-  (run these directly with no toolchain installed)
 - `examples/` — example **source files** (`quickstart/main.go`,
   `full_trader_example/main.go`, `internal/envloader/envloader.go`)
 - `sdk/` — **vendored `godark` module** source (with pre-generated
   protobuf bindings under `sdk/proto/`); `sdk/UPSTREAM_REF` records the
-  upstream commit the binaries were built from
+  exact upstream commit this distribution was cut from
 - `go.mod`, `go.sum` — workspace manifest wiring
   `replace github.com/gq-godark/gdx-go-sdk => ./sdk`, ready for
   `go build ./examples/...`
@@ -25,25 +23,11 @@ Supported order types in this distribution: `MARKET`, `LIMIT`.
 
 ## 1) Prerequisites
 
-To **run the prebuilt binaries**, you only need the Linux runtime libs:
-
-| Item        | Requirement                                                                   |
-|-------------|-------------------------------------------------------------------------------|
-| OS / arch   | Linux x86_64 (built on Ubuntu, glibc ≥ 2.18)                                  |
-| TLS runtime | system OpenSSL / libssl is **not** required — `CGO_ENABLED=0` static-ish ELFs |
-| Other       | `libc` / `libpthread` (standard system libraries)                             |
-
-To **rebuild from source** (or build your own bot against the bundled
-`sdk/`), additionally install:
-
 | Item    | Requirement                                                                       |
 |---------|-----------------------------------------------------------------------------------|
+| OS / arch | any platform Go supports (Linux, macOS, Windows; amd64, arm64, …)                |
 | Go      | stable ≥ 1.22 (`https://go.dev/dl/`)                                              |
-| Network | a Go module proxy (default `proxy.golang.org`) for the standard runtime modules (`coder/websocket`, `google/uuid`, `golang.org/x/crypto`, `google.golang.org/protobuf`); the `godark` module itself is bundled |
-
-> **macOS / Windows / aarch64?** The prebuilt binaries are Linux x86_64 only,
-> but the source-build path works on any platform Go supports — unzip this
-> bundle and run `go build ./examples/...`.
+| Network | a Go module proxy (default `proxy.golang.org`) for the third-party runtime modules (`coder/websocket`, `google/uuid`, `golang.org/x/crypto`, `google.golang.org/protobuf`); the `godark` module itself is bundled in `sdk/` |
 
 ## 2) Create testnet credentials
 
@@ -71,34 +55,27 @@ Optional override:
 
 The OS environment always wins over `.env`.
 
-## 4) Run quickstart
+## 4) Build and run the examples
 
-Run the prebuilt binary directly:
-
-```bash
-./quickstart
-```
-
-Or the full trader example:
-
-```bash
-./full_trader_example
-```
-
-To rebuild from the included sources instead (e.g. on a non-Linux host or
-after editing `examples/*/main.go`):
+From inside the unzipped bundle:
 
 ```bash
 go build ./examples/quickstart            # produces ./quickstart
 go build ./examples/full_trader_example   # produces ./full_trader_example
 ```
 
-The bundled `go.mod` already wires
-`replace github.com/gq-godark/gdx-go-sdk => ./sdk`, so the build resolves
-the `godark` module entirely from the bundled vendored copy; `go` only
-fetches the third-party runtime modules (`coder/websocket`,
-`google/uuid`, `golang.org/x/crypto`, `google.golang.org/protobuf`) from
-the configured GOPROXY.
+Then run either binary:
+
+```bash
+./quickstart
+./full_trader_example
+```
+
+The bundled `go.mod` wires `replace github.com/gq-godark/gdx-go-sdk =>
+./sdk`, so the build resolves the `godark` module entirely from the
+vendored copy. `go` only fetches the third-party runtime modules
+(`coder/websocket`, `google/uuid`, `golang.org/x/crypto`,
+`google.golang.org/protobuf`) from the configured GOPROXY.
 
 ## Go integration (your own bot)
 
