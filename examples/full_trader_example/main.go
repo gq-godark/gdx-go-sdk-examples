@@ -3,13 +3,15 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. Connect and authenticate (encrypted ECDH session).
-//  3. Wire up channel-first push receivers (order / position / health / etc.).
-//  4. Subscribe to the private order + position channels.
-//  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
-//  6. Drain queued updates between actions.
-//  7. Print a session summary including per-stream counts.
-//  8. Clean disconnect.
+//  2. REST pre-flight: GetMe (identity + wallet) → GetMyBalance (margin check).
+//  3. Connect and authenticate (encrypted ECDH WS session).
+//  4. Wire up channel-first push receivers (order / position / health / etc.).
+//  5. Subscribe to the private order + position channels.
+//  6. Place, modify, and cancel `MARKET` / `LIMIT` orders.
+//  7. Drain queued updates between actions.
+//  8. REST post-flight: GetMyBalance (balance delta after trading).
+//  9. Print a session summary including per-stream counts.
+// 10. Clean disconnect.
 //
 // Run with:
 //
@@ -47,19 +49,58 @@ func main() {
 	if apiKeyID == "" || apiSecret == "" {
 		log.Fatal("Missing credentials. Set GODARK_API_KEY_ID and GODARK_API_SECRET (or provide them in .env).")
 	}
-	baseURL := os.Getenv("GODARK_EDGE_URL")
-	if baseURL == "" {
-		baseURL = "wss://api.godark-dex.com"
+	wsURL := os.Getenv("GODARK_EDGE_URL")
+	if wsURL == "" {
+		wsURL = "wss://api.godark-dex.com"
 	}
-	fmt.Printf("Endpoint: %s\n", baseURL)
+	restURL := os.Getenv("GODARK_REST_URL")
+	if restURL == "" {
+		restURL = strings.Replace(strings.Replace(wsURL, "wss://", "https://", 1), "ws://", "http://", 1)
+	}
+	fmt.Printf("Endpoints: ws=%s  rest=%s\n", wsURL, restURL)
 
+	ctx := context.Background()
+
+	// --- REST pre-flight: identity + balance check ---
+	rest, err := godark.NewRestClient(godark.RestClientConfig{
+		APIKeyID:  apiKeyID,
+		APISecret: apiSecret,
+		BaseURL:   restURL,
+	})
+	if err != nil {
+		log.Fatalf("REST config error: %v", err)
+	}
+	if err := rest.Connect(ctx); err != nil {
+		log.Fatalf("REST connect failed: %v", err)
+	}
+	defer func() { _ = rest.Disconnect(ctx) }()
+
+	me, err := rest.GetMe(ctx)
+	if err != nil {
+		log.Fatalf("GetMe: %v", err)
+	}
+	fmt.Printf("Identity: user_uuid=%s  wallet=%s\n", me.ID, me.WalletAddress)
+
+	preBal, err := rest.GetMyBalance(ctx)
+	if err != nil {
+		log.Fatalf("GetMyBalance: %v", err)
+	}
+	fmt.Printf("Balance:  shielded_raw=%d  wallet_raw=%d  pending_deposits_raw=%d  wallet_ui=%.6f\n",
+		preBal.ShieldedBalanceRaw, preBal.WalletUSDTRaw, preBal.PendingDepositsRaw, preBal.WalletUSDTUI)
+	if preBal.ShieldedBalanceRaw == 0 {
+		fmt.Println("No shielded balance -- deposit collateral before placing orders.")
+		fmt.Println("Done.")
+		return
+	}
+
+	// --- WS trading session ---
 	headers := http.Header{}
 	headers.Set("X-Trader-Tag", "go-full-trader-demo")
 
 	client, err := godark.NewClient(godark.ClientConfig{
 		APIKeyID:  apiKeyID,
 		APISecret: apiSecret,
-		BaseURL:   baseURL,
+		BaseURL:   wsURL,
 		Transport: godark.TransportConfig{
 			Headers:           headers,
 			HeartbeatInterval: 30 * time.Second,
@@ -68,19 +109,18 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("Config error: %v", err)
+		log.Fatalf("WS config error: %v", err)
 	}
 
-	ctx := context.Background()
 	if err := client.Connect(ctx); err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		log.Fatalf("WS connect failed: %v", err)
 	}
 	defer func() {
 		_ = client.Disconnect()
 		fmt.Println("Disconnected cleanly")
 	}()
 
-	fmt.Printf("Authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
+	fmt.Printf("WS authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
 
 	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
 		log.Fatalf("Subscribe failed: %v", err)
@@ -161,6 +201,13 @@ func main() {
 	marginCount := drainMargins(client)
 	fundingCount := drainFunding(client)
 	settleCount := drainSettlement(client)
+
+	// --- REST post-flight: balance snapshot after trading ---
+	if postBal, err := rest.GetMyBalance(ctx); err == nil {
+		fmt.Printf("Balance after: shielded_raw=%d  (delta=%d)\n",
+			postBal.ShieldedBalanceRaw,
+			int64(postBal.ShieldedBalanceRaw)-int64(preBal.ShieldedBalanceRaw))
+	}
 
 	fmt.Println(sep)
 	fmt.Println("  Session complete")

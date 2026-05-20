@@ -98,6 +98,51 @@ type BalanceUpdate struct {
 	Timestamp          uint64
 }
 
+// Balance is the REST snapshot returned by
+// GodarkRestClient.GetBalance(ctx, owner). It reports the on-chain
+// USDT balance breakdown across the user's wallet, in-flight shield
+// deposits, and the sequencer-tracked shielded trading balance.
+//
+// All `*Raw` fields are u64 amounts in the asset's smallest denomination
+// (USDT decimals; today this is 1e6 = 1 USDT). Numeric ordering on the
+// wire is decimal-encoded as strings (because u64 doesn't roundtrip
+// JSON safely); the SDK parses them back to uint64 here.
+//
+//   WalletUSDTRaw      - SPL USDT sitting in the user's owner-controlled
+//                        ATA (the on-chain wallet); funds that can be
+//                        shielded.
+//   PendingDepositsRaw - shield deposits the user has signed but the
+//                        sequencer has not yet credited (e.g. inflight
+//                        Solana txs).
+//   ShieldedBalanceRaw - the user's shielded balance held inside the
+//                        pool, as tracked by the sequencer. This is the
+//                        same number streamed by the BalanceUpdate WS
+//                        push, but as an on-demand snapshot.
+//   WalletUSDTUI       - the same wallet amount expressed as the
+//                        ui-decimal preview (USDT human units, e.g.
+//                        12.345). Convenience only; do not use for
+//                        arithmetic -- always reconcile against
+//                        WalletUSDTRaw.
+type Balance struct {
+	WalletUSDTRaw      uint64
+	PendingDepositsRaw uint64
+	ShieldedBalanceRaw uint64
+	WalletUSDTUI       float64
+}
+
+// MeProfile is the REST profile snapshot returned by
+// GodarkRestClient.GetMe, fetched from `GET /api/v1/auth/me`. Notably
+// WalletAddress is the Solana base58 owner pubkey the SDK passes as the
+// path parameter to GetBalance.
+type MeProfile struct {
+	ID            string
+	DynamicUserID string
+	Email         string
+	WalletAddress string
+	ReferralCode  string
+	Tier          string
+}
+
 // MarginAlert is a push frame describing a margin tier transition / recovery.
 type MarginAlert struct {
 	Owner               string

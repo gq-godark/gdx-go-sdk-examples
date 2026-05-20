@@ -1062,6 +1062,40 @@ func coerceUint64(v any) uint64 {
 		return uint64(x)
 	case uint64:
 		return x
+	case string:
+		// Decimal-encoded u64 (used by shielded-pool's BalancesResponse
+		// because u64 doesn't roundtrip JSON safely).
+		if x == "" {
+			return 0
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(x), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
+}
+
+// coerceFloat64 best-effort-parses a JSON number / nullable number into
+// a Go float64. nil and unparseable values become 0.
+func coerceFloat64(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		if x == "" {
+			return 0
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0
+		}
+		return f
 	}
 	return 0
 }

@@ -63,6 +63,7 @@ type GodarkRestClient struct {
 	mu             sync.RWMutex
 	bearer         string
 	userUUID       string
+	walletAddr     string
 	localCOIDIndex map[string]string
 }
 
@@ -208,6 +209,7 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	c.bearer = ""
 	c.userUUID = ""
+	c.walletAddr = ""
 	c.localCOIDIndex = make(map[string]string)
 	c.mu.Unlock()
 	c.session.Reset()
@@ -385,6 +387,90 @@ func (c *GodarkRestClient) GetOrderByClientID(ctx context.Context, clientOrderID
 		return nil, newConnectionError("not connected")
 	}
 	return c.http.GetOrderByClientOrderID(ctx, bearer, clientOrderID)
+}
+
+// GetMe fetches the authenticated user's profile via
+// `GET /api/v1/auth/me`. The result is cached on the client; subsequent
+// calls within a connected session return the cached value.
+//
+// The most useful field is WalletAddress -- the Solana base58 owner
+// pubkey the SDK passes to GetBalance and other on-chain endpoints.
+func (c *GodarkRestClient) GetMe(ctx context.Context) (*MeProfile, error) {
+	c.mu.RLock()
+	bearer := c.bearer
+	cachedWallet := c.walletAddr
+	c.mu.RUnlock()
+	if bearer == "" {
+		return nil, newConnectionError("not connected")
+	}
+	data, err := c.http.GetAuthMe(ctx, bearer)
+	if err != nil {
+		return nil, err
+	}
+	me := &MeProfile{
+		ID:            stringValue(data["id"]),
+		DynamicUserID: stringValue(data["dynamic_user_id"]),
+		Email:         stringValue(data["email"]),
+		WalletAddress: stringValue(data["wallet_address"]),
+		ReferralCode:  stringValue(data["referral_code"]),
+		Tier:          stringValue(data["tier"]),
+	}
+	if me.WalletAddress != "" && me.WalletAddress != cachedWallet {
+		c.mu.Lock()
+		c.walletAddr = me.WalletAddress
+		c.mu.Unlock()
+	}
+	return me, nil
+}
+
+// GetBalance fetches the on-chain balance snapshot for `owner` (the
+// Solana base58 wallet pubkey) via
+// `GET /api/v1/shielded-pool/balances/{owner}`. The response splits the
+// USDT position into wallet (SPL ATA), in-flight shield deposits, and
+// the sequencer-tracked shielded balance.
+//
+// Calling this also nudges the edge's BalanceWatchService to start
+// streaming shielded-balance pushes for (authenticated user, owner).
+func (c *GodarkRestClient) GetBalance(ctx context.Context, owner string) (*Balance, error) {
+	c.mu.RLock()
+	bearer := c.bearer
+	c.mu.RUnlock()
+	if bearer == "" {
+		return nil, newConnectionError("not connected")
+	}
+	if strings.TrimSpace(owner) == "" {
+		return nil, errors.New("GetBalance: owner pubkey is required (use GetMyBalance to auto-resolve from /auth/me)")
+	}
+	data, err := c.http.GetShieldedPoolBalances(ctx, bearer, owner)
+	if err != nil {
+		return nil, err
+	}
+	return &Balance{
+		WalletUSDTRaw:      coerceUint64(data["walletUsdtRaw"]),
+		PendingDepositsRaw: coerceUint64(data["pendingDepositsRaw"]),
+		ShieldedBalanceRaw: coerceUint64(data["shieldedBalanceRaw"]),
+		WalletUSDTUI:       coerceFloat64(data["walletUsdtUi"]),
+	}, nil
+}
+
+// GetMyBalance is the convenience pairing of GetMe + GetBalance: it
+// resolves the user's owner pubkey from `/auth/me` (cached after the
+// first hit) and then fetches the shielded-pool balance snapshot.
+func (c *GodarkRestClient) GetMyBalance(ctx context.Context) (*Balance, error) {
+	c.mu.RLock()
+	owner := c.walletAddr
+	c.mu.RUnlock()
+	if owner == "" {
+		me, err := c.GetMe(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if me.WalletAddress == "" {
+			return nil, errors.New("GetMyBalance: /auth/me returned empty wallet_address")
+		}
+		owner = me.WalletAddress
+	}
+	return c.GetBalance(ctx, owner)
 }
 
 // AwaitTerminalStatus polls GetOrder until the order reaches one of

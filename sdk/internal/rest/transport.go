@@ -62,6 +62,19 @@ func (t *Transport) SetClient(c *http.Client) { t.client = c }
 // -----------------------------------------------------------------------
 
 func (t *Transport) doJSON(ctx context.Context, method, path string, bearer string, body any, query url.Values) (map[string]any, error) {
+	raw, err := t.doJSONRaw(ctx, method, path, bearer, body, query)
+	if err != nil {
+		return nil, err
+	}
+	return unwrap(raw)
+}
+
+// doJSONRaw issues a request and returns the parsed top-level JSON
+// object as-is, WITHOUT unwrapping the docs `{code, data, ...}`
+// envelope. Use this only for endpoints that intentionally return their
+// payload at the response root (e.g. legacy / non-docs APIs like
+// shielded-pool, auth/me). Status >= 400 still surfaces as an error.
+func (t *Transport) doJSONRaw(ctx context.Context, method, path string, bearer string, body any, query url.Values) (map[string]any, error) {
 	u := t.base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -100,15 +113,18 @@ func (t *Transport) doJSON(ctx context.Context, method, path string, bearer stri
 	if resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("%s %s: server status %d: %s", method, u, resp.StatusCode, string(respBody))
 	}
-	if resp.StatusCode >= 400 && len(respBody) == 0 {
-		return nil, fmt.Errorf("%s %s: status %d (empty body)", method, u, resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		if len(respBody) == 0 {
+			return nil, fmt.Errorf("%s %s: status %d (empty body)", method, u, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("%s %s: status %d: %s", method, u, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	var env map[string]any
-	if err := json.Unmarshal(respBody, &env); err != nil {
+	var out map[string]any
+	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("%s %s: bad JSON (status %d): %w", method, u, resp.StatusCode, err)
 	}
-	return unwrap(env)
+	return out, nil
 }
 
 func unwrap(env map[string]any) (map[string]any, error) {
@@ -217,6 +233,32 @@ func (t *Transport) RegisterClientOrderMapping(ctx context.Context, bearer, clie
 // are typically silenced by callers.
 func (t *Transport) RevokeToken(ctx context.Context, bearer string) (map[string]any, error) {
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token/revoke", bearer, nil, nil)
+}
+
+// GetShieldedPoolBalances issues
+// `GET /api/v1/shielded-pool/balances/{owner}`. `owner` is the user's
+// Solana base58 wallet pubkey (the same value `GetMe` returns as
+// `wallet_address`). The edge returns its payload at the JSON root
+// (no docs envelope), with all u64 raw amounts decimal-encoded as
+// strings:
+//
+//	{
+//	  "walletUsdtRaw":        "12345",
+//	  "walletUsdtUi":          12.345,
+//	  "pendingDepositsRaw":   "1000",
+//	  "shieldedBalanceRaw":   "5000"
+//	}
+//
+// Note: hitting this endpoint also nudges the edge's BalanceWatchService
+// to start streaming shielded-balance pushes for (user, owner).
+func (t *Transport) GetShieldedPoolBalances(ctx context.Context, bearer, owner string) (map[string]any, error) {
+	return t.doJSONRaw(ctx, http.MethodGet, "/api/v1/shielded-pool/balances/"+url.PathEscape(owner), bearer, nil, nil)
+}
+
+// GetAuthMe issues `GET /api/v1/auth/me` and returns the authenticated
+// user's profile (raw JSON root, snake_case keys -- not envelope-wrapped).
+func (t *Transport) GetAuthMe(ctx context.Context, bearer string) (map[string]any, error) {
+	return t.doJSONRaw(ctx, http.MethodGet, "/api/v1/auth/me", bearer, nil, nil)
 }
 
 // IsEnvelopeError reports whether err is (or wraps) an *EnvelopeError.
