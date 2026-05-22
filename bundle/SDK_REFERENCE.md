@@ -1,19 +1,12 @@
 # GoDark Go SDK Reference (MM Distribution)
 
 This reference covers the `godark` public surface shipped under `sdk/` in
-this bundle. It is curated for MM integrators and shows the smallest set
-of calls you need to place, modify, cancel, subscribe, and decode order
-and position pushes from the encrypted edge.
-
-Everything required to build is included in this bundle: SDK source under
-`sdk/`, pre-generated protobuf bindings under `sdk/proto/`, and a
-top-level `go.mod` wired so a local `go build` resolves the SDK from the
-bundled copy.
+this bundle.
 
 ## Module + import
 
 In your own `go.mod`, depend on the SDK via a path-based `replace`
-directive pointing at the vendored copy this bundle ships (or a copy you
+directive pointing at the bundled copy this bundle ships (or a copy you
 keep in your own repository):
 
 ```go
@@ -220,16 +213,6 @@ client, _ := godark.NewClient(godark.ClientConfig{
 
 ## Versioning
 
-This bundle was cut from a specific upstream SDK commit; the SHA is
-recorded in `sdk/UPSTREAM_REF`. Newer bundles bump that pin and ship
-under a new release tag. Wire compatibility with the production
-sequencer is the contract `gdx-proto@v1/devnet` (and later revisions)
-maintains.
-
-To upgrade your project to a newer SDK revision:
-
-1. Download the new release zip.
-2. Replace your local copy of the vendored `sdk/` (wherever your
-   `replace` directive points) with the `sdk/` directory from the new
-   zip.
-3. `go build ./...` and re-run your regression tests.
+Each release ships a frozen `sdk/` tree under this bundle. To upgrade,
+download a newer release zip, replace your local copy of `sdk/`, and
+re-run `go build ./...` plus your regression tests.

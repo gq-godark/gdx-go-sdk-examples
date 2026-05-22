@@ -37,7 +37,6 @@
 #   |   |-- full_trader_example/main.go
 #   |   `-- internal/envloader/envloader.go
 #   `-- sdk/
-#       |-- UPSTREAM_REF           (the upstream commit the bundle was cut from)
 #       |-- go.mod                 (godark module manifest)
 #       |-- go.sum
 #       |-- shared/symbols.json    (//go:embed asset)
@@ -46,7 +45,7 @@
 #       `-- *.go                   (godark package source -- no tests, no docs)
 #
 # Usage:
-#   bash scripts/package.sh
+#   bash scripts/package.sh                              # default: godark-go-sdk.zip
 #   bash scripts/package.sh my-release-name
 #   UPSTREAM_SRC=/path/to/gdx-go-sdk bash scripts/package.sh
 set -euo pipefail
@@ -55,7 +54,7 @@ UPSTREAM_REPO="gq-godark/gdx-go-sdk"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DIST_NAME="${1:-gdx-go-sdk}"
+DIST_NAME="${1:-godark-go-sdk}"
 
 cd "$REPO_ROOT"
 
@@ -70,7 +69,8 @@ if [[ -z "$PINNED_REF" ]]; then
   exit 1
 fi
 
-for required in bundle/README.md bundle/SDK_REFERENCE.md .env.example \
+for required in bundle/README.md bundle/SDK_REFERENCE.md bundle/go.mod \
+                go.sum .env.example \
                 examples/quickstart/main.go examples/full_trader_example/main.go \
                 examples/internal/envloader/envloader.go; do
   if [[ ! -f "${REPO_ROOT}/${required}" ]]; then
@@ -185,18 +185,27 @@ cp "${REPO_ROOT}/bundle/README.md"            "$DEST/README.md"
 cp "${REPO_ROOT}/bundle/SDK_REFERENCE.md"     "$DEST/SDK_REFERENCE.md"
 
 # Top-level go.mod / go.sum so `cd <bundle> && go build ./examples/...`
-# resolves the vendored godark via the `replace` directive.
-cp "${REPO_ROOT}/go.mod"                      "$DEST/go.mod"
+# resolves the bundled godark via the `replace` directive.
+cp "${REPO_ROOT}/bundle/go.mod"               "$DEST/go.mod"
 cp "${REPO_ROOT}/go.sum"                      "$DEST/go.sum"
 
-# Example sources.
-cp "${REPO_ROOT}/examples/quickstart/main.go"                       "$DEST/examples/quickstart/main.go"
-cp "${REPO_ROOT}/examples/full_trader_example/main.go"              "$DEST/examples/full_trader_example/main.go"
-cp "${REPO_ROOT}/examples/internal/envloader/envloader.go"          "$DEST/examples/internal/envloader/envloader.go"
+# Example sources — rewrite the examples module import path for recipients.
+rewrite_example() {
+  sed 's|github.com/gq-godark/gdx-go-sdk-examples/examples|godark-examples/examples|g' \
+    "$1" > "$2"
+}
+rewrite_example "${REPO_ROOT}/examples/quickstart/main.go" \
+  "$DEST/examples/quickstart/main.go"
+rewrite_example "${REPO_ROOT}/examples/full_trader_example/main.go" \
+  "$DEST/examples/full_trader_example/main.go"
+cp "${REPO_ROOT}/examples/internal/envloader/envloader.go" \
+  "$DEST/examples/internal/envloader/envloader.go"
 
-# Vendored godark module -- mirror of $REPO_ROOT/sdk/ minus the parity-
-# checked drops. Use cp -a to keep .go files and the proto bindings tree.
+# Bundled godark module — mirror of $REPO_ROOT/sdk/ minus maintainer pin.
 cp -a "${REPO_ROOT}/sdk/." "$DEST/sdk/"
+rm -f "$DEST/sdk/UPSTREAM_REF"
+sed -i 's/list in sync with `gdx-protocol`/list mirrors the canonical protocol schema/' \
+  "$DEST/sdk/order_error_code.go"
 
 # ---- zip ------------------------------------------------------------------
 ARCHIVE="$REPO_ROOT/${DIST_NAME}.zip"
@@ -242,9 +251,14 @@ for f in "${FORBIDDEN_SDK[@]}"; do
 done
 # Recipient contract: source-only bundle must NOT ship any binaries.
 # (Catches accidental reintroduction of a `go build` step in CI.)
-if echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ && $4 !~ /UPSTREAM_REF$/ {print}' | grep -v "${DIST_NAME}/$" >/dev/null; then
+if echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ {print}' | grep -v "${DIST_NAME}/$" >/dev/null; then
   echo "error: bundle contains non-source artifacts (binaries or unexpected files):" >&2
-  echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ && $4 !~ /UPSTREAM_REF$/ {print "  " $4}' >&2
+  echo "$LISTING" | awk 'NR>3 && $4!="" && $4 !~ /\/$/ && $4 !~ /\.(go|mod|sum|md|json|example)$/ {print "  " $4}' >&2
+  exit 1
+fi
+
+if echo "$LISTING" | grep -E "${DIST_NAME}/(sdk/UPSTREAM_REF|/\\.env$)" >/dev/null; then
+  echo "error: bundle contains maintainer-only metadata or .env" >&2
   exit 1
 fi
 
@@ -258,7 +272,6 @@ for required in \
   "${DIST_NAME}/examples/quickstart/main\\.go" \
   "${DIST_NAME}/examples/full_trader_example/main\\.go" \
   "${DIST_NAME}/examples/internal/envloader/envloader\\.go" \
-  "${DIST_NAME}/sdk/UPSTREAM_REF" \
   "${DIST_NAME}/sdk/go\\.mod" \
   "${DIST_NAME}/sdk/go\\.sum" \
   "${DIST_NAME}/sdk/client\\.go"; do
@@ -270,4 +283,16 @@ done
 
 echo
 echo "bundle-shape assertion: PASSED"
+
+# Must NOT leak internal repo names or maintainer markers into recipient docs.
+if unzip -p "$ARCHIVE" \
+    "${DIST_NAME}/README.md" \
+    "${DIST_NAME}/SDK_REFERENCE.md" \
+    "${DIST_NAME}/.env.example" 2>/dev/null | strings | grep -qiE \
+  'gdx-go-sdk-examples|UPSTREAM_REF|refresh_sdk|package\.sh|\bvendored\b|gdx-proto'; then
+  echo "error: bundle docs contain internal repo references or maintainer markers" >&2
+  exit 1
+fi
+
+echo "leak guard: PASSED"
 echo "built from upstream:    ${UPSTREAM_REPO}@${PINNED_REF} (${upstream_head_sha})"

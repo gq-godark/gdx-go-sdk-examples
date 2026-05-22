@@ -104,7 +104,7 @@ jobs:
           version="v${base}-build.${{ github.run_number }}"
           # Bundle is source-only / platform-agnostic; no -linux-x86_64
           # suffix (matches python/java SDK-examples naming).
-          bundle_name="gdx-go-sdk-${version}"
+          bundle_name="godark-go-sdk-${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "bundle_name=${bundle_name}" >> "$GITHUB_OUTPUT"
           echo "Building ${bundle_name}.zip (godark==${base} from upstream pin ${{ steps.pin.outputs.ref }})"
@@ -181,8 +181,8 @@ jobs:
           body: |
             **Automated release** built from commit `${{ github.sha }}`.
 
-            Source bundle vendored from upstream `gq-godark/gdx-go-sdk` at
-            pinned ref `${{ needs.build.outputs.pinned_ref }}`.
+            Source bundle with bundled `godark` module and minimal Go examples
+            for the GoDark Go SDK.
 
             > **Download the asset named `${{ needs.build.outputs.bundle_name }}.zip` below.**
             > Do **not** click "Source code (zip)" / "Source code (tar.gz)" —
