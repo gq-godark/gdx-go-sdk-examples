@@ -178,11 +178,12 @@ var cancelReasonFromProto = map[int32]CancelReason{
 
 // Request / response message-type ints used by the docs-wire envelope.
 var requestTypeToProto = map[string]int32{
-	"place":     1,
-	"cancel":    2,
-	"modify":    3,
-	"subscribe": 4,
-	"signing":   5,
+	"place":           1,
+	"cancel":          2,
+	"modify":          3,
+	"subscribe":       4,
+	"signing":         5,
+	"update_leverage": 8,
 }
 
 var responseMessageTypeToProto = map[string]int32{
