@@ -35,6 +35,7 @@ Copy `.env.example` to `.env` and set:
 
 - `GODARK_API_KEY_ID`
 - `GODARK_API_SECRET`
+- `GODARK_PASSPHRASE` — required for API key-pair auth.
 
 ```bash
 cp .env.example .env
@@ -98,8 +99,9 @@ import (
 
 func main() {
     client, err := godark.NewClient(godark.ClientConfig{
-        APIKeyID:  os.Getenv("GODARK_API_KEY_ID"),
-        APISecret: os.Getenv("GODARK_API_SECRET"),
+        APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+        APISecret:  os.Getenv("GODARK_API_SECRET"),
+        Passphrase: os.Getenv("GODARK_PASSPHRASE"),
     })
     if err != nil {
         log.Fatal(err)

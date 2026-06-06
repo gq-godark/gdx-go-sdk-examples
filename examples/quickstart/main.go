@@ -7,6 +7,7 @@
 //
 //	GODARK_API_KEY_ID=gdk_...
 //	GODARK_API_SECRET=...
+//	GODARK_PASSPHRASE=...
 //	# GODARK_EDGE_URL=wss://api.godark-dex.com   (optional override)
 //
 // Run with:
@@ -33,15 +34,17 @@ func main() {
 
 	apiKeyID := os.Getenv("GODARK_API_KEY_ID")
 	apiSecret := os.Getenv("GODARK_API_SECRET")
+	passphrase := os.Getenv("GODARK_PASSPHRASE")
 	baseURL := os.Getenv("GODARK_EDGE_URL")
-	if apiKeyID == "" || apiSecret == "" {
-		log.Fatal("Set GODARK_API_KEY_ID and GODARK_API_SECRET in .env or your environment")
+	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
+		log.Fatal("Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE in .env or your environment")
 	}
 
 	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:  apiKeyID,
-		APISecret: apiSecret,
-		BaseURL:   baseURL, // empty => SDK default
+		APIKeyID:   apiKeyID,
+		APISecret:  apiSecret,
+		Passphrase: passphrase,
+		BaseURL:    baseURL, // empty => SDK default
 	})
 	if err != nil {
 		log.Fatal(err)

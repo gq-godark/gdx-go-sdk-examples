@@ -46,8 +46,9 @@ func main() {
 
 	apiKeyID := os.Getenv("GODARK_API_KEY_ID")
 	apiSecret := os.Getenv("GODARK_API_SECRET")
-	if apiKeyID == "" || apiSecret == "" {
-		log.Fatal("Missing credentials. Set GODARK_API_KEY_ID and GODARK_API_SECRET (or provide them in .env).")
+	passphrase := os.Getenv("GODARK_PASSPHRASE")
+	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
+		log.Fatal("Missing credentials. Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE (or provide them in .env).")
 	}
 	wsURL := os.Getenv("GODARK_EDGE_URL")
 	if wsURL == "" {
@@ -63,9 +64,10 @@ func main() {
 
 	// --- REST pre-flight: identity + balance check ---
 	rest, err := godark.NewRestClient(godark.RestClientConfig{
-		APIKeyID:  apiKeyID,
-		APISecret: apiSecret,
-		BaseURL:   restURL,
+		APIKeyID:   apiKeyID,
+		APISecret:  apiSecret,
+		Passphrase: passphrase,
+		BaseURL:    restURL,
 	})
 	if err != nil {
 		log.Fatalf("REST config error: %v", err)
@@ -98,9 +100,10 @@ func main() {
 	headers.Set("X-Trader-Tag", "go-full-trader-demo")
 
 	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:  apiKeyID,
-		APISecret: apiSecret,
-		BaseURL:   wsURL,
+		APIKeyID:   apiKeyID,
+		APISecret:  apiSecret,
+		Passphrase: passphrase,
+		BaseURL:    wsURL,
 		Transport: godark.TransportConfig{
 			Headers:           headers,
 			HeartbeatInterval: 30 * time.Second,

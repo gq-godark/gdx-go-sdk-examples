@@ -39,8 +39,9 @@ key) and the same protobuf wire bindings.
 
 ```go
 client, err := godark.NewClient(godark.ClientConfig{
-    APIKeyID:  os.Getenv("GODARK_API_KEY_ID"),
-    APISecret: os.Getenv("GODARK_API_SECRET"),
+    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+    APISecret:  os.Getenv("GODARK_API_SECRET"),
+    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
     // BaseURL defaults to wss://api.godark-dex.com; override via
     // GODARK_EDGE_URL/GDX_EDGE_URL env vars or this field.
     BaseURL: os.Getenv("GODARK_EDGE_URL"),
@@ -66,8 +67,9 @@ don't need push streams.
 
 ```go
 rest, err := godark.NewRestClient(godark.RestClientConfig{
-    APIKeyID:  os.Getenv("GODARK_API_KEY_ID"),
-    APISecret: os.Getenv("GODARK_API_SECRET"),
+    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+    APISecret:  os.Getenv("GODARK_API_SECRET"),
+    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
     // BaseURL defaults to https://api.godark-dex.com (derived from the
     // edge WS URL if GODARK_REST_URL/GDX_REST_URL is unset).
 })
@@ -203,7 +205,7 @@ against a non-prod edge with a custom symbol set, pass `SymbolMap` on
 
 ```go
 client, _ := godark.NewClient(godark.ClientConfig{
-    APIKeyID: ..., APISecret: ...,
+    APIKeyID: ..., APISecret: ..., Passphrase: ...,
     SymbolMap: map[string]int64{
         "BTC-USDC-PERP": 1,
         "ETH-USDC-PERP": 2,

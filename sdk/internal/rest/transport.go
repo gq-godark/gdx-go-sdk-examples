@@ -196,6 +196,17 @@ func (t *Transport) PostOrdersEncrypted(ctx context.Context, bearer string, body
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/orders", bearer, body, nil)
 }
 
+// GetLeverage issues `GET /api/v1/leverage`.
+func (t *Transport) GetLeverage(ctx context.Context, bearer string) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/leverage", bearer, nil, nil)
+}
+
+// PostLeverageEncrypted issues `POST /api/v1/leverage` with an already-
+// encrypted update-leverage body.
+func (t *Transport) PostLeverageEncrypted(ctx context.Context, bearer string, body map[string]any) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodPost, "/api/v1/leverage", bearer, body, nil)
+}
+
 // DeleteOrderEncrypted issues `DELETE /api/v1/orders/{order_id}` with an
 // encrypted body.
 func (t *Transport) DeleteOrderEncrypted(ctx context.Context, bearer, orderID string, body map[string]any) (map[string]any, error) {
