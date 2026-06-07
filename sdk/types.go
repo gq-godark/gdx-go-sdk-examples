@@ -4,6 +4,18 @@ package godark
 // price values are stringly-typed decimals so callers don't lose precision
 // to float64. Convert with math/big or shopspring/decimal as needed.
 
+// LeverageSetting is one row in a leverage-settings snapshot.
+type LeverageSetting struct {
+	SymbolID int64
+	Leverage int32
+}
+
+// LeverageSettings is the REST snapshot returned by
+// GodarkRestClient.GetLeverage via `GET /api/v1/leverage`.
+type LeverageSettings struct {
+	Settings []LeverageSetting
+}
+
 // OrderAck is the response to a Place / Cancel / Modify command.
 type OrderAck struct {
 	OrderID  string

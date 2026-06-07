@@ -52,9 +52,11 @@ type RestClientConfig struct {
 // derived via X25519 ECDH; the edge stays stateless and only routes the
 // encrypted envelope.
 type GodarkRestClient struct {
-	authToken  string
-	passphrase string
-	baseURL    string
+	legacyToken string
+	apiKeyID    string
+	apiSecret   string
+	passphrase  string
+	baseURL     string
 	symbolMap  map[string]int64
 	http       *rest.Transport
 	session    *session.CryptoSession
@@ -70,10 +72,11 @@ type GodarkRestClient struct {
 // NewRestClient validates the config and returns an unconnected client.
 // Call Connect to obtain a bearer token and complete ECDH session setup.
 func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
-	authToken, err := resolveAuthToken(ClientConfig{
-		APIKey:    cfg.APIKey,
-		APIKeyID:  cfg.APIKeyID,
-		APISecret: cfg.APISecret,
+	creds, err := resolveRestCredentials(RestClientConfig{
+		APIKey:     cfg.APIKey,
+		APIKeyID:   cfg.APIKeyID,
+		APISecret:  cfg.APISecret,
+		Passphrase: cfg.Passphrase,
 	})
 	if err != nil {
 		return nil, err
@@ -84,8 +87,10 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		symMap = DefaultSymbolMap()
 	}
 	return &GodarkRestClient{
-		authToken:      authToken,
-		passphrase:     cfg.Passphrase,
+		legacyToken:    creds.legacyToken,
+		apiKeyID:       creds.apiKeyID,
+		apiSecret:      creds.apiSecret,
+		passphrase:     creds.passphrase,
 		baseURL:        base,
 		symbolMap:      symMap,
 		http:           rest.New(base, cfg.HTTPClient),
@@ -93,6 +98,40 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		fallback:       resolveUserUUID(cfg.UserUUID),
 		localCOIDIndex: make(map[string]string),
 	}, nil
+}
+
+type restCredentials struct {
+	legacyToken string
+	apiKeyID    string
+	apiSecret   string
+	passphrase  string
+}
+
+func resolveRestCredentials(cfg RestClientConfig) (restCredentials, error) {
+	if cfg.APIKeyID != "" || cfg.APISecret != "" {
+		if cfg.APIKeyID == "" || cfg.APISecret == "" {
+			return restCredentials{}, errors.New("APIKeyID and APISecret must be provided together")
+		}
+		if cfg.APIKey != "" {
+			return restCredentials{}, errors.New("use either APIKey or (APIKeyID + APISecret), not both")
+		}
+		passphrase, err := resolvePassphrase(cfg.Passphrase)
+		if err != nil {
+			return restCredentials{}, err
+		}
+		return restCredentials{
+			apiKeyID:   cfg.APIKeyID,
+			apiSecret:  cfg.APISecret,
+			passphrase: passphrase,
+		}, nil
+	}
+	if cfg.APIKey != "" {
+		if strings.TrimSpace(cfg.Passphrase) != "" {
+			return restCredentials{}, errors.New("Passphrase must not be set when using legacy APIKey")
+		}
+		return restCredentials{legacyToken: cfg.APIKey}, nil
+	}
+	return restCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
 }
 
 // IsSessionEstablished reports whether ECDH session setup completed.
@@ -125,11 +164,10 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 		authData map[string]any
 		err      error
 	)
-	if strings.Contains(c.authToken, ":") {
-		parts := strings.SplitN(c.authToken, ":", 2)
-		authData, err = c.http.AuthTokenClientCredentials(ctx, parts[0], parts[1], c.passphrase)
+	if c.apiKeyID != "" {
+		authData, err = c.http.AuthTokenClientCredentials(ctx, c.apiKeyID, c.apiSecret, c.passphrase)
 	} else {
-		authData, err = c.http.AuthTokenLegacy(ctx, c.authToken)
+		authData, err = c.http.AuthTokenLegacy(ctx, c.legacyToken)
 	}
 	if err != nil {
 		return newAuthenticationError(err.Error())
@@ -471,6 +509,96 @@ func (c *GodarkRestClient) GetMyBalance(ctx context.Context) (*Balance, error) {
 		owner = me.WalletAddress
 	}
 	return c.GetBalance(ctx, owner)
+}
+
+// GetLeverage fetches per-symbol leverage settings via `GET /api/v1/leverage`.
+func (c *GodarkRestClient) GetLeverage(ctx context.Context) (*LeverageSettings, error) {
+	c.mu.RLock()
+	bearer := c.bearer
+	c.mu.RUnlock()
+	if bearer == "" {
+		return nil, newConnectionError("not connected")
+	}
+	raw, err := c.http.GetLeverage(ctx, bearer)
+	if err != nil {
+		return nil, err
+	}
+	rows, _ := raw["settings"].([]any)
+	out := &LeverageSettings{Settings: make([]LeverageSetting, 0, len(rows))}
+	for _, row := range rows {
+		m, ok := row.(map[string]any)
+		if !ok {
+			continue
+		}
+		out.Settings = append(out.Settings, LeverageSetting{
+			SymbolID: int64(coerceUint64(m["symbol_id"])),
+			Leverage: int32(coerceUint64(m["leverage"])),
+		})
+	}
+	return out, nil
+}
+
+// UpdateLeverage sends an encrypted leverage update via `POST /api/v1/leverage`.
+// The JSON header must include `leverage` so the edge can update its DB cache
+// and fan out WS pushes on success.
+func (c *GodarkRestClient) UpdateLeverage(ctx context.Context, symbol string, leverage int) (*OrderAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	lev := leverage
+	if lev < 1 {
+		lev = 1
+	}
+
+	corrID := newCorrelationID()
+	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
+	nonceCounter := c.session.NextNonce()
+
+	aad, err := BuildOrderHeaderAAD(c.userUUIDBytes(), uint64(symbolID), "update_leverage", uint64(nonceCounter), bodyLength, corrID)
+	if err != nil {
+		return nil, err
+	}
+	actualNonce, ciphertext, err := c.session.EncryptOrder(aad, plaintext)
+	if err != nil {
+		return nil, newEncryptionError(fmt.Sprintf("encrypt leverage update: %v", err))
+	}
+	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
+
+	corrIDStr := ""
+	if s, err := identity.FromBytes(corrID); err == nil {
+		corrIDStr = s
+	}
+	headerObj := map[string]any{
+		"symbol_id":      symbolID,
+		"request_type":   "update_leverage",
+		"nonce":          actualNonce,
+		"body_length":    bodyLength,
+		"correlation_id": corrIDStr,
+		"leverage":       lev,
+	}
+	payload := map[string]any{
+		"header":     headerObj,
+		"ciphertext": bodyB64,
+	}
+
+	c.mu.RLock()
+	bearer := c.bearer
+	c.mu.RUnlock()
+
+	raw, err := c.http.PostLeverageEncrypted(ctx, bearer, payload)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseAck(raw)
 }
 
 // AwaitTerminalStatus polls GetOrder until the order reaches one of

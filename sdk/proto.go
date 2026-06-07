@@ -160,6 +160,25 @@ func BuildCancelOrderRequest(orderID uint64, userUUID []byte, symbolID uint64, c
 	return proto.Marshal(req)
 }
 
+// BuildUpdateLeverageRequest serializes an UpdateLeverageRequest wrapped in
+// EdgeSequencerRequest (field 19). Leverage is clamped to max(1, floor(value)).
+func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, correlationID []byte) ([]byte, error) {
+	lev := leverage
+	if lev < 1 {
+		lev = 1
+	}
+	ul := &sequencerpb.UpdateLeverageRequest{
+		UserUuid:      userUUID,
+		SymbolId:      symbolID,
+		Leverage:      uint32(lev),
+		CorrelationId: correlationID,
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_UpdateLeverage{UpdateLeverage: ul},
+	}
+	return proto.Marshal(req)
+}
+
 // BuildModifyOrderRequest serializes a ModifyOrderInput wrapped in EdgeSequencerRequest.
 func BuildModifyOrderRequest(
 	orderID uint64,

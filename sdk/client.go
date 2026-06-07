@@ -36,10 +36,13 @@ type ClientConfig struct {
 	// (APIKeyID + APISecret), not both.
 	APIKey string
 
-	// APIKeyID / APISecret are the modern key-pair credentials. Both must be
-	// set together; the client joins them with `:` to form the wire token.
-	APIKeyID  string
-	APISecret string
+	// APIKeyID / APISecret / Passphrase are the modern key-pair credentials.
+	// All three must be set together (Passphrase may also come from
+	// GODARK_PASSPHRASE / GDX_PASSPHRASE); the client joins them with `:`
+	// to form the wire token `key_id:secret:passphrase`.
+	APIKeyID   string
+	APISecret  string
+	Passphrase string
 
 	// BaseURL is the edge WebSocket origin (host only, e.g.
 	// `wss://api.godark-dex.com`). The client appends `/ws/v1` to produce
@@ -946,6 +949,18 @@ func (c *GodarkClient) resolveSymbol(symbol string) (int64, error) {
 	return id, nil
 }
 
+func resolvePassphrase(explicit string) (string, error) {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v, nil
+	}
+	for _, key := range []string{"GODARK_PASSPHRASE", "GDX_PASSPHRASE"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v, nil
+		}
+	}
+	return "", errors.New("passphrase is required when using APIKeyID and APISecret")
+}
+
 func resolveAuthToken(cfg ClientConfig) (string, error) {
 	if cfg.APIKeyID != "" || cfg.APISecret != "" {
 		if cfg.APIKeyID == "" || cfg.APISecret == "" {
@@ -954,9 +969,16 @@ func resolveAuthToken(cfg ClientConfig) (string, error) {
 		if cfg.APIKey != "" {
 			return "", errors.New("use either APIKey or (APIKeyID + APISecret), not both")
 		}
-		return cfg.APIKeyID + ":" + cfg.APISecret, nil
+		passphrase, err := resolvePassphrase(cfg.Passphrase)
+		if err != nil {
+			return "", err
+		}
+		return cfg.APIKeyID + ":" + cfg.APISecret + ":" + passphrase, nil
 	}
 	if cfg.APIKey != "" {
+		if strings.TrimSpace(cfg.Passphrase) != "" {
+			return "", errors.New("Passphrase must not be set when using legacy APIKey")
+		}
 		return cfg.APIKey, nil
 	}
 	return "", errors.New("provide APIKey or both APIKeyID + APISecret")
