@@ -26,6 +26,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -188,6 +189,59 @@ func main() {
 
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after SELL/CANCEL")
+
+	// --- Bulk quote (mass quote) ---
+	// Place a whole ladder of resting quotes in one batched request. With the
+	// default (post-only) mode -- pass nil for postOnly -- every leg is
+	// post-only: a leg that would cross is rejected as "failed" so the batch
+	// fuses into a single MPC round. Pass a *bool(false) for the relaxed path,
+	// where a crossing leg takes liquidity up to its limit and rests the
+	// remainder (the number of taker fills is reported per leg as FillCount).
+	fmt.Println("Mass-quoting a 3-level BUY ladder (post-only)...")
+	ladder := []godark.MassQuoteLegInput{
+		{Side: godark.SideBuy, Price: 66_000, Quantity: 0.02},
+		{Side: godark.SideBuy, Price: 65_500, Quantity: 0.02},
+		{Side: godark.SideBuy, Price: 65_000, Quantity: 0.02},
+	}
+	var restingIDs []uint64
+	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, 1, nil); mqErr != nil {
+		envloader.PrintOrderError("Mass quote rejected", mqErr)
+	} else {
+		fmt.Printf("Mass quote: success=%v  sequence=%s  legs=%d\n", mq.Success, mq.Sequence, len(mq.Results))
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  new_order_id=%s  fills=%d  err=%s\n",
+				r.LegIndex, r.Status, r.NewOrderID, r.FillCount, errStr)
+			if r.Status == "open" && r.NewOrderID != "" {
+				if id, perr := strconv.ParseUint(r.NewOrderID, 10, 64); perr == nil {
+					restingIDs = append(restingIDs, id)
+				}
+			}
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+	drainOrderUpdates(client, "after MASS QUOTE")
+
+	if len(restingIDs) > 0 {
+		fmt.Printf("Batch-cancelling %d ladder orders (cleanup)...\n", len(restingIDs))
+		if bc, bcErr := client.BatchCancel(ctx, symbol, restingIDs); bcErr != nil {
+			envloader.PrintOrderError("Batch cancel rejected", bcErr)
+		} else {
+			for _, r := range bc.Results {
+				errStr := "<nil>"
+				if r.ErrorCode != nil {
+					errStr = fmt.Sprintf("%d", *r.ErrorCode)
+				}
+				fmt.Printf("  cancel id=%s: cancelled=%v  err=%s\n", r.OrderID, r.Cancelled, errStr)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		drainOrderUpdates(client, "after BATCH CANCEL")
+	}
 
 	// Cleanup: cancel the original BUY (if still resting).
 	fmt.Println("Cancelling original BUY (cleanup)...")

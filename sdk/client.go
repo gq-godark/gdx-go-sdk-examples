@@ -679,6 +679,17 @@ func (c *GodarkClient) emitError(err error) {
 // sendEncryptedOrder is the shared encrypt-send-await path for place / cancel
 // / modify.
 func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte) (*OrderAck, error) {
+	resp, err := c.sendEncryptedCommand(ctx, requestType, symbolID, plaintext, correlationID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseOrderResponse(resp)
+}
+
+// sendEncryptedCommand encrypts plaintext, sends it with the wire op matching
+// requestType, and returns the raw response. Shared by the single-order path
+// and the mass-quote / batch paths.
+func (c *GodarkClient) sendEncryptedCommand(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte) (transport.Message, error) {
 	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
 	nonceCounter := c.session.NextNonce()
 
@@ -709,9 +720,12 @@ func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType strin
 	var payload any
 	if c.transport.UseDocsWire() {
 		opMap := map[string]string{
-			"place":  "order.place",
-			"cancel": "order.cancel",
-			"modify": "order.modify",
+			"place":        "order.place",
+			"cancel":       "order.cancel",
+			"modify":       "order.modify",
+			"mass_quote":   "order.mass_quote",
+			"batch_cancel": "order.batch_cancel",
+			"batch_modify": "order.batch_modify",
 		}
 		payload = map[string]any{
 			"id":   uuid.NewString(),
@@ -736,7 +750,7 @@ func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType strin
 		}
 		return nil, newConnectionError(err.Error())
 	}
-	return c.parseOrderResponse(resp)
+	return resp, nil
 }
 
 func (c *GodarkClient) parseOrderResponse(msg transport.Message) (*OrderAck, error) {
@@ -813,6 +827,158 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	}, nil
 }
 
+// decryptCommandPlaintext decrypts an encrypted_push command response and
+// returns the plaintext NodeResponse bytes. Used by the mass-quote / batch
+// pipelines, which decode their own ack variants from the plaintext.
+func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMessageType string) ([]byte, error) {
+	mt, _ := msg["type"].(string)
+	switch mt {
+	case "error":
+		errMsg, _ := msg["message"].(string)
+		ec, _ := msg["error_code"].(string)
+		return nil, MakeOrderErrorFromJSON(errMsg, ec)
+	case "encrypted_push":
+		// handled below
+	default:
+		return nil, newOrderError(fmt.Sprintf("unexpected response type: %v", mt), "")
+	}
+
+	ctB64, _ := msg["encrypted_body"].(string)
+	ct, err := base64.StdEncoding.DecodeString(ctB64)
+	if err != nil {
+		return nil, newEncryptionError(fmt.Sprintf("decode ack body: %v", err))
+	}
+	nonce := coerceUint32(msg["nonce"])
+	fencingEpoch := coerceUint64(msg["fencing_epoch"])
+	messageType, _ := msg["message_type"].(string)
+	if messageType == "" {
+		messageType = defaultMessageType
+	}
+	aad, err := BuildResponseHeaderAAD(c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.session.DecryptPush(nonce, aad, ct)
+	if err != nil {
+		return nil, newEncryptionError(fmt.Sprintf("decrypt ack: %v", err))
+	}
+	return pt, nil
+}
+
+// MassQuote performs a bulk cancel-replace (market-maker mass quote) on one
+// symbol (up to 20 legs), which fuses into one MPC round. Returns one result
+// per leg.
+//
+// postOnly is the batch-level post-only flag. When nil (the default) or true,
+// a replacement leg that would cross is rejected as "failed". Pass a pointer to
+// false to enable the relaxed path: a crossing leg takes liquidity up to its
+// limit and rests the remainder; such a leg reports FillCount > 0 on its result.
+func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []MassQuoteLegInput, leverage uint32, postOnly *bool) (*MassQuoteAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	if leverage < 1 {
+		leverage = 1
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, leverage, postOnly)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "mass_quote", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "mass_quote_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseMassQuoteAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected mass_quote_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
+// BatchCancel cancels multiple resting orders on one symbol in a single
+// fanned-out request (up to 20 ids). Cancels are pure index removals (zero
+// online MPC rounds). An id that is not resting is reported Cancelled=false
+// (error_code 2003) and never aborts the rest of the batch.
+func (c *GodarkClient) BatchCancel(ctx context.Context, symbol string, orderIDs []uint64) (*BatchCancelAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "batch_cancel", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "batch_cancel_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchCancelAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected batch_cancel_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
+// BatchModify amends multiple resting orders on one symbol in a single
+// fanned-out post-only request (up to 20 legs). Each leg sets NewPrice and/or
+// NewQuantity (at least one). A leg whose amended order would cross is rejected
+// (Modified=false, error_code 2018) rather than taking liquidity; a missing
+// order id is reported Modified=false (error_code 2003). Neither aborts the
+// rest of the batch.
+func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []BatchModifyLegInput) (*BatchModifyAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "batch_modify", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "batch_modify_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchModifyAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected batch_modify_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
 func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
@@ -824,7 +990,8 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 
-	if messageType == "ack" {
+	switch messageType {
+	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack":
 		c.transport.ResolveCommand(msg)
 		return
 	}

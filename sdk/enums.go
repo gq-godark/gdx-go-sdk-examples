@@ -184,6 +184,9 @@ var requestTypeToProto = map[string]int32{
 	"subscribe":       4,
 	"signing":         5,
 	"update_leverage": 8,
+	"mass_quote":      10,
+	"batch_cancel":    11,
+	"batch_modify":    12,
 }
 
 var responseMessageTypeToProto = map[string]int32{
@@ -193,6 +196,9 @@ var responseMessageTypeToProto = map[string]int32{
 	"open_orders_snapshot":   5,
 	"order_history_snapshot": 6,
 	"positions_snapshot":     7,
+	"mass_quote_ack":         8,
+	"batch_cancel_ack":       9,
+	"batch_modify_ack":       10,
 }
 
 // SideFromProto / OrderTypeFromProto / ... are exported because the proto
@@ -201,11 +207,20 @@ var responseMessageTypeToProto = map[string]int32{
 // agnostic types in types.go. Helpers below are unexported but adjacent
 // callers in this package can use them.
 
-func sideEnumFromProto(v int32) (Side, bool)                       { s, ok := sideFromProto[v]; return s, ok }
-func orderTypeEnumFromProto(v int32) (OrderType, bool)             { s, ok := orderTypeFromProto[v]; return s, ok }
-func timeInForceEnumFromProto(v int32) (TimeInForce, bool)         { s, ok := timeInForceFromProto[v]; return s, ok }
-func orderStatusEnumFromProto(v int32) (OrderStatus, bool)         { s, ok := orderStatusFromProto[v]; return s, ok }
-func orderUpdateTypeEnumFromProto(v int32) (OrderUpdateType, bool) { s, ok := orderUpdateTypeFromProto[v]; return s, ok }
+func sideEnumFromProto(v int32) (Side, bool)           { s, ok := sideFromProto[v]; return s, ok }
+func orderTypeEnumFromProto(v int32) (OrderType, bool) { s, ok := orderTypeFromProto[v]; return s, ok }
+func timeInForceEnumFromProto(v int32) (TimeInForce, bool) {
+	s, ok := timeInForceFromProto[v]
+	return s, ok
+}
+func orderStatusEnumFromProto(v int32) (OrderStatus, bool) {
+	s, ok := orderStatusFromProto[v]
+	return s, ok
+}
+func orderUpdateTypeEnumFromProto(v int32) (OrderUpdateType, bool) {
+	s, ok := orderUpdateTypeFromProto[v]
+	return s, ok
+}
 func positionUpdateTypeEnumFromProto(v int32) (PositionUpdateType, bool) {
 	s, ok := positionUpdateTypeFromProto[v]
 	return s, ok

@@ -28,6 +28,78 @@ type OrderAck struct {
 	Error string
 }
 
+// MassQuoteLegInput is one cancel-replace leg of a mass quote.
+type MassQuoteLegInput struct {
+	Side     Side
+	Price    float64
+	Quantity float64
+	// CancelOrderID is the resting order to cancel-replace; nil/0 = pure place.
+	CancelOrderID *uint64
+	// TimeInForce defaults to GTC when empty.
+	TimeInForce TimeInForce
+	// ExpiryTime (ns) is required when TimeInForce == GTD.
+	ExpiryTime *uint64
+}
+
+// BatchModifyLegInput is one amend leg of a batch modify. At least one of
+// NewPrice / NewQuantity must be set.
+type BatchModifyLegInput struct {
+	OrderID     uint64
+	NewPrice    *float64
+	NewQuantity *float64
+}
+
+// MassQuoteLegResult is the outcome of one cancel-replace leg in a mass quote.
+type MassQuoteLegResult struct {
+	LegIndex uint32
+	// Status is "open" | "filled" | "failed" | "unspecified" | "unknown".
+	Status string
+	// CancelledOrderID is empty when there was no cancel target / cancel failed.
+	CancelledOrderID string
+	// NewOrderID is empty when the replacement failed.
+	NewOrderID string
+	// ErrorCode is set (non-nil) when the leg failed.
+	ErrorCode *uint32
+	// FillCount is the number of taker fills this leg produced in relaxed
+	// (post-only=false) mode. 0 for a pure rest or a post-only leg.
+	FillCount uint32
+}
+
+// MassQuoteAck is the batch-level result of a mass quote: one entry per leg.
+type MassQuoteAck struct {
+	Success  bool
+	Sequence string
+	Results  []MassQuoteLegResult
+}
+
+// BatchCancelLegResult is the outcome of cancelling one order id in a batch.
+type BatchCancelLegResult struct {
+	OrderID   string
+	Cancelled bool
+	ErrorCode *uint32
+}
+
+// BatchCancelAck is the batch-level result of a batch cancel.
+type BatchCancelAck struct {
+	Success  bool
+	Sequence string
+	Results  []BatchCancelLegResult
+}
+
+// BatchModifyLegResult is the outcome of amending one resting order in a batch.
+type BatchModifyLegResult struct {
+	OrderID   string
+	Modified  bool
+	ErrorCode *uint32
+}
+
+// BatchModifyAck is the batch-level result of a batch modify.
+type BatchModifyAck struct {
+	Success  bool
+	Sequence string
+	Results  []BatchModifyLegResult
+}
+
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
 	OrderID       string
