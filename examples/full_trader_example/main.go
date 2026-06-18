@@ -197,11 +197,16 @@ func main() {
 	// fuses into a single MPC round. Pass a *bool(false) for the relaxed path,
 	// where a crossing leg takes liquidity up to its limit and rests the
 	// remainder (the number of taker fills is reported per leg as FillCount).
+	// `GDX_BASE` anchors the ladder/cross near the live mark (default 64000).
+	base := 64000.0
+	if v, perr := strconv.ParseFloat(os.Getenv("GDX_BASE"), 64); perr == nil && v > 0 {
+		base = v
+	}
 	fmt.Println("Mass-quoting a 3-level BUY ladder (post-only)...")
 	ladder := []godark.MassQuoteLegInput{
-		{Side: godark.SideBuy, Price: 66_000, Quantity: 0.02},
-		{Side: godark.SideBuy, Price: 65_500, Quantity: 0.02},
-		{Side: godark.SideBuy, Price: 65_000, Quantity: 0.02},
+		{Side: godark.SideBuy, Price: base * (1 - 0.003), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: base * (1 - 0.006), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: base * (1 - 0.009), Quantity: 0.02},
 	}
 	var restingIDs []uint64
 	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, 1, nil); mqErr != nil {
@@ -242,6 +247,47 @@ func main() {
 		time.Sleep(500 * time.Millisecond)
 		drainOrderUpdates(client, "after BATCH CANCEL")
 	}
+
+	// Demonstrate the batch-level post_only flag on a crossing leg.
+	crossPx := base * 1.02
+	// post_only=true: a crossing leg is rejected (would-cross, error_code 2018).
+	postOnlyTrue := true
+	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
+	if mq, mqErr := client.MassQuote(ctx, symbol,
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.001}},
+		1, &postOnlyTrue); mqErr != nil {
+		envloader.PrintOrderError("post_only=true mass quote rejected", mqErr)
+	} else {
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  err=%s  fills=%d\n", r.LegIndex, r.Status, errStr, r.FillCount)
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// post_only=false (relaxed): the crossing leg takes liquidity up to its
+	// limit and rests the remainder; taker fills are reported per leg as FillCount.
+	postOnlyFalse := false
+	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
+	if mq, mqErr := client.MassQuote(ctx, symbol,
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.003}},
+		1, &postOnlyFalse); mqErr != nil {
+		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
+	} else {
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  new_order_id=%s  err=%s  fills=%d\n",
+				r.LegIndex, r.Status, r.NewOrderID, errStr, r.FillCount)
+		}
+	}
+	time.Sleep(1 * time.Second)
+	drainOrderUpdates(client, "after post_only mass quotes")
 
 	// Cleanup: cancel the original BUY (if still resting).
 	fmt.Println("Cancelling original BUY (cleanup)...")

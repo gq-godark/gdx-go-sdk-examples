@@ -233,8 +233,8 @@ type MarginAlert struct {
 	SymbolID            int64
 	Tier                int32
 	MarginRatioBps      int64
-	MarkPriceBps        int64
-	LiquidationPriceBps int64
+	MarkPrice           string
+	LiquidationPrice    string
 	TS                  uint64
 	StateVersion        uint64
 	Recovered           bool
