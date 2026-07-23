@@ -31,9 +31,9 @@ package name" rule).
 
 ## Constructors
 
-The SDK ships three concrete clients. All three share the same wire
-crypto (X25519 ECDH + HKDF-SHA256 + AES-256-GCM under a per-session
-key) and the same protobuf wire bindings.
+The SDK ships three concrete clients. Encrypted WebSocket trading uses
+**Noise XK** (pin the sequencer static public key — see Configuration in
+`README.md` / `.env.example`).
 
 ### Encrypted WebSocket trading -- `GodarkClient`
 
@@ -42,6 +42,7 @@ client, err := godark.NewClient(godark.ClientConfig{
     APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
     APISecret:  os.Getenv("GODARK_API_SECRET"),
     Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+    // NoiseStaticPublicKeyHex: os.Getenv("GDX_NOISE_STATIC_PUBLIC_KEY"),
     // BaseURL defaults to wss://api.godark-dex.com; override via
     // GODARK_EDGE_URL/GDX_EDGE_URL env vars or this field.
     BaseURL: os.Getenv("GODARK_EDGE_URL"),
@@ -53,7 +54,7 @@ Lifecycle:
 
 ```go
 ctx := context.Background()
-if err := client.Connect(ctx); err != nil { ... }   // login + ECDH session.setup
+if err := client.Connect(ctx); err != nil { ... }   // login + Noise XK handshake
 defer client.Disconnect()
 
 uid := client.UserUUID()
@@ -182,7 +183,7 @@ if errors.As(err, &oe) {
 Other typed errors you may see:
 
   - `*godark.AuthenticationError` -- login failed (bad API key, expired token)
-  - `*godark.SessionError`        -- ECDH session setup failed
+  - `*godark.SessionError`        -- Noise XK handshake or rekey failed
   - `*godark.ConnectionError`     -- WS or HTTP layer failure
   - `*godark.EncryptionError`     -- crypto path returned an error
   - `*godark.TimeoutError`        -- command exceeded its timeout

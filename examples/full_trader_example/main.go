@@ -4,7 +4,7 @@
 //
 //  1. Load credentials from `.env` / environment.
 //  2. REST pre-flight: GetMe (identity + wallet) → GetMyBalance (margin check).
-//  3. Connect and authenticate (encrypted ECDH WS session).
+//  3. Connect and authenticate (Noise XK encrypted WebSocket session).
 //  4. Wire up channel-first push receivers (order / position / health / etc.).
 //  5. Subscribe to the private order + position channels.
 //  6. Place, modify, and cancel `MARKET` / `LIMIT` orders.

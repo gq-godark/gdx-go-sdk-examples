@@ -21,8 +21,10 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | `sdk/order_error_code.go`             | Canonical 34-entry numeric -> symbolic reject reason map |
 | `sdk/proto.go`                        | Hand-written wrappers around generated proto (AAD builders, parsers, encoders) |
 | `sdk/symbols.go` + `sdk/shared/symbols.json` | Embedded symbol-id table |
-| `sdk/internal/crypto/crypto.go`       | X25519 ECDH + HKDF-SHA256 + AES-256-GCM primitives |
-| `sdk/internal/session/session.go`     | `CryptoSession` lifecycle (Establish / EncryptOrder / DecryptPush / Reset) |
+| `sdk/internal/noise/noise.go`         | Noise_XK_25519_AESGCM_SHA256 initiator |
+| `sdk/internal/bound/bound.go`         | SHA-256-bound AEAD framing helpers |
+| `sdk/internal/crypto/crypto.go`       | X25519 + AES-GCM primitives used by Noise |
+| `sdk/internal/session/session.go`     | Post-handshake `CryptoSession` (encrypt/decrypt) |
 | `sdk/internal/identity/identity.go`   | UUID <-> 16-byte wire helpers |
 | `sdk/internal/transport/transport.go` | WS transport + docs-wire envelope normalisation |
 | `sdk/internal/rest/transport.go`      | HTTP wrapper + `{code, data, message?}` envelope unwrap |
@@ -41,11 +43,12 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
   - **Envelope**: docs-wire `{id, op, args}` out; `{id, op, code, data?,
     message?}` in. The transport normalises both legacy and docs envelopes
     transparently.
-  - **Crypto**: every order body is AES-256-GCM-encrypted under a per-
-    session key derived via X25519 ECDH + HKDF-SHA256. AAD is the
-    serialised `OrderHeader` proto. Pushes carry a `ResponseHeader` AAD.
-    Both the WS and REST clients reuse the same `CryptoSession` state
-    machine (`sdk/internal/session/`).
+  - **Crypto**: after login the client runs `Noise_XK_25519_AESGCM_SHA256`
+    (`noise.handshake`). Pin the sequencer static key via
+    `ClientConfig.NoiseStaticPublicKeyHex` or `GDX_NOISE_STATIC_PUBLIC_KEY`.
+    Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
+    Legacy REST `session.setup` / ECDH is retired — use the WebSocket client
+    for encrypted order flow.
 
 ## Examples mapping
 
