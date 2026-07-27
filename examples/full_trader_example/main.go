@@ -34,6 +34,14 @@ import (
 
 const symbol = "BTC-USDC-PERP"
 
+// btcSymbolID is BTC-USDC-PERP's numeric symbol id in position snapshots.
+const btcSymbolID = 1
+
+// lastBtcMark holds the most recent BTC mark seen in a positions snapshot, so
+// the mass-quote ladder/cross prices can anchor to the live touch. Zero means
+// "not seen yet" (fall back to GDX_BASE).
+var lastBtcMark float64
+
 func main() {
 	envloader.LoadDotenv()
 
@@ -158,12 +166,17 @@ func main() {
 	// fuses into a single MPC round. Pass a *bool(false) for the relaxed path,
 	// where a crossing leg takes liquidity up to its limit and rests the
 	// remainder (the number of taker fills is reported per leg as FillCount).
-	// `GDX_BASE` anchors the ladder/cross near the live mark (default 64000).
-	base := 64000.0
-	if v, perr := strconv.ParseFloat(os.Getenv("GDX_BASE"), 64); perr == nil && v > 0 {
-		base = v
+	// Anchor the ladder/cross to the live BTC mark captured from the snapshot so
+	// the crossing demo below is deterministic regardless of current price. Fall
+	// back to GDX_BASE (default 64000) only if no mark was seen yet.
+	base := lastBtcMark
+	if base <= 0 {
+		base = 64000.0
+		if v, perr := strconv.ParseFloat(os.Getenv("GDX_BASE"), 64); perr == nil && v > 0 {
+			base = v
+		}
 	}
-	fmt.Println("Mass-quoting a 3-level BUY ladder (post-only)...")
+	fmt.Printf("Mass-quoting a 3-level BUY ladder (post-only), base=%.2f...\n", base)
 	ladder := []godark.MassQuoteLegInput{
 		{Side: godark.SideBuy, Price: base * (1 - 0.003), Quantity: 0.02},
 		{Side: godark.SideBuy, Price: base * (1 - 0.006), Quantity: 0.02},
@@ -209,8 +222,11 @@ func main() {
 		drainOrderUpdates(client, "after BATCH CANCEL")
 	}
 
-	// Demonstrate the batch-level post_only flag on a crossing leg.
-	crossPx := base * 1.02
+	// Demonstrate the batch-level post_only flag on a crossing leg. Price a BUY
+	// ~5% above the live mark: aggressive enough to cross the resting ask, yet
+	// within the exchange's 10%-of-oracle limit. Anchored to the live mark, this
+	// makes the post_only=true (reject) vs false (fill) contrast deterministic.
+	crossPx := base * 1.05
 	// post_only=true: a crossing leg is rejected (would-cross, error_code 2018).
 	postOnlyTrue := true
 	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
@@ -323,6 +339,11 @@ func drainPositionsSnapshots(c *godark.GodarkClient) int {
 			fmt.Printf("SNAP   source=%s  rows=%d  ts=%d\n",
 				s.Source, len(s.Rows), s.ServerTimestamp)
 			for _, row := range s.Rows {
+				if row.SymbolID == btcSymbolID && row.MarkPrice != "" {
+					if v, perr := strconv.ParseFloat(row.MarkPrice, 64); perr == nil && v > 0 {
+						lastBtcMark = v
+					}
+				}
 				mark := row.MarkPrice
 				if mark == "" {
 					mark = "—"
