@@ -13,7 +13,7 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | File                                  | Surface                                       |
 | ------------------------------------- | --------------------------------------------- |
 | `sdk/client.go`                       | `GodarkClient`, `ClientConfig`, `TransportConfig` |
-| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig`, `PlaceOrderRestRequest` |
+| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig` (legacy; **encrypted REST trading is unsupported** — the examples trade over the WebSocket `GodarkClient`) |
 | `sdk/market_data.go`                  | `MarketDataClient`, `MarketDataConfig`, `MarketDataMessage` |
 | `sdk/types.go`                        | `OrderAck`, `OrderUpdate`, `PositionUpdate`, etc. |
 | `sdk/enums.go`                        | `Side`, `OrderType`, `OrderStatus`, `TimeInForce`, etc. |
@@ -38,7 +38,8 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
   - **Trading WS endpoint**: `wss://api.godark-dex.com/ws/v1` (overridable
     via `GODARK_EDGE_URL` / `GDX_EDGE_URL`).
   - **REST root**: `https://api.godark-dex.com/api/v1` (auto-derived from
-    the WS host; overridable via `GODARK_REST_URL` / `GDX_REST_URL`).
+    the WS host). Not used by the examples — encrypted REST trading is
+    unsupported; all order flow goes over the WebSocket client.
   - **Public market-data WS**: `wss://api.godark-dex.com/ws/gomarket`.
   - **Envelope**: docs-wire `{id, op, args}` out; `{id, op, code, data?,
     message?}` in. The transport normalises both legacy and docs envelopes
@@ -47,15 +48,16 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
     (`noise.handshake`). Pin the sequencer static key via
     `ClientConfig.NoiseStaticPublicKeyHex` or `GDX_NOISE_STATIC_PUBLIC_KEY`.
     Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
-    Legacy REST `session.setup` / ECDH is retired — use the WebSocket client
-    for encrypted order flow.
+    The legacy ECDH `session.setup` handshake is retired; all encrypted
+    order flow now uses the Noise XK WebSocket client. Encrypted REST
+    trading is unsupported.
 
 ## Examples mapping
 
 | Example                              | API touchpoints                                                                                                                   |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | `examples/quickstart/main.go`        | `NewClient` -> `Connect` -> `PlaceOrder` -> `CancelOrder` -> `Disconnect`                                                          |
-| `examples/full_trader_example/main.go` | `NewClient` (with `TransportConfig`) -> `Connect` -> `Subscribe` -> `PlaceOrder` / `ModifyOrder` / `CancelOrder` (mixed) -> drain push channels -> `Disconnect` |
+| `examples/full_trader_example/main.go` | `NewClient` (with `TransportConfig`) -> `Connect` -> `Subscribe` -> `PlaceOrder` / `ModifyOrder` / `CancelOrder` / `MassQuote` / `BatchCancel` (mixed) -> drain push channels -> `Disconnect` |
 
 Both examples share `examples/internal/envloader/envloader.go` for `.env`
 loading and `OrderError` pretty-printing.

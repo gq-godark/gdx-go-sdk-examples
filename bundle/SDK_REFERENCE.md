@@ -31,9 +31,11 @@ package name" rule).
 
 ## Constructors
 
-The SDK ships three concrete clients. Encrypted WebSocket trading uses
+Trading runs over the encrypted WebSocket `GodarkClient`, which uses
 **Noise XK** (pin the sequencer static public key — see Configuration in
-`README.md` / `.env.example`).
+`README.md` / `.env.example`). A read-only `MarketDataClient` is also
+available for public market data. (Encrypted REST trading is not
+supported — see the note below.)
 
 ### Encrypted WebSocket trading -- `GodarkClient`
 
@@ -60,23 +62,11 @@ defer client.Disconnect()
 uid := client.UserUUID()
 ```
 
-### Encrypted REST trading -- `GodarkRestClient`
-
-Same crypto and protobuf builders as `GodarkClient`, but the wire is HTTP
-(`POST /api/v1/orders`, etc.). Useful for stateless integrations that
-don't need push streams.
-
-```go
-rest, err := godark.NewRestClient(godark.RestClientConfig{
-    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
-    APISecret:  os.Getenv("GODARK_API_SECRET"),
-    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
-    // BaseURL defaults to https://api.godark-dex.com (derived from the
-    // edge WS URL if GODARK_REST_URL/GDX_REST_URL is unset).
-})
-_ = rest.Connect(ctx)
-defer rest.Disconnect(ctx)
-```
+> **Encrypted REST trading is not supported.** Earlier builds shipped a
+> `GodarkRestClient` that placed orders over HTTP; that path is retired.
+> All order flow — place / modify / cancel / mass-quote — now runs over the
+> Noise XK WebSocket `GodarkClient` shown above. The examples in this bundle
+> trade exclusively over the WebSocket client.
 
 ### Public market-data feed -- `MarketDataClient`
 
@@ -104,8 +94,8 @@ for msg := range md.TradesEvents()    { ... }
 
 ## Trading commands
 
-`PlaceOrder`, `CancelOrder`, `ModifyOrder` work the same on both
-`GodarkClient` and `GodarkRestClient`. Their request structs:
+`PlaceOrder`, `CancelOrder`, `ModifyOrder` are exposed by the WebSocket
+`GodarkClient`. Their request structs:
 
 ```go
 ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
@@ -125,18 +115,6 @@ cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 newPrice := 68_000.0
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil)
-```
-
-On the REST client, `PlaceOrder` takes `PlaceOrderRestRequest` (an
-embed of `PlaceOrderRequest` plus an optional `ClientOrderID` field):
-
-```go
-ack, err := rest.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
-    PlaceOrderRequest: godark.PlaceOrderRequest{...},
-    ClientOrderID: "my-uuid-here",
-})
-// Subsequent cancel by client-order-id:
-_, _ = rest.CancelOrderByClientID(ctx, "my-uuid-here", "BTC-USDC-PERP")
 ```
 
 ## Push streams (encrypted WS only)
