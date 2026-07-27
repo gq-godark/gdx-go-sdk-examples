@@ -65,6 +65,48 @@ func correlationIDBigInt(raw []byte) *big.Int {
 	return new(big.Int).SetBytes(raw)
 }
 
+// correlationIDBodyBytes converts canonical big-endian u128 bytes to the
+// little-endian encoding used by correlation_id fields in sequencer messages.
+func correlationIDBodyBytes(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]byte, len(raw))
+	for i := range raw {
+		out[len(raw)-1-i] = raw[i]
+	}
+	return out
+}
+
+// correlationIDFromWire parses the decimal u128 emitted by edge JSON responses
+// and returns the canonical 16-byte big-endian representation used in AAD.
+func correlationIDFromWire(v any) []byte {
+	var text string
+	switch value := v.(type) {
+	case string:
+		text = value
+	case float64:
+		text = fmt.Sprintf("%.0f", value)
+	case uint64:
+		text = fmt.Sprintf("%d", value)
+	case int64:
+		if value < 0 {
+			return nil
+		}
+		text = fmt.Sprintf("%d", value)
+	default:
+		return nil
+	}
+	n, ok := new(big.Int).SetString(text, 10)
+	if !ok || n.Sign() <= 0 || n.BitLen() > 128 {
+		return nil
+	}
+	raw := n.Bytes()
+	out := make([]byte, 16)
+	copy(out[16-len(raw):], raw)
+	return out
+}
+
 // uuidBytesToString converts 16 raw UUID bytes to canonical hex form, or
 // returns the all-zero UUID on malformed input.
 func uuidBytesToString(raw []byte) string {
@@ -137,7 +179,7 @@ func BuildPlaceOrderRequest(
 		place.ExpiryTime = expiryTime
 	}
 	if correlationID != nil {
-		place.CorrelationId = correlationID
+		place.CorrelationId = correlationIDBodyBytes(correlationID)
 	}
 
 	req := &sequencerpb.EdgeSequencerRequest{
@@ -152,7 +194,7 @@ func BuildCancelOrderRequest(orderID uint64, userUUID []byte, symbolID uint64, c
 		OrderId:        orderID,
 		UserCommitment: make([]byte, 32),
 		SymbolId:       symbolID,
-		CorrelationId:  correlationID,
+		CorrelationId:  correlationIDBodyBytes(correlationID),
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Cancel{Cancel: cancel},
@@ -171,7 +213,7 @@ func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, 
 		UserUuid:      userUUID,
 		SymbolId:      symbolID,
 		Leverage:      uint32(lev),
-		CorrelationId: correlationID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_UpdateLeverage{UpdateLeverage: ul},
@@ -192,7 +234,7 @@ func BuildModifyOrderRequest(
 		OrderId:        orderID,
 		UserCommitment: nil,
 		SymbolId:       symbolID,
-		CorrelationId:  correlationID,
+		CorrelationId:  correlationIDBodyBytes(correlationID),
 		UserUuid:       userUUID,
 	}
 	if newPrice != nil {
@@ -207,8 +249,147 @@ func BuildModifyOrderRequest(
 	return proto.Marshal(req)
 }
 
+func newLegCorrelationID() []byte {
+	u := uuid.New()
+	return u[:]
+}
+
+// maxBatchLegs is the maximum number of legs / ids accepted in a single
+// mass-quote, batch-cancel, or batch-modify request. The node fans batches out
+// at ~constant MPC cost only up to this bound; larger batches are rejected
+// client-side before reaching the wire.
+const maxBatchLegs = 20
+
+// BuildMassQuoteRequest serializes a MassQuoteInput (bulk cancel-replace)
+// wrapped in EdgeSequencerRequest. Each leg becomes its own order and carries a
+// unique 16-byte correlation id (the wire requires exactly 16 bytes per leg).
+// postOnly is the batch-level post-only flag: when non-nil and false, a crossing
+// leg takes liquidity up to its limit and rests the remainder instead of being
+// rejected. A nil pointer omits the field on the wire (node defaults to post-only).
+func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, leverage uint32, postOnly *bool) ([]byte, error) {
+	if len(legs) == 0 {
+		return nil, fmt.Errorf("mass quote requires at least one leg")
+	}
+	if len(legs) > maxBatchLegs {
+		return nil, fmt.Errorf("mass quote accepts at most %d legs, got %d", maxBatchLegs, len(legs))
+	}
+	pbLegs := make([]*sequencerpb.MassQuoteLeg, 0, len(legs))
+	for i, leg := range legs {
+		sideInt, ok := sideToProto[leg.Side]
+		if !ok {
+			return nil, fmt.Errorf("mass quote leg %d: unknown side: %q", i, leg.Side)
+		}
+		tif := leg.TimeInForce
+		if tif == "" {
+			tif = TimeInForceGTC
+		}
+		tifInt, ok := timeInForceToProto[tif]
+		if !ok {
+			return nil, fmt.Errorf("mass quote leg %d: unknown time in force: %q", i, tif)
+		}
+		if tif == TimeInForceGTD && leg.ExpiryTime == nil {
+			return nil, fmt.Errorf("mass quote leg %d: ExpiryTime is required when TimeInForce=GTD", i)
+		}
+		var cancelID uint64
+		if leg.CancelOrderID != nil {
+			cancelID = *leg.CancelOrderID
+		}
+		pbLeg := &sequencerpb.MassQuoteLeg{
+			CancelOrderId: cancelID,
+			Side:          commonpb.Side(sideInt),
+			Price:         leg.Price,
+			Quantity:      leg.Quantity,
+			TimeInForce:   commonpb.TimeInForce(tifInt),
+			CorrelationId: newLegCorrelationID(),
+		}
+		if leg.ExpiryTime != nil {
+			pbLeg.ExpiryTime = leg.ExpiryTime
+		}
+		pbLegs = append(pbLegs, pbLeg)
+	}
+	mq := &sequencerpb.MassQuoteInput{
+		SymbolId:      symbolID,
+		Legs:          pbLegs,
+		UserUuid:      userUUID,
+		Leverage:      leverage,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+		PostOnly:      postOnly,
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_MassQuote{MassQuote: mq},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildBatchCancelRequest serializes a BatchCancelInput (cancel up to 20 resting
+// orders on one symbol) wrapped in EdgeSequencerRequest.
+func BuildBatchCancelRequest(symbolID uint64, userUUID []byte, orderIDs []uint64, correlationID []byte) ([]byte, error) {
+	if len(orderIDs) == 0 {
+		return nil, fmt.Errorf("batch cancel requires at least one order id")
+	}
+	if len(orderIDs) > maxBatchLegs {
+		return nil, fmt.Errorf("batch cancel accepts at most %d ids, got %d", maxBatchLegs, len(orderIDs))
+	}
+	bc := &sequencerpb.BatchCancelInput{
+		SymbolId:      symbolID,
+		OrderIds:      orderIDs,
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_BatchCancel{BatchCancel: bc},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildBatchModifyRequest serializes a BatchModifyInput (post-only amend up to
+// 20 resting orders on one symbol) wrapped in EdgeSequencerRequest. Each leg
+// carries a unique 16-byte correlation id.
+func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModifyLegInput, correlationID []byte) ([]byte, error) {
+	if len(legs) == 0 {
+		return nil, fmt.Errorf("batch modify requires at least one leg")
+	}
+	if len(legs) > maxBatchLegs {
+		return nil, fmt.Errorf("batch modify accepts at most %d legs, got %d", maxBatchLegs, len(legs))
+	}
+	for i, leg := range legs {
+		if leg.NewPrice == nil && leg.NewQuantity == nil {
+			return nil, fmt.Errorf("batch modify leg %d must set NewPrice and/or NewQuantity", i)
+		}
+	}
+	pbLegs := make([]*sequencerpb.BatchModifyLeg, 0, len(legs))
+	for _, leg := range legs {
+		pbLeg := &sequencerpb.BatchModifyLeg{
+			OrderId:       leg.OrderID,
+			CorrelationId: newLegCorrelationID(),
+		}
+		if leg.NewPrice != nil {
+			pbLeg.NewPrice = leg.NewPrice
+		}
+		if leg.NewQuantity != nil {
+			pbLeg.NewQuantity = leg.NewQuantity
+		}
+		pbLegs = append(pbLegs, pbLeg)
+	}
+	bm := &sequencerpb.BatchModifyInput{
+		SymbolId:      symbolID,
+		Legs:          pbLegs,
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_BatchModify{BatchModify: bm},
+	}
+	return proto.Marshal(req)
+}
+
 // BuildOrderHeaderAAD serializes an OrderHeader for use as AES-GCM AAD.
 func BuildOrderHeaderAAD(userUUID []byte, symbolID uint64, requestType string, nonce uint64, bodyLength uint32, correlationID []byte) ([]byte, error) {
+	return BuildOrderHeaderAADWithConn(userUUID, symbolID, requestType, nonce, bodyLength, correlationID, 0)
+}
+
+// BuildOrderHeaderAADWithConn includes the Noise-bound WebSocket conn_id.
+func BuildOrderHeaderAADWithConn(userUUID []byte, symbolID uint64, requestType string, nonce uint64, bodyLength uint32, correlationID []byte, connID uint64) ([]byte, error) {
 	reqInt, ok := requestTypeToProto[requestType]
 	if !ok {
 		return nil, fmt.Errorf("unknown request type: %q", requestType)
@@ -220,22 +401,31 @@ func BuildOrderHeaderAAD(userUUID []byte, symbolID uint64, requestType string, n
 		Nonce:         nonce,
 		BodyLength:    bodyLength,
 		CorrelationId: correlationID,
+		ConnId:        connID,
 	}
 	return proto.Marshal(hdr)
 }
 
 // BuildResponseHeaderAAD serializes a ResponseHeader for use as AES-GCM AAD.
-func BuildResponseHeaderAAD(userUUID []byte, messageType string, bodyLength uint32, nonce uint64, fencingEpoch uint64) ([]byte, error) {
+func BuildResponseHeaderAAD(userUUID []byte, messageType string, bodyLength uint32, nonce uint64, fencingEpoch uint64, correlationID []byte, sessionSeq uint64) ([]byte, error) {
+	return BuildResponseHeaderAADWithConn(userUUID, messageType, bodyLength, nonce, fencingEpoch, correlationID, sessionSeq, 0)
+}
+
+// BuildResponseHeaderAADWithConn includes the Noise-bound WebSocket conn_id.
+func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLength uint32, nonce uint64, fencingEpoch uint64, correlationID []byte, sessionSeq uint64, connID uint64) ([]byte, error) {
 	msgInt, ok := responseMessageTypeToProto[messageType]
 	if !ok {
 		return nil, fmt.Errorf("unknown response message type: %q", messageType)
 	}
 	hdr := &edgepb.ResponseHeader{
-		UserUuid:     userUUID,
-		MessageType:  commonpb.ResponseMessageType(msgInt),
-		BodyLength:   bodyLength,
-		Nonce:        nonce,
-		FencingEpoch: fencingEpoch,
+		UserUuid:      userUUID,
+		MessageType:   commonpb.ResponseMessageType(msgInt),
+		BodyLength:    bodyLength,
+		Nonce:         nonce,
+		FencingEpoch:  fencingEpoch,
+		CorrelationId: correlationID,
+		SessionSeq:    sessionSeq,
+		ConnId:        connID,
 	}
 	return proto.Marshal(hdr)
 }
@@ -248,11 +438,13 @@ func BuildResponseHeaderAAD(userUUID []byte, messageType string, bodyLength uint
 // Fill / Signing variants are intentionally not parsed in the trading path -
 // the WS client only consumes acks here.
 type NodeAck struct {
-	NodeID        uint64
-	Sequence      uint64
-	OrderID       uint64
-	Success       bool
-	ErrorCode     *uint32
+	NodeID    uint64
+	Sequence  uint64
+	OrderID   uint64
+	Success   bool
+	ErrorCode *uint32
+	// RejectText is AckMessage.reject_text when the sequencer supplied detail.
+	RejectText    string
 	CorrelationID []byte
 	OrderStatus   *OrderStatus
 	NodeHealth    *uint32
@@ -277,6 +469,7 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 		OrderID:       ack.OrderId,
 		Success:       ack.Success,
 		ErrorCode:     ack.ErrorCode,
+		RejectText:    ack.GetRejectText(),
 		CorrelationID: ack.CorrelationId,
 		NodeHealth:    ack.NodeHealth,
 	}
@@ -287,6 +480,126 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 		}
 	}
 	return out, true, nil
+}
+
+func massQuoteLegStatusString(s sequencerpb.MassQuoteLegStatus) string {
+	switch s {
+	case sequencerpb.MassQuoteLegStatus_MASS_QUOTE_LEG_STATUS_OPEN:
+		return "open"
+	case sequencerpb.MassQuoteLegStatus_MASS_QUOTE_LEG_STATUS_FILLED:
+		return "filled"
+	case sequencerpb.MassQuoteLegStatus_MASS_QUOTE_LEG_STATUS_FAILED:
+		return "failed"
+	case sequencerpb.MassQuoteLegStatus_MASS_QUOTE_LEG_STATUS_UNSPECIFIED:
+		return "unspecified"
+	default:
+		return "unknown"
+	}
+}
+
+func uint64OrEmpty(v uint64) string {
+	if v == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", v)
+}
+
+// ParseMassQuoteAck decodes a NodeResponse carrying a MassQuoteAck. ok is false
+// when the inner variant is not a mass_quote_ack. Success is true when no leg
+// failed.
+func ParseMassQuoteAck(data []byte) (*MassQuoteAck, bool, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, false, err
+	}
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_MassQuoteAck)
+	if !ok || inner.MassQuoteAck == nil {
+		return nil, false, nil
+	}
+	a := inner.MassQuoteAck
+	results := make([]MassQuoteLegResult, 0, len(a.Results))
+	success := len(a.Results) > 0
+	for _, r := range a.Results {
+		status := massQuoteLegStatusString(r.Status)
+		if status == "failed" {
+			success = false
+		}
+		results = append(results, MassQuoteLegResult{
+			LegIndex:         r.LegIndex,
+			Status:           status,
+			CancelledOrderID: uint64OrEmpty(r.CancelledOrderId),
+			NewOrderID:       uint64OrEmpty(r.NewOrderId),
+			ErrorCode:        r.ErrorCode,
+			FillCount:        r.FillCount,
+		})
+	}
+	return &MassQuoteAck{
+		Success:  success,
+		Sequence: fmt.Sprintf("%d", a.Sequence),
+		Results:  results,
+	}, true, nil
+}
+
+// ParseBatchCancelAck decodes a NodeResponse carrying a BatchCancelAck. Success
+// is true when every id was cancelled.
+func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, false, err
+	}
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_BatchCancelAck)
+	if !ok || inner.BatchCancelAck == nil {
+		return nil, false, nil
+	}
+	a := inner.BatchCancelAck
+	results := make([]BatchCancelLegResult, 0, len(a.Results))
+	success := len(a.Results) > 0
+	for _, r := range a.Results {
+		if !r.Cancelled {
+			success = false
+		}
+		results = append(results, BatchCancelLegResult{
+			OrderID:   fmt.Sprintf("%d", r.OrderId),
+			Cancelled: r.Cancelled,
+			ErrorCode: r.ErrorCode,
+		})
+	}
+	return &BatchCancelAck{
+		Success:  success,
+		Sequence: fmt.Sprintf("%d", a.Sequence),
+		Results:  results,
+	}, true, nil
+}
+
+// ParseBatchModifyAck decodes a NodeResponse carrying a BatchModifyAck. Success
+// is true when every leg was modified.
+func ParseBatchModifyAck(data []byte) (*BatchModifyAck, bool, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, false, err
+	}
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_BatchModifyAck)
+	if !ok || inner.BatchModifyAck == nil {
+		return nil, false, nil
+	}
+	a := inner.BatchModifyAck
+	results := make([]BatchModifyLegResult, 0, len(a.Results))
+	success := len(a.Results) > 0
+	for _, r := range a.Results {
+		if !r.Modified {
+			success = false
+		}
+		results = append(results, BatchModifyLegResult{
+			OrderID:   fmt.Sprintf("%d", r.OrderId),
+			Modified:  r.Modified,
+			ErrorCode: r.ErrorCode,
+		})
+	}
+	return &BatchModifyAck{
+		Success:  success,
+		Sequence: fmt.Sprintf("%d", a.Sequence),
+		Results:  results,
+	}, true, nil
 }
 
 // ParseOrderUpdate decodes an OrderUpdateMessage into the public OrderUpdate.
@@ -335,6 +648,7 @@ func ParseOrderUpdate(data []byte) (*OrderUpdate, error) {
 		CumFill:       msg.CumFill,
 		CancelReason:  cancelReason,
 		RejectReason:  rejectReason,
+		Msg:           msg.GetMsg(),
 		CorrelationID: correlationIDToUint64(msg.CorrelationId),
 		Timestamp:     msg.Timestamp,
 		Leverage:      int32(msg.Leverage),
@@ -473,17 +787,16 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		return ParsePositionUpdate(b)
 	case *sequencerpb.SequencerToEdgeMessage_PositionsSnapshot:
 		return ParsePositionsSnapshot(inner.PositionsSnapshot), nil
-	case *sequencerpb.SequencerToEdgeMessage_SystemHealth:
-		h := inner.SystemHealth
+	case *sequencerpb.SequencerToEdgeMessage_HealthReport:
+		h := inner.HealthReport
 		return &SystemHealthUpdate{
-			TotalNodes:      int32(h.TotalNodes),
-			AcceptingOrders: h.AcceptingOrders,
-			Ready:           int32(h.Ready),
-			Degraded:        int32(h.Degraded),
-			Exhausted:       int32(h.Exhausted),
-			Warming:         int32(h.Warming),
-			Draining:        int32(h.Draining),
-			Waiting:         int32(h.Waiting),
+			ComponentID:    h.ComponentId,
+			State:          int32(h.State),
+			Serving:        h.Serving,
+			Cause:          h.Cause,
+			UpdatedAtNanos: h.UpdatedAtNanos,
+			Sequence:       h.Sequence,
+			SchemaVersion:  h.SchemaVersion,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_SettlementUpdate:
 		s := inner.SettlementUpdate
@@ -513,19 +826,6 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 			UserUUID:           uuidBytesToString(b.UserUuid),
 			ShieldedBalanceRaw: b.ShieldedBalanceRaw,
 			Timestamp:          b.Timestamp,
-		}, nil
-	case *sequencerpb.SequencerToEdgeMessage_MarginAlert:
-		m := inner.MarginAlert
-		return &MarginAlert{
-			Owner:               uuidBytesToString(m.Owner),
-			SymbolID:            int64(m.SymbolId),
-			Tier:                int32(m.Tier),
-			MarginRatioBps:      int64(m.MarginRatioBps),
-			MarkPriceBps:        int64(m.MarkPriceBps),
-			LiquidationPriceBps: int64(m.LiquidationPriceBps),
-			TS:                  uint64(m.Ts),
-			StateVersion:        m.StateVersion,
-			Recovered:           m.Recovered,
 		}, nil
 	default:
 		// New variants (OrderHistoryInsert, OpenInterestUpdate, VolumeUpdate,

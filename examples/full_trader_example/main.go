@@ -3,15 +3,13 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. REST pre-flight: GetMe (identity + wallet) → GetMyBalance (margin check).
-//  3. Connect and authenticate (Noise XK encrypted WebSocket session).
-//  4. Wire up channel-first push receivers (order / position / health / etc.).
-//  5. Subscribe to the private order + position channels.
-//  6. Place, modify, and cancel `MARKET` / `LIMIT` orders.
-//  7. Drain queued updates between actions.
-//  8. REST post-flight: GetMyBalance (balance delta after trading).
-//  9. Print a session summary including per-stream counts.
-// 10. Clean disconnect.
+//  2. Connect and authenticate (Noise XK encrypted WebSocket session).
+//  3. Wire up channel-first push receivers (order / position / health / etc.).
+//  4. Subscribe to the private order + position channels.
+//  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
+//  6. Drain queued updates between actions.
+//  7. Print a session summary including per-stream counts.
+//  8. Clean disconnect.
 //
 // Run with:
 //
@@ -54,46 +52,9 @@ func main() {
 	if wsURL == "" {
 		wsURL = "wss://api.godark-dex.com"
 	}
-	restURL := os.Getenv("GODARK_REST_URL")
-	if restURL == "" {
-		restURL = strings.Replace(strings.Replace(wsURL, "wss://", "https://", 1), "ws://", "http://", 1)
-	}
-	fmt.Printf("Endpoints: ws=%s  rest=%s\n", wsURL, restURL)
+	fmt.Printf("Endpoint: ws=%s\n", wsURL)
 
 	ctx := context.Background()
-
-	// --- REST pre-flight: identity + balance check ---
-	rest, err := godark.NewRestClient(godark.RestClientConfig{
-		APIKeyID:   apiKeyID,
-		APISecret:  apiSecret,
-		Passphrase: passphrase,
-		BaseURL:    restURL,
-	})
-	if err != nil {
-		log.Fatalf("REST config error: %v", err)
-	}
-	if err := rest.Connect(ctx); err != nil {
-		log.Fatalf("REST connect failed: %v", err)
-	}
-	defer func() { _ = rest.Disconnect(ctx) }()
-
-	me, err := rest.GetMe(ctx)
-	if err != nil {
-		log.Fatalf("GetMe: %v", err)
-	}
-	fmt.Printf("Identity: user_uuid=%s  wallet=%s\n", me.ID, me.WalletAddress)
-
-	preBal, err := rest.GetMyBalance(ctx)
-	if err != nil {
-		log.Fatalf("GetMyBalance: %v", err)
-	}
-	fmt.Printf("Balance:  shielded_raw=%d  wallet_raw=%d  pending_deposits_raw=%d  wallet_ui=%.6f\n",
-		preBal.ShieldedBalanceRaw, preBal.WalletUSDTRaw, preBal.PendingDepositsRaw, preBal.WalletUSDTUI)
-	if preBal.ShieldedBalanceRaw == 0 {
-		fmt.Println("No shielded balance -- deposit collateral before placing orders.")
-		fmt.Println("Done.")
-		return
-	}
 
 	// --- WS trading session ---
 	headers := http.Header{}
@@ -205,13 +166,6 @@ func main() {
 	fundingCount := drainFunding(client)
 	settleCount := drainSettlement(client)
 
-	// --- REST post-flight: balance snapshot after trading ---
-	if postBal, err := rest.GetMyBalance(ctx); err == nil {
-		fmt.Printf("Balance after: shielded_raw=%d  (delta=%d)\n",
-			postBal.ShieldedBalanceRaw,
-			int64(postBal.ShieldedBalanceRaw)-int64(preBal.ShieldedBalanceRaw))
-	}
-
 	fmt.Println(sep)
 	fmt.Println("  Session complete")
 	fmt.Printf("  Pushes: snapshots=%d  health=%d  balance=%d  margin=%d  funding=%d  settle=%d\n",
@@ -289,8 +243,8 @@ func drainHealth(c *godark.GodarkClient) int {
 		select {
 		case h := <-ch:
 			count++
-			fmt.Printf("HEALTH nodes=%d  accepting=%v  ready=%v\n",
-				h.TotalNodes, h.AcceptingOrders, h.Ready)
+			fmt.Printf("HEALTH component=%s  state=%d  serving=%v  cause=%q\n",
+				h.ComponentID, h.State, h.Serving, h.Cause)
 		default:
 			return count
 		}

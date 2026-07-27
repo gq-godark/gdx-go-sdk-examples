@@ -1,174 +1,149 @@
-// Package session owns the ECDH session lifecycle with the gdx-edge sequencer.
-//
-// Wire flow:
-//
-//  1. Client: GenerateKeypair() -> base64 public key sent to `session.setup`.
-//  2. Server: returns its public key + session_id.
-//  3. Client: Establish(serverPub, sessionID) derives the AES key via HKDF.
-//  4. From here, EncryptOrder / DecryptPush use the session key + a 96-bit
-//     nonce built from session_id || nonce_counter.
-//
-// Reset() must be called between reconnects so the nonce counter and stale
-// keypair don't leak across sessions.
+// Package session owns the post-handshake Noise transport lifecycle.
 package session
 
 import (
-	"crypto/ecdh"
-	"encoding/base64"
 	"errors"
-	"fmt"
+	"os"
+	"strings"
 	"sync"
 
-	gdxcrypto "github.com/gq-godark/gdx-go-sdk/internal/crypto"
+	"github.com/gq-godark/gdx-go-sdk/internal/bound"
+	"github.com/gq-godark/gdx-go-sdk/internal/noise"
 )
 
 // ErrNotEstablished is returned by Encrypt / Decrypt before Establish().
 var ErrNotEstablished = errors.New("session not established")
 
-// ErrMissingKeypair is returned by Establish() before GenerateKeypair().
-var ErrMissingKeypair = errors.New("must call GenerateKeypair() before Establish()")
+// stampedNoncePush aligns push decryption to the server-stamped envelope nonce
+// instead of a strictly-sequential Noise receive counter. The edge relay may
+// drop frames for unsubscribed channels, advancing the server send counter and
+// desyncing a sequential client (GCM tag mismatches / ACK timeouts on hosted
+// testnet). Default on; set GDX_STAMPED_NONCE_PUSH=false for the legacy path.
+var stampedNoncePush = strings.ToLower(os.Getenv("GDX_STAMPED_NONCE_PUSH")) != "false"
 
-// CryptoSession holds a single ECDH session with the sequencer.
+// StampedNoncePush reports whether push decryption realigns to the
+// server-stamped envelope nonce (default) versus the legacy sequential gate.
+// The client uses this to decide whether to buffer/reorder pushes by nonce.
+func StampedNoncePush() bool { return stampedNoncePush }
+
+// CryptoSession holds one Noise XK transport.
 //
 // All methods are safe to call from multiple goroutines.
 type CryptoSession struct {
 	mu          sync.Mutex
-	privateKey  *ecdh.PrivateKey
-	localPublic []byte
-	sessionKey  []byte
-	sessionID   uint64
-	hasSession  bool
+	transport   *noise.Transport
+	connID      uint64
 	established bool
-	nonce       gdxcrypto.NonceTracker
+	sendNonce   uint32
 }
 
-// IsEstablished reports whether the ECDH handshake has completed.
+// IsEstablished reports whether the Noise XK handshake has completed.
 func (s *CryptoSession) IsEstablished() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.established
 }
 
-// SessionID returns the server-assigned session id (only valid once
+// SessionID returns the server-assigned connection id (only valid once
 // IsEstablished returns true).
 func (s *CryptoSession) SessionID() (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.hasSession {
+	if !s.established {
 		return 0, false
 	}
-	return s.sessionID, true
+	return s.connID, true
 }
 
 // NextNonce returns the value the next call to EncryptOrder would consume,
 // without advancing the counter. Useful for AAD construction.
 func (s *CryptoSession) NextNonce() uint32 {
-	return s.nonce.PeekNext()
-}
-
-// GenerateKeypair creates a fresh X25519 keypair for this session and returns
-// the base64-encoded public key string the client sends in `session.setup`.
-func (s *CryptoSession) GenerateKeypair() (string, error) {
-	priv, pub, err := gdxcrypto.GenerateEphemeralKeypair()
-	if err != nil {
-		return "", err
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.privateKey = priv
-	s.localPublic = pub
-	s.sessionKey = nil
-	s.hasSession = false
-	s.established = false
-	s.nonce.Reset()
-	return base64.StdEncoding.EncodeToString(pub), nil
+	return s.sendNonce
 }
 
-// Establish completes the ECDH handshake. `sequencerPubkeyB64` is the
-// base64-encoded server X25519 public key from the `session.setup` response;
-// `sessionID` is the server-assigned session id from the same response.
-//
-// On success the private key is dropped so a stolen *CryptoSession can no
-// longer revive past sessions.
-func (s *CryptoSession) Establish(sequencerPubkeyB64 string, sessionID uint64) error {
-	remotePub, err := base64.StdEncoding.DecodeString(sequencerPubkeyB64)
-	if err != nil {
-		return fmt.Errorf("decode sequencer public key: %w", err)
+// Establish attaches a completed Noise transport to the authenticated conn_id.
+func (s *CryptoSession) Establish(value any, connID uint64) error {
+	transport, ok := value.(*noise.Transport)
+	if !ok {
+		return errors.New("ECDH session.setup is not supported; encrypted REST trading requires a Noise WebSocket session")
 	}
-
+	if transport == nil || connID == 0 {
+		return errors.New("Noise transport and non-zero conn_id are required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.privateKey == nil || s.localPublic == nil {
-		return ErrMissingKeypair
-	}
-
-	key, err := gdxcrypto.DeriveSessionKey(s.privateKey, s.localPublic, remotePub)
-	if err != nil {
-		return err
-	}
-
-	s.sessionKey = key
-	s.sessionID = sessionID
-	s.hasSession = true
-	s.established = true
-	s.privateKey = nil
-	s.nonce.Reset()
+	s.transport, s.connID, s.established, s.sendNonce = transport, connID, true, 0
 	return nil
+}
+
+// GenerateKeypair is retained only so older REST call sites fail explicitly:
+// Noise XK needs a live WebSocket relay and cannot be established over REST.
+func (s *CryptoSession) GenerateKeypair() (string, error) {
+	return "", errors.New("ECDH session.setup is not supported; encrypted REST trading requires a Noise WebSocket session")
 }
 
 // EncryptOrder seals an order payload. Returns (nonce_counter, ciphertext).
 // `aad` is typically the protobuf-encoded `OrderHeader`.
 func (s *CryptoSession) EncryptOrder(aad, plaintext []byte) (uint32, []byte, error) {
 	s.mu.Lock()
-	if !s.established {
+	if !s.established || s.transport == nil {
 		s.mu.Unlock()
 		return 0, nil, ErrNotEstablished
 	}
-	key := s.sessionKey
-	sid := s.sessionID
+	transport := s.transport
+	nonce := s.sendNonce
+	if nonce == ^uint32(0) {
+		s.mu.Unlock()
+		return 0, nil, errors.New("send nonce counter exceeded u32 max")
+	}
+	s.sendNonce++
 	s.mu.Unlock()
-
-	counter, err := s.nonce.Advance()
+	ct, err := bound.Encrypt(transport, aad, plaintext)
 	if err != nil {
 		return 0, nil, err
 	}
-	ct, err := gdxcrypto.Encrypt(key, sid, counter, aad, plaintext)
-	if err != nil {
-		return 0, nil, err
-	}
-	return counter, ct, nil
+	return nonce, ct, nil
 }
 
 // DecryptPush opens an encrypted push from the sequencer. `aad` is typically
 // the protobuf-encoded `ResponseHeader`.
 func (s *CryptoSession) DecryptPush(nonceCounter uint32, aad, ciphertext []byte) ([]byte, error) {
 	s.mu.Lock()
-	if !s.established {
+	if !s.established || s.transport == nil {
 		s.mu.Unlock()
 		return nil, ErrNotEstablished
 	}
-	key := s.sessionKey
-	sid := s.sessionID
+	transport := s.transport
 	s.mu.Unlock()
-
-	pt, err := gdxcrypto.Decrypt(key, sid, nonceCounter, aad, ciphertext)
-	if err != nil {
-		return nil, err
+	if stampedNoncePush {
+		// Align the receive counter to the server-stamped nonce, then decrypt.
+		// DecryptAt advances the counter to nonceCounter+1 on success.
+		return bound.DecryptAt(transport, uint64(nonceCounter), aad, ciphertext)
 	}
-	s.nonce.CommitRecv(nonceCounter)
-	return pt, nil
+	if uint64(nonceCounter) != transport.RecvNonce() {
+		return nil, errors.New("Noise receive nonce out of sequence")
+	}
+	return bound.Decrypt(transport, aad, ciphertext)
+}
+
+// RecvNonce returns the next Noise receive counter for ordered push handling.
+func (s *CryptoSession) RecvNonce() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transport == nil {
+		return 0
+	}
+	return s.transport.RecvNonce()
 }
 
 // Reset clears all session state. Call between reconnects or on rekey.
 func (s *CryptoSession) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.privateKey = nil
-	s.localPublic = nil
-	s.sessionKey = nil
-	s.sessionID = 0
-	s.hasSession = false
+	s.transport = nil
+	s.connID = 0
 	s.established = false
-	s.nonce.Reset()
+	s.sendNonce = 0
 }
