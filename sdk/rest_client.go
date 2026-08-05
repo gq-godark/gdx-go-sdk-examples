@@ -3,6 +3,7 @@ package godark
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,20 +48,18 @@ type RestClientConfig struct {
 	HTTPClient *http.Client
 }
 
-// GodarkRestClient is the REST trading client. Same crypto contract as
-// GodarkClient: orders are AES-256-GCM-encrypted under a per-session key
-// derived via X25519 ECDH; the edge stays stateless and only routes the
-// encrypted envelope.
+// GodarkRestClient exposes REST account and market endpoints. Encrypted
+// trading requires the Noise XK WebSocket session and is intentionally refused.
 type GodarkRestClient struct {
 	legacyToken string
 	apiKeyID    string
 	apiSecret   string
 	passphrase  string
 	baseURL     string
-	symbolMap  map[string]int64
-	http       *rest.Transport
-	session    *session.CryptoSession
-	fallback   string
+	symbolMap   map[string]int64
+	http        *rest.Transport
+	session     *session.CryptoSession
+	fallback    string
 
 	mu             sync.RWMutex
 	bearer         string
@@ -70,7 +69,7 @@ type GodarkRestClient struct {
 }
 
 // NewRestClient validates the config and returns an unconnected client.
-// Call Connect to obtain a bearer token and complete ECDH session setup.
+// Call Connect to obtain a bearer token. Encrypted trading remains WebSocket-only.
 func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 	creds, err := resolveRestCredentials(RestClientConfig{
 		APIKey:     cfg.APIKey,
@@ -134,7 +133,7 @@ func resolveRestCredentials(cfg RestClientConfig) (restCredentials, error) {
 	return restCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
 }
 
-// IsSessionEstablished reports whether ECDH session setup completed.
+// IsSessionEstablished is always false: REST cannot establish Noise XK.
 func (c *GodarkRestClient) IsSessionEstablished() bool {
 	return c.session.IsEstablished()
 }
@@ -157,8 +156,8 @@ func (c *GodarkRestClient) BearerToken() string {
 	return c.bearer
 }
 
-// Connect performs `auth/token` then `session/setup` (ECDH). After this
-// returns nil, encrypted orders can flow.
+// Connect authenticates REST requests. It does not create an encrypted trading
+// session because Noise XK is a WebSocket flow.
 func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	var (
 		authData map[string]any
@@ -197,45 +196,10 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	c.userUUID = uid
 	c.mu.Unlock()
 
-	pubB64, err := c.session.GenerateKeypair()
-	if err != nil {
-		return newSessionError(fmt.Sprintf("generate keypair: %v", err))
-	}
-	sessData, err := c.http.SessionSetup(ctx, bearer, pubB64)
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	seqPub, _ := sessData["sequencer_ecdh_pubkey"].(string)
-	if seqPub == "" {
-		seqPub, _ = sessData["server_ecdh_pubkey"].(string)
-	}
-	sidRaw := sessData["session_id"]
-	var sid uint64
-	switch v := sidRaw.(type) {
-	case float64:
-		sid = uint64(v)
-	case int:
-		sid = uint64(v)
-	case int64:
-		sid = uint64(v)
-	case uint64:
-		sid = v
-	case string:
-		parsed, perr := strconv.ParseUint(v, 10, 64)
-		if perr != nil {
-			return newSessionError(fmt.Sprintf("invalid session_id %q: %v", v, perr))
-		}
-		sid = parsed
-	default:
-		return newSessionError(fmt.Sprintf("missing or invalid session_id type %T", sidRaw))
-	}
-	if err := c.session.Establish(seqPub, sid); err != nil {
-		return newSessionError(err.Error())
-	}
 	return nil
 }
 
-// Disconnect revokes the bearer and resets the local ECDH session.
+// Disconnect revokes the bearer and resets local state.
 // Revocation is best-effort: errors are silently ignored.
 func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 	c.mu.RLock()
@@ -573,10 +537,7 @@ func (c *GodarkRestClient) UpdateLeverage(ctx context.Context, symbol string, le
 	}
 	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
 
-	corrIDStr := ""
-	if s, err := identity.FromBytes(corrID); err == nil {
-		corrIDStr = s
-	}
+	corrIDStr := hex.EncodeToString(corrID)
 	headerObj := map[string]any{
 		"symbol_id":      symbolID,
 		"request_type":   "update_leverage",
@@ -650,10 +611,7 @@ func (c *GodarkRestClient) sendEncrypted(ctx context.Context, requestType string
 	}
 	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
 
-	corrIDStr := ""
-	if s, err := identity.FromBytes(correlationID); err == nil {
-		corrIDStr = s
-	}
+	corrIDStr := hex.EncodeToString(correlationID)
 	headerObj := map[string]any{
 		"symbol_id":      symbolID,
 		"request_type":   requestType,
@@ -725,7 +683,10 @@ func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error)
 	if messageType == "" {
 		messageType = "ack"
 	}
-	aad, err := BuildResponseHeaderAAD(c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch)
+	aad, err := BuildResponseHeaderAAD(
+		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -743,9 +704,9 @@ func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error)
 	if !ack.Success {
 		if ack.ErrorCode != nil {
 			code := int32(*ack.ErrorCode)
-			return nil, MakeOrderErrorFromCode(&code)
+			return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
 		}
-		return nil, MakeOrderErrorFromJSON("order rejected", "")
+		return nil, MakeOrderErrorFromJSON(ack.RejectText, "")
 	}
 	return &OrderAck{
 		OrderID:  strconv.FormatUint(ack.OrderID, 10),
@@ -797,7 +758,7 @@ func (c *GodarkRestClient) ensureReady() error {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
-		return newSessionError("ECDH session not established")
+		return newSessionError("encrypted REST trading is not supported; use GodarkClient over WebSocket with Noise XK")
 	}
 	return nil
 }

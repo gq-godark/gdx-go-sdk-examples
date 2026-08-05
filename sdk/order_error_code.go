@@ -96,20 +96,27 @@ func FindOrderErrorSymbolic(symbolic string) (OrderErrorEntry, bool) {
 // non-zero.
 //
 // Pass code = nil to signal "the server didn't supply a code at all".
-func MakeOrderErrorFromCode(code *int32) *OrderError {
+// An optional detail (ack reject_text / update msg) is appended when non-empty.
+func MakeOrderErrorFromCode(code *int32, detail ...string) *OrderError {
+	detailSuffix := ""
+	if len(detail) > 0 {
+		if d := strings.TrimSpace(detail[0]); d != "" {
+			detailSuffix = ": " + d
+		}
+	}
 	if code == nil {
-		return newOrderError("order rejected", "")
+		return newOrderError("order rejected"+detailSuffix, "")
 	}
 	raw := *code
 	if raw >= 0 && raw <= 0xFFFF {
 		if e, ok := FindOrderErrorCode(uint16(raw)); ok {
 			return newOrderError(
-				fmt.Sprintf("%s (%s, code=%d)", e.Reason, e.Symbolic, e.Code),
+				fmt.Sprintf("%s (%s, code=%d)%s", e.Reason, e.Symbolic, e.Code, detailSuffix),
 				e.Symbolic,
 			)
 		}
 	}
-	return newOrderError("order rejected", strconv.FormatInt(int64(raw), 10))
+	return newOrderError("order rejected"+detailSuffix, strconv.FormatInt(int64(raw), 10))
 }
 
 // MakeOrderErrorFromJSON is the JSON-ack equivalent of MakeOrderErrorFromCode.

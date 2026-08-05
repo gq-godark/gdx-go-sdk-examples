@@ -6,7 +6,7 @@
 //     message?}` in) and its translation to the legacy `{type, event, ...}`
 //     shape the client uses internally.
 //   - Authentication (login op -> auth_result frame).
-//   - Session-setup handshake (session.setup -> session_established).
+//   - Noise XK handshake relay (noise.handshake -> noise_handshake_reply).
 //   - Command serialization (one in flight at a time) with timeout.
 //   - Subscribe / unsubscribe ack collation.
 //   - Heartbeat + staleness detection.
@@ -22,9 +22,11 @@ package transport
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -100,16 +102,26 @@ type Transport struct {
 	connected bool
 	closed    bool
 
-	// command waiter (one at a time, gated by cmdLock)
+	// Command waiters.
+	//
+	// cmdLock serializes only the *send* (nonce assignment, encryption, and
+	// the WS write) so frames leave in nonce order; the round-trip wait
+	// happens without the lock. Correlation-keyed commands (encrypted trading
+	// ops) may therefore be in flight concurrently, each matched back by
+	// correlation id (or wire id, which business rejects carry when the header
+	// correlation id is dropped). Commands without a correlation id use the
+	// single `pending` slot and stay serialized.
 	cmdLock   sync.Mutex
 	pending   chan Message
 	pendingMu sync.Mutex
+	byCorr    map[string]chan Message
+	byWireID  map[string]chan Message
 
 	// subscription ack waiter
-	subWaiter  chan error
-	subExpect  int
-	subOp      string
-	subMu      sync.Mutex
+	subWaiter chan error
+	subExpect int
+	subOp     string
+	subMu     sync.Mutex
 
 	// liveness tracking
 	lastInbound time.Time
@@ -125,10 +137,12 @@ type Transport struct {
 func New(targetURL string, config Config, handlers Handlers) *Transport {
 	config.applyDefaults()
 	return &Transport{
-		url:     targetURL,
-		config:  config,
-		use:     config.useDocsWire(),
-		handler: handlers,
+		url:      targetURL,
+		config:   config,
+		use:      config.useDocsWire(),
+		handler:  handlers,
+		byCorr:   make(map[string]chan Message),
+		byWireID: make(map[string]chan Message),
 	}
 }
 
@@ -220,26 +234,104 @@ func (t *Transport) SendJSON(ctx context.Context, obj any) error {
 	return conn.Write(ctx, websocket.MessageText, b)
 }
 
+// commandKeys extracts the header correlation id and wire id from an outbound
+// payload. Correlation id selects the concurrent routing path; wire id is a
+// fallback for error frames that omit the correlation id.
+func commandKeys(payload any) (corr, wireID string) {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	if id, ok := m["id"].(string); ok {
+		wireID = id
+	}
+	var header map[string]any
+	if args, ok := m["args"].(map[string]any); ok {
+		header, _ = args["header"].(map[string]any)
+	}
+	if header == nil {
+		if data, ok := m["data"].(map[string]any); ok {
+			header, _ = data["header"].(map[string]any)
+		}
+	}
+	if header != nil {
+		if c, ok := header["correlation_id"].(string); ok && c != "" {
+			corr = correlationKeyFromString(c)
+		}
+	}
+	return corr, wireID
+}
+
 // SendCommand sends a JSON payload and waits for its matching ack or error.
-// Serializes commands so only one is in flight at a time, matching python.
 func (t *Transport) SendCommand(ctx context.Context, payload any) (Message, error) {
+	return t.SendCommandFunc(ctx, func() (any, error) { return payload, nil })
+}
+
+// SendCommandFunc builds the frame via prepare while holding the send lock,
+// then sends it and awaits its ack/error. prepare lets the caller keep nonce
+// assignment and encryption atomic with the send so concurrent commands still
+// hit the wire in nonce order. Commands carrying a correlation id are matched
+// back by that id (or wire id) and may be in flight concurrently; commands
+// without one fall back to the serialized single slot.
+func (t *Transport) SendCommandFunc(ctx context.Context, prepare func() (any, error)) (Message, error) {
+	waiter := make(chan Message, 1)
+
 	t.cmdLock.Lock()
-	defer t.cmdLock.Unlock()
-
-	t.pendingMu.Lock()
-	t.pending = make(chan Message, 1)
-	t.pendingMu.Unlock()
-
-	defer func() {
-		t.pendingMu.Lock()
-		t.pending = nil
-		t.pendingMu.Unlock()
-	}()
-
-	if err := t.SendJSON(ctx, payload); err != nil {
+	payload, err := prepare()
+	if err != nil {
+		t.cmdLock.Unlock()
 		return nil, err
 	}
+	corr, wireID := commandKeys(payload)
 
+	if corr == "" {
+		// Serialized single-slot path: keep the lock across the round-trip so
+		// the unkeyed response cannot be confused with another command.
+		defer t.cmdLock.Unlock()
+		t.pendingMu.Lock()
+		t.pending = waiter
+		t.pendingMu.Unlock()
+		defer func() {
+			t.pendingMu.Lock()
+			t.pending = nil
+			t.pendingMu.Unlock()
+		}()
+		if err := t.SendJSON(ctx, payload); err != nil {
+			return nil, err
+		}
+		return t.awaitWaiter(ctx, waiter)
+	}
+
+	// Concurrent path: register keyed waiter, send, then release the lock and
+	// await the response off-lock so other commands can pipeline.
+	t.pendingMu.Lock()
+	t.byCorr[corr] = waiter
+	if wireID != "" {
+		t.byWireID[wireID] = waiter
+	}
+	t.pendingMu.Unlock()
+
+	cleanup := func() {
+		t.pendingMu.Lock()
+		delete(t.byCorr, corr)
+		if wireID != "" {
+			delete(t.byWireID, wireID)
+		}
+		t.pendingMu.Unlock()
+	}
+
+	if err := t.SendJSON(ctx, payload); err != nil {
+		cleanup()
+		t.cmdLock.Unlock()
+		return nil, err
+	}
+	t.cmdLock.Unlock()
+
+	defer cleanup()
+	return t.awaitWaiter(ctx, waiter)
+}
+
+func (t *Transport) awaitWaiter(ctx context.Context, waiter chan Message) (Message, error) {
 	timeout := t.config.CommandTimeout
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -249,7 +341,7 @@ func (t *Transport) SendCommand(ctx context.Context, payload any) (Message, erro
 		return nil, ctx.Err()
 	case <-timer.C:
 		return nil, fmt.Errorf("command timed out after %s", timeout)
-	case msg, ok := <-t.pending:
+	case msg, ok := <-waiter:
 		if !ok {
 			return nil, errors.New("transport closed while awaiting ack")
 		}
@@ -372,15 +464,120 @@ func (t *Transport) Authenticate(ctx context.Context, apiKey string) (Message, e
 func (t *Transport) ResolveCommand(msg Message) bool {
 	t.pendingMu.Lock()
 	defer t.pendingMu.Unlock()
-	if t.pending == nil {
-		return false
+	return t.resolveLocked(msg)
+}
+
+// resolveLocked routes a response to its waiter by correlation id, then wire
+// id, then the serialized single slot. Callers must hold pendingMu.
+func (t *Transport) resolveLocked(msg Message) bool {
+	if corr := correlationKey(msg["correlation_id"]); corr != "" {
+		if ch, ok := t.byCorr[corr]; ok {
+			t.forgetLocked(ch)
+			select {
+			case ch <- msg:
+				return true
+			default:
+				return true
+			}
+		}
 	}
-	select {
-	case t.pending <- msg:
-		return true
+	if wireID, _ := msg["wire_id"].(string); wireID != "" {
+		if ch, ok := t.byWireID[wireID]; ok {
+			t.forgetLocked(ch)
+			select {
+			case ch <- msg:
+				return true
+			default:
+				return true
+			}
+		}
+	}
+	if t.pending != nil {
+		select {
+		case t.pending <- msg:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// forgetLocked removes ch from both keyed waiter maps. Callers hold pendingMu.
+func (t *Transport) forgetLocked(ch chan Message) {
+	for k, v := range t.byCorr {
+		if v == ch {
+			delete(t.byCorr, k)
+		}
+	}
+	for k, v := range t.byWireID {
+		if v == ch {
+			delete(t.byWireID, k)
+		}
+	}
+}
+
+// correlationKey normalizes a wire correlation id to a canonical lowercase-hex
+// key over the underlying 16 bytes. The request header stamps the id as hex
+// while edge responses return it as a decimal integer string, so both encodings
+// must map to the same key (matching the Java SDK's normalizeCorrelationKey).
+func correlationKey(v any) string {
+	var s string
+	switch value := v.(type) {
+	case string:
+		s = value
+	case float64:
+		s = fmt.Sprintf("%.0f", value)
+	case uint64:
+		s = fmt.Sprintf("%d", value)
 	default:
-		return false
+		return ""
 	}
+	return correlationKeyFromString(s)
+}
+
+func correlationKeyFromString(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	var n *big.Int
+	var ok bool
+	switch {
+	case isAllDigits(s):
+		n, ok = new(big.Int).SetString(s, 10)
+	case len(s) == 32 && isHex(s):
+		n, ok = new(big.Int).SetString(s, 16)
+	default:
+		// Unknown format: fall back to a lowercased passthrough so at least
+		// identical encodings still match.
+		return strings.ToLower(s)
+	}
+	if !ok || n.Sign() <= 0 || n.BitLen() > 128 {
+		return strings.ToLower(s)
+	}
+	raw := n.Bytes()
+	out := make([]byte, 16)
+	copy(out[16-len(raw):], raw)
+	return hex.EncodeToString(out)
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // rejectPending fails any in-flight command/subscribe waiter with err.
@@ -389,6 +586,23 @@ func (t *Transport) rejectPending(err error) {
 	if t.pending != nil {
 		close(t.pending)
 	}
+	// Close every concurrent waiter exactly once (the same channel may be
+	// registered under both a correlation id and a wire id).
+	closed := make(map[chan Message]struct{})
+	for _, ch := range t.byCorr {
+		if _, done := closed[ch]; !done {
+			close(ch)
+			closed[ch] = struct{}{}
+		}
+	}
+	for _, ch := range t.byWireID {
+		if _, done := closed[ch]; !done {
+			close(ch)
+			closed[ch] = struct{}{}
+		}
+	}
+	t.byCorr = make(map[string]chan Message)
+	t.byWireID = make(map[string]chan Message)
 	t.pendingMu.Unlock()
 
 	t.subMu.Lock()
@@ -455,6 +669,11 @@ func (t *Transport) dispatch(msg Message) {
 			t.handler.OnSessionEstablished(msg)
 		}
 		return
+	case "noise_handshake_reply":
+		if t.handler.OnSessionEstablished != nil {
+			t.handler.OnSessionEstablished(msg)
+		}
+		return
 	case "rekey_required":
 		if t.handler.OnRekeyRequired != nil {
 			t.handler.OnRekeyRequired(msg)
@@ -467,14 +686,8 @@ func (t *Transport) dispatch(msg Message) {
 		return
 	case "ack", "error":
 		t.pendingMu.Lock()
-		ch := t.pending
+		t.resolveLocked(msg)
 		t.pendingMu.Unlock()
-		if ch != nil {
-			select {
-			case ch <- msg:
-			default:
-			}
-		}
 		return
 	}
 
@@ -595,6 +808,7 @@ func normalizeInboundMessage(msg Message) Message {
 	op, _ := msg["op"].(string)
 	data, _ := msg["data"].(map[string]any)
 	message, _ := msg["message"].(string)
+	wireID, _ := msg["id"].(string)
 
 	switch {
 	case op == "pong" && code == 0:
@@ -619,7 +833,7 @@ func normalizeInboundMessage(msg Message) Message {
 			}
 			for _, k := range []string{
 				"user_uuid", "account_id", "session_id",
-				"token_expires_at", "cancel_on_disconnect",
+				"token_expires_at", "cancel_on_disconnect", "conn_id",
 			} {
 				if v, ok := data[k]; ok {
 					out[k] = v
@@ -629,26 +843,26 @@ func normalizeInboundMessage(msg Message) Message {
 		}
 		return Message{"type": "auth_result", "success": false, "error": "invalid auth response"}
 
-	case op == "session.setup" || op == "session_setup":
+	case op == "noise.handshake" || op == "noise_handshake":
 		if code != 0 {
 			errText := message
 			if errText == "" {
-				errText = "session setup failed"
+				errText = "noise handshake failed"
 			}
 			return Message{"type": "error", "message": errText}
 		}
 		if data == nil {
-			return Message{"type": "error", "message": "invalid session response"}
-		}
-		seqPub := stringFromAny(data["sequencer_ecdh_pubkey"])
-		if seqPub == "" {
-			seqPub = stringFromAny(data["server_ecdh_pubkey"])
+			return Message{"type": "error", "message": "invalid noise handshake response"}
 		}
 		return Message{
-			"type":                   "session_established",
-			"sequencer_ecdh_pubkey":  seqPub,
-			"session_id":             data["session_id"],
+			"type":        "noise_handshake_reply",
+			"conn_id":     data["conn_id"],
+			"message":     data["message"],
+			"established": data["established"],
 		}
+
+	case op == "session.setup" || op == "session_setup":
+		return Message{"type": "error", "message": "session.setup is not supported (Noise XK required)"}
 
 	case op == "subscribe" || op == "unsubscribe":
 		if code != 0 {
@@ -679,34 +893,42 @@ func normalizeInboundMessage(msg Message) Message {
 		}
 		return Message{"type": "ack", "success": true}
 
-	case op == "order.place" || op == "order.cancel" || op == "order.modify":
+	case op == "order.place" || op == "order.cancel" || op == "order.modify" ||
+		op == "order.mass_quote" || op == "order.batch_cancel" || op == "order.batch_modify":
 		if code != 0 {
 			errText := message
 			if errText == "" {
 				errText = "order error"
 			}
-			return Message{"type": "error", "message": errText}
+			// wire_id lets a concurrent command's error route to its waiter
+			// even when the edge omits the header correlation id on rejects.
+			return Message{"type": "error", "message": errText, "wire_id": wireID}
 		}
 		if data == nil {
-			return Message{"type": "error", "message": "invalid order response"}
+			return Message{"type": "error", "message": "invalid order response", "wire_id": wireID}
 		}
 		// If the server responded with an encrypted ack, surface it as an
 		// encrypted_push frame the client will decrypt.
-		if mt, _ := data["message_type"].(string); mt == "ack" {
+		if mt, _ := data["message_type"].(string); mt != "" {
 			ciphertext := stringFromAny(data["ciphertext"])
 			if ciphertext == "" {
 				ciphertext = stringFromAny(data["encrypted_body"])
 			}
-			return Message{
-				"type":           "encrypted_push",
-				"message_type":   "ack",
-				"encrypted_body": ciphertext,
-				"nonce":          data["nonce"],
-				"fencing_epoch":  data["fencing_epoch"],
+			if ciphertext != "" {
+				return Message{
+					"type":           "encrypted_push",
+					"message_type":   mt,
+					"encrypted_body": ciphertext,
+					"nonce":          data["nonce"],
+					"fencing_epoch":  data["fencing_epoch"],
+					"correlation_id": data["correlation_id"],
+					"session_seq":    data["session_seq"],
+					"wire_id":        wireID,
+				}
 			}
 		}
-		out := Message{"type": "ack"}
-		for _, k := range []string{"success", "order_id", "sequence", "error", "error_code"} {
+		out := Message{"type": "ack", "wire_id": wireID}
+		for _, k := range []string{"success", "order_id", "sequence", "error", "error_code", "correlation_id"} {
 			if v, ok := data[k]; ok {
 				out[k] = v
 			}
@@ -735,6 +957,8 @@ func normalizeInboundMessage(msg Message) Message {
 					"encrypted_body": ciphertext,
 					"nonce":          data["nonce"],
 					"fencing_epoch":  data["fencing_epoch"],
+					"correlation_id": data["correlation_id"],
+					"session_seq":    data["session_seq"],
 				}
 			}
 		}

@@ -3,6 +3,7 @@ package godark
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	gdxcrypto "github.com/gq-godark/gdx-go-sdk/internal/crypto"
 	"github.com/gq-godark/gdx-go-sdk/internal/identity"
+	"github.com/gq-godark/gdx-go-sdk/internal/noise"
 	"github.com/gq-godark/gdx-go-sdk/internal/session"
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
 )
@@ -55,6 +57,11 @@ type ClientConfig struct {
 	// GDX_USER_UUID env vars.
 	UserUUID string
 
+	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 static key.
+	// It may also be supplied as GDX_NOISE_STATIC_PUBLIC_KEY,
+	// GDX_NOISE_STATIC_PUBKEY, or GODARK_NOISE_STATIC_PUBLIC_KEY.
+	NoiseStaticPublicKeyHex string
+
 	// SymbolMap overrides the embedded default symbol map. Useful when
 	// running against a non-prod edge with a custom symbol set.
 	SymbolMap map[string]int64
@@ -70,6 +77,35 @@ type ClientConfig struct {
 	// (order updates, position updates, etc.). When the buffer fills, the
 	// oldest frame is dropped. Default 256.
 	StreamBufferSize int
+
+	// PlaceOrderTerminalTimeout is how long PlaceOrder waits for book
+	// confirmation (OPEN/reject/fill/cancel) after the fast ack when
+	// Confirmation is Book. Nil uses the command timeout (30s by default).
+	// When set, the duration must be greater than zero.
+	PlaceOrderTerminalTimeout *time.Duration
+}
+
+// PlaceOrderConfirmation selects the PlaceOrder completion boundary.
+// Empty Confirmation on PlaceOrderRequest defaults to Book.
+type PlaceOrderConfirmation string
+
+const (
+	// PlaceOrderConfirmationAck returns after the sequencer fast ack.
+	// Callers must consume OrderUpdates / OnOrderUpdate for the later outcome.
+	PlaceOrderConfirmationAck PlaceOrderConfirmation = "ack"
+	// PlaceOrderConfirmationBook waits for OPEN, REJECTED, FILLED,
+	// PARTIALLY_FILLED, or CANCELLED after the fast ack (default).
+	PlaceOrderConfirmationBook PlaceOrderConfirmation = "book"
+)
+
+type placeOutcomeResult struct {
+	update *OrderUpdate
+	err    error
+}
+
+type placeOutcomeWaiter struct {
+	orderID string
+	ch      chan placeOutcomeResult
 }
 
 // GodarkClient is the encrypted trading client.
@@ -91,6 +127,8 @@ type GodarkClient struct {
 
 	mu             sync.RWMutex
 	userUUID       string
+	connID         uint64
+	noiseStaticKey string
 	accountID      string
 	loginSessionID string
 	tokenExpiresAt string
@@ -107,21 +145,28 @@ type GodarkClient struct {
 	fundingRateQueue  chan *FundingRateUpdate
 	settlementQueue   chan *SettlementUpdate
 
-	cbMu               sync.RWMutex
-	orderCallbacks     []func(*OrderUpdate)
-	positionCallbacks  []func(*PositionUpdate)
-	snapshotCallbacks  []func(*PositionsSnapshot)
-	healthCallbacks    []func(*SystemHealthUpdate)
-	balanceCallbacks   []func(*BalanceUpdate)
-	marginCallbacks    []func(*MarginAlert)
-	fundingCallbacks   []func(*FundingRateUpdate)
-	settlementCBs      []func(*SettlementUpdate)
-	errorCallbacks     []func(error)
-	disconnectCB       []func()
+	cbMu              sync.RWMutex
+	orderCallbacks    []func(*OrderUpdate)
+	positionCallbacks []func(*PositionUpdate)
+	snapshotCallbacks []func(*PositionsSnapshot)
+	healthCallbacks   []func(*SystemHealthUpdate)
+	balanceCallbacks  []func(*BalanceUpdate)
+	marginCallbacks   []func(*MarginAlert)
+	fundingCallbacks  []func(*FundingRateUpdate)
+	settlementCBs     []func(*SettlementUpdate)
+	errorCallbacks    []func(error)
+	disconnectCB      []func()
 
 	// session-setup waiter
-	sessionMu     sync.Mutex
-	sessionReady  chan transport.Message
+	sessionMu               sync.Mutex
+	sessionReady            chan transport.Message
+	pendingMu               sync.Mutex
+	pendingEncryptedByNonce map[uint64]transport.Message
+
+	placeMu              sync.Mutex
+	placeOutcomeWaiters  []*placeOutcomeWaiter
+	recentTerminalOrders []*OrderUpdate
+	placeTerminalTimeout time.Duration
 }
 
 // NewClient validates config and returns an unconnected client. Call Connect
@@ -149,21 +194,35 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		cfg.Transport.HTTPClient = cfg.HTTPClient
 	}
 
+	terminalTimeout := 30 * time.Second
+	if cfg.Transport.CommandTimeout > 0 {
+		terminalTimeout = cfg.Transport.CommandTimeout
+	}
+	if cfg.PlaceOrderTerminalTimeout != nil {
+		if *cfg.PlaceOrderTerminalTimeout <= 0 {
+			return nil, errors.New("PlaceOrderTerminalTimeout must be greater than 0")
+		}
+		terminalTimeout = *cfg.PlaceOrderTerminalTimeout
+	}
+
 	c := &GodarkClient{
-		authToken:         authToken,
-		baseURL:           baseURL,
-		fallbackUserUU:    fallbackUUID,
-		symbolMap:         symbolMap,
-		bufSize:           bufSize,
-		session:           &session.CryptoSession{},
-		orderQueue:        make(chan *OrderUpdate, bufSize),
-		positionQueue:     make(chan *PositionUpdate, bufSize),
-		posSnapshotQueue:  make(chan *PositionsSnapshot, bufSize),
-		systemHealthQueue: make(chan *SystemHealthUpdate, bufSize),
-		balanceQueue:      make(chan *BalanceUpdate, bufSize),
-		marginAlertQueue:  make(chan *MarginAlert, bufSize),
-		fundingRateQueue:  make(chan *FundingRateUpdate, bufSize),
-		settlementQueue:   make(chan *SettlementUpdate, bufSize),
+		authToken:               authToken,
+		baseURL:                 baseURL,
+		fallbackUserUU:          fallbackUUID,
+		symbolMap:               symbolMap,
+		bufSize:                 bufSize,
+		placeTerminalTimeout:    terminalTimeout,
+		noiseStaticKey:          resolveNoiseStaticPublicKey(cfg.NoiseStaticPublicKeyHex),
+		session:                 &session.CryptoSession{},
+		pendingEncryptedByNonce: make(map[uint64]transport.Message),
+		orderQueue:              make(chan *OrderUpdate, bufSize),
+		positionQueue:           make(chan *PositionUpdate, bufSize),
+		posSnapshotQueue:        make(chan *PositionsSnapshot, bufSize),
+		systemHealthQueue:       make(chan *SystemHealthUpdate, bufSize),
+		balanceQueue:            make(chan *BalanceUpdate, bufSize),
+		marginAlertQueue:        make(chan *MarginAlert, bufSize),
+		fundingRateQueue:        make(chan *FundingRateUpdate, bufSize),
+		settlementQueue:         make(chan *SettlementUpdate, bufSize),
 	}
 
 	c.transport = transport.New(transport.EdgeURL(baseURL), cfg.Transport, transport.Handlers{
@@ -218,7 +277,7 @@ func (c *GodarkClient) IsConnected() bool {
 // -----------------------------------------------------------------------
 
 // Connect opens the WebSocket, authenticates with the configured API key, and
-// completes the ECDH session handshake. After Connect returns nil, the client
+// completes the Noise XK handshake. After Connect returns nil, the client
 // can issue trading commands.
 func (c *GodarkClient) Connect(ctx context.Context) error {
 	if err := c.transport.Connect(ctx); err != nil {
@@ -265,7 +324,15 @@ func (c *GodarkClient) Connect(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
-	if err := c.setupECDHSession(ctx); err != nil {
+	connID := coerceUint64(auth["conn_id"])
+	if connID == 0 {
+		_ = c.disconnectInternal()
+		return newAuthenticationError("auth response did not include a non-zero conn_id (required for Noise XK)")
+	}
+	c.mu.Lock()
+	c.connID = connID
+	c.mu.Unlock()
+	if err := c.setupNoiseSession(ctx); err != nil {
 		_ = c.disconnectInternal()
 		return err
 	}
@@ -276,7 +343,7 @@ func (c *GodarkClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Disconnect closes the WebSocket and clears the ECDH session. Safe to call
+// Disconnect closes the WebSocket and clears the Noise session. Safe to call
 // from multiple goroutines.
 func (c *GodarkClient) Disconnect() error {
 	return c.disconnectInternal()
@@ -288,6 +355,9 @@ func (c *GodarkClient) disconnectInternal() error {
 	c.mu.Unlock()
 	c.transport.Disconnect()
 	c.session.Reset()
+	c.pendingMu.Lock()
+	c.pendingEncryptedByNonce = make(map[uint64]transport.Message)
+	c.pendingMu.Unlock()
 	return nil
 }
 
@@ -307,10 +377,17 @@ type PlaceOrderRequest struct {
 	AON         bool
 	MinFillSize *float64
 	ExpiryTime  *uint64
+	// Confirmation selects the completion boundary. Empty defaults to Book.
+	// Ack returns on the sequencer fast ack; Book waits for a definitive
+	// order update and returns OrderError on REJECTED.
+	Confirmation PlaceOrderConfirmation
 }
 
-// PlaceOrder sends an encrypted place command and waits for its ack. The
-// transport serializes commands so only one is in flight at a time.
+// PlaceOrder sends an encrypted place command and waits for its fast ack.
+// By default (Confirmation Book) it then waits for OPEN / REJECTED / FILLED /
+// PARTIALLY_FILLED / CANCELLED and surfaces REJECTED as OrderError with code
+// and msg / reject text. Confirmation Ack returns after the fast ack; callers
+// must consume OrderUpdates themselves. The transport serializes command sends.
 func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
@@ -324,6 +401,14 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 	}
 	if req.Side == "" || req.OrderType == "" {
 		return nil, errors.New("PlaceOrder: Side and OrderType are required")
+	}
+	confirmation := req.Confirmation
+	if confirmation == "" {
+		confirmation = PlaceOrderConfirmationBook
+	}
+	if confirmation != PlaceOrderConfirmationAck && confirmation != PlaceOrderConfirmationBook {
+		return nil, fmt.Errorf("PlaceOrder: Confirmation must be %q or %q",
+			PlaceOrderConfirmationAck, PlaceOrderConfirmationBook)
 	}
 
 	corrID := newCorrelationID()
@@ -349,7 +434,31 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	return c.sendEncryptedOrder(ctx, "place", uint64(symbolID), plaintext, corrID)
+	// Register before send so a terminal push that races the ack is not lost.
+	var waiter *placeOutcomeWaiter
+	if confirmation == PlaceOrderConfirmationBook {
+		waiter = c.registerPlaceOutcomeWaiter()
+	}
+	ack, err := c.sendEncryptedOrder(ctx, "place", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		c.cancelPlaceOutcomeWaiter(waiter)
+		return nil, err
+	}
+	if waiter == nil {
+		return ack, nil
+	}
+	update, err := c.awaitPlaceOutcome(ctx, ack.OrderID, waiter)
+	if err != nil {
+		return nil, err
+	}
+	if update.UpdateType == OrderUpdateTypeRejected || update.Status == OrderStatusRejected {
+		if numeric, parseErr := strconv.ParseInt(update.RejectReason, 10, 32); parseErr == nil {
+			code := int32(numeric)
+			return nil, MakeOrderErrorFromCode(&code, update.Msg)
+		}
+		return nil, MakeOrderErrorFromJSON(update.Msg, update.RejectReason)
+	}
+	return ack, nil
 }
 
 // CancelOrder sends an encrypted cancel command and waits for its ack.
@@ -549,12 +658,22 @@ func (c *GodarkClient) OnDisconnect(cb func()) {
 // Internals
 // -----------------------------------------------------------------------
 
-func (c *GodarkClient) setupECDHSession(ctx context.Context) error {
-	pubB64, err := c.session.GenerateKeypair()
-	if err != nil {
-		return newSessionError(fmt.Sprintf("generate keypair: %v", err))
+func (c *GodarkClient) setupNoiseSession(ctx context.Context) error {
+	if c.noiseStaticKey == "" {
+		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex or GDX_NOISE_STATIC_PUBLIC_KEY")
 	}
-
+	remoteStatic, err := noise.ParsePinnedStaticPublicKeyHex(c.noiseStaticKey)
+	if err != nil {
+		return newSessionError(err.Error())
+	}
+	prologue, err := noise.PrologueForUser(c.userUUIDBytes())
+	if err != nil {
+		return newSessionError(err.Error())
+	}
+	initiator, err := noise.NewHandshakeInitiator(remoteStatic, prologue)
+	if err != nil {
+		return newSessionError(err.Error())
+	}
 	c.sessionMu.Lock()
 	c.sessionReady = make(chan transport.Message, 1)
 	ready := c.sessionReady
@@ -566,66 +685,61 @@ func (c *GodarkClient) setupECDHSession(ctx context.Context) error {
 		c.sessionMu.Unlock()
 	}()
 
-	payload := map[string]any{
-		"id":   uuid.NewString(),
-		"op":   "session.setup",
-		"args": map[string]any{"client_ecdh_pubkey": pubB64},
-	}
-	if !c.transport.UseDocsWire() {
-		payload = map[string]any{
-			"type": "session_setup",
-			"data": map[string]any{
-				"user_uuid":          c.userUUID,
-				"client_ecdh_pubkey": pubB64,
-			},
+	sendAndWait := func(message []byte, established bool) (transport.Message, error) {
+		payload := map[string]any{"id": uuid.NewString(), "op": "noise.handshake", "args": map[string]any{"message": base64.StdEncoding.EncodeToString(message)}}
+		if !c.transport.UseDocsWire() {
+			payload = map[string]any{"type": "noise_handshake", "data": map[string]any{"message": base64.StdEncoding.EncodeToString(message)}}
+		}
+		if err := c.transport.SendJSON(ctx, payload); err != nil {
+			return nil, err
+		}
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, errors.New("Noise XK handshake timed out")
+		case msg := <-ready:
+			if msg["type"] == "error" {
+				return nil, errors.New(stringValue(msg["message"]))
+			}
+			if coerceUint64(msg["conn_id"]) != c.connID || msg["established"] != established {
+				return nil, errors.New("invalid Noise XK handshake reply")
+			}
+			return msg, nil
 		}
 	}
-	if err := c.transport.SendJSON(ctx, payload); err != nil {
+	msg1, err := initiator.WriteMessage(nil)
+	if err != nil {
 		return newSessionError(err.Error())
 	}
-
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return newSessionError(ctx.Err().Error())
-	case <-timer.C:
-		return newSessionError("ECDH session setup timed out")
-	case msg, ok := <-ready:
-		if !ok {
-			return newSessionError("session setup channel closed before reply")
-		}
-		if t, _ := msg["type"].(string); t == "error" {
-			errText, _ := msg["message"].(string)
-			if errText == "" {
-				errText = "session setup failed"
-			}
-			return newSessionError(errText)
-		}
-		seqPub := stringValue(msg["sequencer_ecdh_pubkey"])
-		sidRaw := msg["session_id"]
-		var sid uint64
-		switch v := sidRaw.(type) {
-		case float64:
-			sid = uint64(v)
-		case int:
-			sid = uint64(v)
-		case int64:
-			sid = uint64(v)
-		case string:
-			parsed, perr := strconv.ParseUint(v, 10, 64)
-			if perr != nil {
-				return newSessionError(fmt.Sprintf("invalid session_id %q: %v", v, perr))
-			}
-			sid = parsed
-		default:
-			return newSessionError(fmt.Sprintf("missing or invalid session_id type %T", sidRaw))
-		}
-		if err := c.session.Establish(seqPub, sid); err != nil {
-			return newSessionError(err.Error())
-		}
-		return nil
+	reply, err := sendAndWait(msg1, false)
+	if err != nil {
+		return newSessionError(err.Error())
 	}
+	msg2, err := base64.StdEncoding.DecodeString(stringValue(reply["message"]))
+	if err != nil {
+		return newSessionError(fmt.Sprintf("decode Noise reply: %v", err))
+	}
+	if _, err := initiator.ReadMessage(msg2); err != nil {
+		return newSessionError(fmt.Sprintf("read Noise reply: %v", err))
+	}
+	msg3, err := initiator.WriteMessage(nil)
+	if err != nil {
+		return newSessionError(err.Error())
+	}
+	if _, err := sendAndWait(msg3, true); err != nil {
+		return newSessionError(err.Error())
+	}
+	transportState, err := initiator.IntoTransport()
+	if err != nil {
+		return newSessionError(err.Error())
+	}
+	if err := c.session.Establish(transportState, c.connID); err != nil {
+		return newSessionError(err.Error())
+	}
+	return nil
 }
 
 func (c *GodarkClient) handleSessionEstablished(msg transport.Message) {
@@ -641,12 +755,12 @@ func (c *GodarkClient) handleSessionEstablished(msg transport.Message) {
 }
 
 func (c *GodarkClient) handleRekeyRequired(msg transport.Message) {
-	// Rekey support: re-run ECDH on the fly. Failures are surfaced via OnError
+	// Noise XK rekey re-runs the complete handshake. Failures are surfaced via OnError
 	// rather than the connection being torn down (caller can choose to
 	// reconnect manually).
 	go func() {
 		c.session.Reset()
-		if err := c.setupECDHSession(context.Background()); err != nil {
+		if err := c.setupNoiseSession(context.Background()); err != nil {
 			c.emitError(err)
 		}
 	}()
@@ -656,6 +770,9 @@ func (c *GodarkClient) handleDisconnect() {
 	c.mu.Lock()
 	c.connected = false
 	c.mu.Unlock()
+	c.rejectPlaceOutcomeWaiters(newConnectionError(
+		"connection lost while waiting for order confirmation",
+	))
 	c.cbMu.RLock()
 	cbs := append([]func(){}, c.disconnectCB...)
 	c.cbMu.RUnlock()
@@ -679,53 +796,63 @@ func (c *GodarkClient) emitError(err error) {
 // sendEncryptedOrder is the shared encrypt-send-await path for place / cancel
 // / modify.
 func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte) (*OrderAck, error) {
-	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
-	nonceCounter := c.session.NextNonce()
-
-	aad, err := BuildOrderHeaderAAD(c.userUUIDBytes(), symbolID, requestType, uint64(nonceCounter), bodyLength, correlationID)
+	resp, err := c.sendEncryptedCommand(ctx, requestType, symbolID, plaintext, correlationID)
 	if err != nil {
 		return nil, err
 	}
+	return c.parseOrderResponse(resp)
+}
 
-	actualNonce, ciphertext, err := c.session.EncryptOrder(aad, plaintext)
-	if err != nil {
-		return nil, newEncryptionError(fmt.Sprintf("encrypt order: %v", err))
-	}
+// sendEncryptedCommand encrypts plaintext, sends it with the wire op matching
+// requestType, and returns the raw response. Shared by the single-order path
+// and the mass-quote / batch paths.
+func (c *GodarkClient) sendEncryptedCommand(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte) (transport.Message, error) {
+	bodyLength := uint32(len(plaintext) + 32 + gdxcrypto.GCMTagLen)
+	corrIDStr := hex.EncodeToString(correlationID)
 
-	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
-	corrIDStr := ""
-	if s, err := identity.FromBytes(correlationID); err == nil {
-		corrIDStr = s
-	}
-
-	headerObj := map[string]any{
-		"symbol_id":      symbolID,
-		"request_type":   requestType,
-		"nonce":          actualNonce,
-		"body_length":    bodyLength,
-		"correlation_id": corrIDStr,
-	}
-
-	var payload any
-	if c.transport.UseDocsWire() {
-		opMap := map[string]string{
-			"place":  "order.place",
-			"cancel": "order.cancel",
-			"modify": "order.modify",
+	// Nonce assignment + encryption run inside prepare so they stay atomic with
+	// the send: the transport holds its send lock for the duration, keeping
+	// concurrent commands in nonce order on the wire.
+	prepare := func() (any, error) {
+		nonceCounter := c.session.NextNonce()
+		aad, err := BuildOrderHeaderAADWithConn(c.userUUIDBytes(), symbolID, requestType, uint64(nonceCounter), bodyLength, correlationID, c.connectionID())
+		if err != nil {
+			return nil, err
 		}
-		payload = map[string]any{
-			"id":   uuid.NewString(),
-			"op":   opMap[requestType],
-			"args": map[string]any{"header": headerObj, "ciphertext": bodyB64},
+		actualNonce, ciphertext, err := c.session.EncryptOrder(aad, plaintext)
+		if err != nil {
+			return nil, newEncryptionError(fmt.Sprintf("encrypt order: %v", err))
 		}
-	} else {
-		payload = map[string]any{
+		bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
+		headerObj := map[string]any{
+			"symbol_id":      symbolID,
+			"request_type":   requestType,
+			"nonce":          actualNonce,
+			"body_length":    bodyLength,
+			"correlation_id": corrIDStr,
+		}
+		if c.transport.UseDocsWire() {
+			opMap := map[string]string{
+				"place":        "order.place",
+				"cancel":       "order.cancel",
+				"modify":       "order.modify",
+				"mass_quote":   "order.mass_quote",
+				"batch_cancel": "order.batch_cancel",
+				"batch_modify": "order.batch_modify",
+			}
+			return map[string]any{
+				"id":   uuid.NewString(),
+				"op":   opMap[requestType],
+				"args": map[string]any{"header": headerObj, "ciphertext": bodyB64},
+			}, nil
+		}
+		return map[string]any{
 			"type": "encrypted_order",
 			"data": map[string]any{"header": headerObj, "encrypted_body": bodyB64},
-		}
+		}, nil
 	}
 
-	resp, err := c.transport.SendCommand(ctx, payload)
+	resp, err := c.transport.SendCommandFunc(ctx, prepare)
 	if err != nil {
 		var to *TimeoutError
 		if errors.As(err, &to) {
@@ -736,7 +863,7 @@ func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType strin
 		}
 		return nil, newConnectionError(err.Error())
 	}
-	return c.parseOrderResponse(resp)
+	return resp, nil
 }
 
 func (c *GodarkClient) parseOrderResponse(msg transport.Message) (*OrderAck, error) {
@@ -748,12 +875,16 @@ func (c *GodarkClient) parseOrderResponse(msg transport.Message) (*OrderAck, err
 		return nil, MakeOrderErrorFromJSON(errMsg, ec)
 	case "ack":
 		if v, _ := msg["success"].(bool); !v {
+			rejectText := stringValue(msg["reject_text"])
 			rawCode := msg["error_code"]
 			if num := coerceNumericErrorCode(rawCode); num != nil {
-				return nil, MakeOrderErrorFromCode(num)
+				return nil, MakeOrderErrorFromCode(num, rejectText)
 			}
 			ec := stringValue(rawCode)
 			reason, _ := msg["error"].(string)
+			if reason == "" {
+				reason = rejectText
+			}
 			if reason == "" {
 				reason = "order rejected"
 			}
@@ -771,6 +902,22 @@ func (c *GodarkClient) parseOrderResponse(msg transport.Message) (*OrderAck, err
 }
 
 func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) {
+	if failed, ok := msg["_decrypt_error"].(string); ok {
+		return nil, newEncryptionError("decrypt ack: " + failed)
+	}
+	if decrypted, ok := msg["_decrypted_plaintext"].([]byte); ok {
+		ack, isAck, err := ParseNodeResponseAck(decrypted)
+		if err != nil {
+			return nil, err
+		}
+		if !isAck {
+			return nil, newOrderError("expected ack inside encrypted push", "")
+		}
+		if !ack.Success {
+			return nil, MakeOrderErrorFromJSON(ack.RejectText, "")
+		}
+		return &OrderAck{OrderID: strconv.FormatUint(ack.OrderID, 10), Success: true, Sequence: strconv.FormatUint(ack.Sequence, 10)}, nil
+	}
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
 	if err != nil {
@@ -783,7 +930,10 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 		messageType = "ack"
 	}
 
-	aad, err := BuildResponseHeaderAAD(c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch)
+	aad, err := BuildResponseHeaderAADWithConn(
+		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -802,9 +952,9 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	if !ack.Success {
 		if ack.ErrorCode != nil {
 			code := int32(*ack.ErrorCode)
-			return nil, MakeOrderErrorFromCode(&code)
+			return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
 		}
-		return nil, MakeOrderErrorFromJSON("order rejected", "")
+		return nil, MakeOrderErrorFromJSON(ack.RejectText, "")
 	}
 	return &OrderAck{
 		OrderID:  strconv.FormatUint(ack.OrderID, 10),
@@ -813,7 +963,206 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	}, nil
 }
 
+// decryptCommandPlaintext decrypts an encrypted_push command response and
+// returns the plaintext NodeResponse bytes. Used by the mass-quote / batch
+// pipelines, which decode their own ack variants from the plaintext.
+func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMessageType string) ([]byte, error) {
+	mt, _ := msg["type"].(string)
+	switch mt {
+	case "error":
+		errMsg, _ := msg["message"].(string)
+		ec, _ := msg["error_code"].(string)
+		return nil, MakeOrderErrorFromJSON(errMsg, ec)
+	case "encrypted_push":
+		// handled below
+	default:
+		return nil, newOrderError(fmt.Sprintf("unexpected response type: %v", mt), "")
+	}
+	if decrypted, ok := msg["_decrypted_plaintext"].([]byte); ok {
+		return decrypted, nil
+	}
+	if failed, ok := msg["_decrypt_error"].(string); ok {
+		return nil, newEncryptionError("decrypt ack: " + failed)
+	}
+
+	ctB64, _ := msg["encrypted_body"].(string)
+	ct, err := base64.StdEncoding.DecodeString(ctB64)
+	if err != nil {
+		return nil, newEncryptionError(fmt.Sprintf("decode ack body: %v", err))
+	}
+	nonce := coerceUint32(msg["nonce"])
+	fencingEpoch := coerceUint64(msg["fencing_epoch"])
+	messageType, _ := msg["message_type"].(string)
+	if messageType == "" {
+		messageType = defaultMessageType
+	}
+	aad, err := BuildResponseHeaderAADWithConn(
+		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
+	)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.session.DecryptPush(nonce, aad, ct)
+	if err != nil {
+		return nil, newEncryptionError(fmt.Sprintf("decrypt ack: %v", err))
+	}
+	return pt, nil
+}
+
+// MassQuote performs a bulk cancel-replace (market-maker mass quote) on one
+// symbol (up to 20 legs), which fuses into one MPC round. Returns one result
+// per leg.
+//
+// postOnly is the batch-level post-only flag. When nil (the default) or true,
+// a replacement leg that would cross is rejected as "failed". Pass a pointer to
+// false to enable the relaxed path: a crossing leg takes liquidity up to its
+// limit and rests the remainder; such a leg reports FillCount > 0 on its result.
+func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []MassQuoteLegInput, leverage uint32, postOnly *bool) (*MassQuoteAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	if leverage < 1 {
+		leverage = 1
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, leverage, postOnly)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "mass_quote", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "mass_quote_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseMassQuoteAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected mass_quote_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
+// BatchCancel cancels multiple resting orders on one symbol in a single
+// fanned-out request (up to 20 ids). Cancels are pure index removals (zero
+// online MPC rounds). An id that is not resting is reported Cancelled=false
+// (error_code 2003) and never aborts the rest of the batch.
+func (c *GodarkClient) BatchCancel(ctx context.Context, symbol string, orderIDs []uint64) (*BatchCancelAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "batch_cancel", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "batch_cancel_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchCancelAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected batch_cancel_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
+// BatchModify amends multiple resting orders on one symbol in a single
+// fanned-out post-only request (up to 20 legs). Each leg sets NewPrice and/or
+// NewQuantity (at least one). A leg whose amended order would cross is rejected
+// (Modified=false, error_code 2018) rather than taking liquidity; a missing
+// order id is reported Modified=false (error_code 2003). Neither aborts the
+// rest of the batch.
+func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []BatchModifyLegInput) (*BatchModifyAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "batch_modify", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decryptCommandPlaintext(resp, "batch_modify_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchModifyAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newOrderError("expected batch_modify_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
 func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
+	if !session.StampedNoncePush() {
+		// Legacy path: pushes are keyed by the sequential Noise receive counter,
+		// so deliver strictly in nonce order and buffer any that arrive early.
+		nonce := uint64(coerceUint32(msg["nonce"]))
+		expected := c.session.RecvNonce()
+		if nonce > expected {
+			c.pendingMu.Lock()
+			c.pendingEncryptedByNonce[nonce] = msg
+			c.pendingMu.Unlock()
+			return
+		}
+		if nonce < expected {
+			return
+		}
+	}
+	// Stamped-nonce mode: decrypt each frame in arrival order at its own stamped
+	// nonce; relayed gaps are tolerated, so no reorder buffer is needed.
+	c.dispatchEncryptedPushInOrder(msg)
+	c.flushPendingEncrypted()
+}
+
+func (c *GodarkClient) flushPendingEncrypted() {
+	for {
+		expected := c.session.RecvNonce()
+		c.pendingMu.Lock()
+		msg, ok := c.pendingEncryptedByNonce[expected]
+		if ok {
+			delete(c.pendingEncryptedByNonce, expected)
+		}
+		c.pendingMu.Unlock()
+		if !ok {
+			return
+		}
+		c.dispatchEncryptedPushInOrder(msg)
+	}
+}
+
+func (c *GodarkClient) dispatchEncryptedPushInOrder(msg transport.Message) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
 	if err != nil {
@@ -824,7 +1173,23 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 
-	if messageType == "ack" {
+	switch messageType {
+	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack":
+		aad, err := BuildResponseHeaderAADWithConn(
+			c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
+		)
+		if err != nil {
+			c.emitError(err)
+			return
+		}
+		pt, err := c.session.DecryptPush(nonce, aad, ct)
+		if err != nil {
+			c.emitError(newEncryptionError(fmt.Sprintf("decrypt ack: %v", err)))
+			msg["_decrypt_error"] = err.Error()
+		} else {
+			msg["_decrypted_plaintext"] = pt
+		}
 		c.transport.ResolveCommand(msg)
 		return
 	}
@@ -833,7 +1198,10 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 		return
 	}
 
-	aad, err := BuildResponseHeaderAAD(c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch)
+	aad, err := BuildResponseHeaderAADWithConn(
+		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
+	)
 	if err != nil {
 		c.emitError(err)
 		return
@@ -853,12 +1221,123 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	c.dispatchSequencerPush(parsed)
 }
 
+func isTerminalPlaceUpdate(update *OrderUpdate) bool {
+	switch update.UpdateType {
+	case OrderUpdateTypeOpen, OrderUpdateTypeRejected, OrderUpdateTypeFilled,
+		OrderUpdateTypePartiallyFilled, OrderUpdateTypeCancelled:
+		return true
+	}
+	return update.Status == OrderStatusRejected ||
+		update.Status == OrderStatusFilled ||
+		update.Status == OrderStatusCancelled
+}
+
+func (c *GodarkClient) registerPlaceOutcomeWaiter() *placeOutcomeWaiter {
+	waiter := &placeOutcomeWaiter{
+		ch: make(chan placeOutcomeResult, 1),
+	}
+	c.placeMu.Lock()
+	c.placeOutcomeWaiters = append(c.placeOutcomeWaiters, waiter)
+	c.placeMu.Unlock()
+	return waiter
+}
+
+func (c *GodarkClient) removePlaceOutcomeWaiterLocked(target *placeOutcomeWaiter) {
+	for i, waiter := range c.placeOutcomeWaiters {
+		if waiter == target {
+			c.placeOutcomeWaiters = append(c.placeOutcomeWaiters[:i], c.placeOutcomeWaiters[i+1:]...)
+			return
+		}
+	}
+}
+
+func (c *GodarkClient) cancelPlaceOutcomeWaiter(waiter *placeOutcomeWaiter) {
+	if waiter == nil {
+		return
+	}
+	c.placeMu.Lock()
+	c.removePlaceOutcomeWaiterLocked(waiter)
+	c.placeMu.Unlock()
+}
+
+func (c *GodarkClient) rejectPlaceOutcomeWaiters(err error) {
+	c.placeMu.Lock()
+	waiters := c.placeOutcomeWaiters
+	c.placeOutcomeWaiters = nil
+	c.recentTerminalOrders = nil
+	c.placeMu.Unlock()
+	for _, waiter := range waiters {
+		select {
+		case waiter.ch <- placeOutcomeResult{err: err}:
+		default:
+		}
+	}
+}
+
+func (c *GodarkClient) awaitPlaceOutcome(
+	ctx context.Context, orderID string, waiter *placeOutcomeWaiter,
+) (*OrderUpdate, error) {
+	// Timeout starts after the fast ack (caller invokes this post-ack).
+	c.placeMu.Lock()
+	waiter.orderID = orderID
+	for _, update := range c.recentTerminalOrders {
+		if update.OrderID == orderID {
+			c.removePlaceOutcomeWaiterLocked(waiter)
+			c.placeMu.Unlock()
+			return update, nil
+		}
+	}
+	c.placeMu.Unlock()
+
+	timer := time.NewTimer(c.placeTerminalTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-waiter.ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return result.update, nil
+	case <-ctx.Done():
+		c.cancelPlaceOutcomeWaiter(waiter)
+		return nil, ctx.Err()
+	case <-timer.C:
+		c.cancelPlaceOutcomeWaiter(waiter)
+		return nil, newTimeoutError(fmt.Sprintf(
+			"PlaceOrder timed out waiting for book confirmation after %s",
+			c.placeTerminalTimeout,
+		))
+	}
+}
+
+func (c *GodarkClient) observeOrderUpdate(update *OrderUpdate) {
+	if !isTerminalPlaceUpdate(update) {
+		return
+	}
+	c.placeMu.Lock()
+	defer c.placeMu.Unlock()
+	c.recentTerminalOrders = append(c.recentTerminalOrders, update)
+	if len(c.recentTerminalOrders) > 64 {
+		c.recentTerminalOrders = c.recentTerminalOrders[1:]
+	}
+	for _, waiter := range c.placeOutcomeWaiters {
+		if waiter.orderID != "" && waiter.orderID == update.OrderID {
+			c.removePlaceOutcomeWaiterLocked(waiter)
+			select {
+			case waiter.ch <- placeOutcomeResult{update: update}:
+			default:
+			}
+			return
+		}
+	}
+}
+
 func (c *GodarkClient) dispatchSequencerPush(parsed SequencerPush) {
 	c.cbMu.RLock()
 	defer c.cbMu.RUnlock()
 
 	switch v := parsed.(type) {
 	case *OrderUpdate:
+		c.observeOrderUpdate(v)
 		nonBlockingSend(c.orderQueue, v)
 		for _, cb := range c.orderCallbacks {
 			safeCallOrder(cb, v)
@@ -919,7 +1398,7 @@ func (c *GodarkClient) ensureReady() error {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
-		return newSessionError("ECDH session not established")
+		return newSessionError("Noise XK session not established")
 	}
 	return nil
 }
@@ -935,6 +1414,19 @@ func (c *GodarkClient) userUUIDBytes() []byte {
 		return make([]byte, identity.UserUUIDLen)
 	}
 	return b
+}
+
+func (c *GodarkClient) connectionID() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connID
+}
+
+func (c *GodarkClient) messageConnID(msg transport.Message) uint64 {
+	if id := coerceUint64(msg["conn_id"]); id != 0 {
+		return id
+	}
+	return c.connectionID()
 }
 
 func (c *GodarkClient) resolveSymbol(symbol string) (int64, error) {
@@ -1001,6 +1493,18 @@ func resolveUserUUID(explicit string) string {
 		return v
 	}
 	for _, key := range []string{"GODARK_USER_UUID", "GDX_USER_UUID"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveNoiseStaticPublicKey(explicit string) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	for _, key := range []string{"GDX_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBKEY", "GODARK_NOISE_STATIC_PUBLIC_KEY"} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
@@ -1140,7 +1644,7 @@ func nonBlockingSend[T any](ch chan T, v T) {
 // safeCall* wrappers swallow panics from user callbacks to protect the recv
 // loop. Each variant is a thin wrapper because Go doesn't have a uniform
 // "func with any arg" type without reflection.
-func safeCallNoArg(cb func())                          { defer func() { _ = recover() }(); cb() }
+func safeCallNoArg(cb func()) { defer func() { _ = recover() }(); cb() }
 func safeCallOrder(cb func(*OrderUpdate), v *OrderUpdate) {
 	defer func() { _ = recover() }()
 	cb(v)
