@@ -28,6 +28,78 @@ type OrderAck struct {
 	Error string
 }
 
+// MassQuoteLegInput is one cancel-replace leg of a mass quote.
+type MassQuoteLegInput struct {
+	Side     Side
+	Price    float64
+	Quantity float64
+	// CancelOrderID is the resting order to cancel-replace; nil/0 = pure place.
+	CancelOrderID *uint64
+	// TimeInForce defaults to GTC when empty.
+	TimeInForce TimeInForce
+	// ExpiryTime (ns) is required when TimeInForce == GTD.
+	ExpiryTime *uint64
+}
+
+// BatchModifyLegInput is one amend leg of a batch modify. At least one of
+// NewPrice / NewQuantity must be set.
+type BatchModifyLegInput struct {
+	OrderID     uint64
+	NewPrice    *float64
+	NewQuantity *float64
+}
+
+// MassQuoteLegResult is the outcome of one cancel-replace leg in a mass quote.
+type MassQuoteLegResult struct {
+	LegIndex uint32
+	// Status is "open" | "filled" | "failed" | "unspecified" | "unknown".
+	Status string
+	// CancelledOrderID is empty when there was no cancel target / cancel failed.
+	CancelledOrderID string
+	// NewOrderID is empty when the replacement failed.
+	NewOrderID string
+	// ErrorCode is set (non-nil) when the leg failed.
+	ErrorCode *uint32
+	// FillCount is the number of taker fills this leg produced in relaxed
+	// (post-only=false) mode. 0 for a pure rest or a post-only leg.
+	FillCount uint32
+}
+
+// MassQuoteAck is the batch-level result of a mass quote: one entry per leg.
+type MassQuoteAck struct {
+	Success  bool
+	Sequence string
+	Results  []MassQuoteLegResult
+}
+
+// BatchCancelLegResult is the outcome of cancelling one order id in a batch.
+type BatchCancelLegResult struct {
+	OrderID   string
+	Cancelled bool
+	ErrorCode *uint32
+}
+
+// BatchCancelAck is the batch-level result of a batch cancel.
+type BatchCancelAck struct {
+	Success  bool
+	Sequence string
+	Results  []BatchCancelLegResult
+}
+
+// BatchModifyLegResult is the outcome of amending one resting order in a batch.
+type BatchModifyLegResult struct {
+	OrderID   string
+	Modified  bool
+	ErrorCode *uint32
+}
+
+// BatchModifyAck is the batch-level result of a batch modify.
+type BatchModifyAck struct {
+	Success  bool
+	Sequence string
+	Results  []BatchModifyLegResult
+}
+
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
 	OrderID       string
@@ -43,6 +115,7 @@ type OrderUpdate struct {
 	CumFill       string
 	CancelReason  CancelReason
 	RejectReason  string
+	Msg           string
 	CorrelationID uint64
 	Timestamp     uint64
 	// Leverage is the client-selected leverage at order-placement time (1 = 1x).
@@ -91,16 +164,15 @@ type PositionsSnapshot struct {
 	CorrelationID uint64
 }
 
-// SystemHealthUpdate is a push frame describing the sequencer / MPC cluster.
+// SystemHealthUpdate is a unified component health report.
 type SystemHealthUpdate struct {
-	TotalNodes      int32
-	AcceptingOrders bool
-	Ready           int32
-	Degraded        int32
-	Exhausted       int32
-	Warming         int32
-	Draining        int32
-	Waiting         int32
+	ComponentID    string
+	State          int32
+	Serving        bool
+	Cause          string
+	UpdatedAtNanos uint64
+	Sequence       uint64
+	SchemaVersion  uint32
 }
 
 // BalanceUpdate is a push frame describing the user's shielded balance.
@@ -120,21 +192,21 @@ type BalanceUpdate struct {
 // wire is decimal-encoded as strings (because u64 doesn't roundtrip
 // JSON safely); the SDK parses them back to uint64 here.
 //
-//   WalletUSDTRaw      - SPL USDT sitting in the user's owner-controlled
-//                        ATA (the on-chain wallet); funds that can be
-//                        shielded.
-//   PendingDepositsRaw - shield deposits the user has signed but the
-//                        sequencer has not yet credited (e.g. inflight
-//                        Solana txs).
-//   ShieldedBalanceRaw - the user's shielded balance held inside the
-//                        pool, as tracked by the sequencer. This is the
-//                        same number streamed by the BalanceUpdate WS
-//                        push, but as an on-demand snapshot.
-//   WalletUSDTUI       - the same wallet amount expressed as the
-//                        ui-decimal preview (USDT human units, e.g.
-//                        12.345). Convenience only; do not use for
-//                        arithmetic -- always reconcile against
-//                        WalletUSDTRaw.
+//	WalletUSDTRaw      - SPL USDT sitting in the user's owner-controlled
+//	                     ATA (the on-chain wallet); funds that can be
+//	                     shielded.
+//	PendingDepositsRaw - shield deposits the user has signed but the
+//	                     sequencer has not yet credited (e.g. inflight
+//	                     Solana txs).
+//	ShieldedBalanceRaw - the user's shielded balance held inside the
+//	                     pool, as tracked by the sequencer. This is the
+//	                     same number streamed by the BalanceUpdate WS
+//	                     push, but as an on-demand snapshot.
+//	WalletUSDTUI       - the same wallet amount expressed as the
+//	                     ui-decimal preview (USDT human units, e.g.
+//	                     12.345). Convenience only; do not use for
+//	                     arithmetic -- always reconcile against
+//	                     WalletUSDTRaw.
 type Balance struct {
 	WalletUSDTRaw      uint64
 	PendingDepositsRaw uint64
@@ -157,15 +229,15 @@ type MeProfile struct {
 
 // MarginAlert is a push frame describing a margin tier transition / recovery.
 type MarginAlert struct {
-	Owner               string
-	SymbolID            int64
-	Tier                int32
-	MarginRatioBps      int64
-	MarkPriceBps        int64
-	LiquidationPriceBps int64
-	TS                  uint64
-	StateVersion        uint64
-	Recovered           bool
+	Owner            string
+	SymbolID         int64
+	Tier             int32
+	MarginRatioBps   int64
+	MarkPrice        string
+	LiquidationPrice string
+	TS               uint64
+	StateVersion     uint64
+	Recovered        bool
 }
 
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.

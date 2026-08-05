@@ -31,9 +31,11 @@ package name" rule).
 
 ## Constructors
 
-The SDK ships three concrete clients. All three share the same wire
-crypto (X25519 ECDH + HKDF-SHA256 + AES-256-GCM under a per-session
-key) and the same protobuf wire bindings.
+Trading runs over the encrypted WebSocket `GodarkClient`, which uses
+**Noise XK** (pin the sequencer static public key — see Configuration in
+`README.md` / `.env.example`). A read-only `MarketDataClient` is also
+available for public market data. (Encrypted REST trading is not
+supported — see the note below.)
 
 ### Encrypted WebSocket trading -- `GodarkClient`
 
@@ -42,6 +44,7 @@ client, err := godark.NewClient(godark.ClientConfig{
     APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
     APISecret:  os.Getenv("GODARK_API_SECRET"),
     Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+    // NoiseStaticPublicKeyHex: os.Getenv("GDX_NOISE_STATIC_PUBLIC_KEY"),
     // BaseURL defaults to wss://api.godark-dex.com; override via
     // GODARK_EDGE_URL/GDX_EDGE_URL env vars or this field.
     BaseURL: os.Getenv("GODARK_EDGE_URL"),
@@ -53,29 +56,17 @@ Lifecycle:
 
 ```go
 ctx := context.Background()
-if err := client.Connect(ctx); err != nil { ... }   // login + ECDH session.setup
+if err := client.Connect(ctx); err != nil { ... }   // login + Noise XK handshake
 defer client.Disconnect()
 
 uid := client.UserUUID()
 ```
 
-### Encrypted REST trading -- `GodarkRestClient`
-
-Same crypto and protobuf builders as `GodarkClient`, but the wire is HTTP
-(`POST /api/v1/orders`, etc.). Useful for stateless integrations that
-don't need push streams.
-
-```go
-rest, err := godark.NewRestClient(godark.RestClientConfig{
-    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
-    APISecret:  os.Getenv("GODARK_API_SECRET"),
-    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
-    // BaseURL defaults to https://api.godark-dex.com (derived from the
-    // edge WS URL if GODARK_REST_URL/GDX_REST_URL is unset).
-})
-_ = rest.Connect(ctx)
-defer rest.Disconnect(ctx)
-```
+> **Encrypted REST trading is not supported.** Earlier builds shipped a
+> `GodarkRestClient` that placed orders over HTTP; that path is retired.
+> All order flow — place / modify / cancel / mass-quote — now runs over the
+> Noise XK WebSocket `GodarkClient` shown above. The examples in this bundle
+> trade exclusively over the WebSocket client.
 
 ### Public market-data feed -- `MarketDataClient`
 
@@ -103,8 +94,8 @@ for msg := range md.TradesEvents()    { ... }
 
 ## Trading commands
 
-`PlaceOrder`, `CancelOrder`, `ModifyOrder` work the same on both
-`GodarkClient` and `GodarkRestClient`. Their request structs:
+`PlaceOrder`, `CancelOrder`, `ModifyOrder` are exposed by the WebSocket
+`GodarkClient`. Their request structs:
 
 ```go
 ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
@@ -124,18 +115,6 @@ cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 newPrice := 68_000.0
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil)
-```
-
-On the REST client, `PlaceOrder` takes `PlaceOrderRestRequest` (an
-embed of `PlaceOrderRequest` plus an optional `ClientOrderID` field):
-
-```go
-ack, err := rest.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
-    PlaceOrderRequest: godark.PlaceOrderRequest{...},
-    ClientOrderID: "my-uuid-here",
-})
-// Subsequent cancel by client-order-id:
-_, _ = rest.CancelOrderByClientID(ctx, "my-uuid-here", "BTC-USDC-PERP")
 ```
 
 ## Push streams (encrypted WS only)
@@ -182,7 +161,7 @@ if errors.As(err, &oe) {
 Other typed errors you may see:
 
   - `*godark.AuthenticationError` -- login failed (bad API key, expired token)
-  - `*godark.SessionError`        -- ECDH session setup failed
+  - `*godark.SessionError`        -- Noise XK handshake or rekey failed
   - `*godark.ConnectionError`     -- WS or HTTP layer failure
   - `*godark.EncryptionError`     -- crypto path returned an error
   - `*godark.TimeoutError`        -- command exceeded its timeout

@@ -60,12 +60,18 @@ func main() {
 
 	fmt.Printf("Connected as user %s\n", client.UserUUID())
 
+	// Book confirmation waits on order-channel pushes; subscribe first (or use Ack).
+	if err := client.Subscribe(ctx, "orders"); err != nil {
+		log.Fatal(err)
+	}
+
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
-		Symbol:    symbol,
-		Side:      godark.SideSell,
-		OrderType: godark.OrderTypeLimit,
-		Price:     999_999,
-		Quantity:  0.01,
+		Symbol:       symbol,
+		Side:         godark.SideSell,
+		OrderType:    godark.OrderTypeLimit,
+		Price:        999_999,
+		Quantity:     0.01,
+		Confirmation: godark.PlaceOrderConfirmationAck,
 	})
 	if err != nil {
 		envloader.PrintOrderError("PlaceOrder", err)

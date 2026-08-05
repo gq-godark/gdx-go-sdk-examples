@@ -13,7 +13,7 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | File                                  | Surface                                       |
 | ------------------------------------- | --------------------------------------------- |
 | `sdk/client.go`                       | `GodarkClient`, `ClientConfig`, `TransportConfig` |
-| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig`, `PlaceOrderRestRequest` |
+| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig` (legacy; **encrypted REST trading is unsupported** — the examples trade over the WebSocket `GodarkClient`) |
 | `sdk/market_data.go`                  | `MarketDataClient`, `MarketDataConfig`, `MarketDataMessage` |
 | `sdk/types.go`                        | `OrderAck`, `OrderUpdate`, `PositionUpdate`, etc. |
 | `sdk/enums.go`                        | `Side`, `OrderType`, `OrderStatus`, `TimeInForce`, etc. |
@@ -21,8 +21,10 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | `sdk/order_error_code.go`             | Canonical 34-entry numeric -> symbolic reject reason map |
 | `sdk/proto.go`                        | Hand-written wrappers around generated proto (AAD builders, parsers, encoders) |
 | `sdk/symbols.go` + `sdk/shared/symbols.json` | Embedded symbol-id table |
-| `sdk/internal/crypto/crypto.go`       | X25519 ECDH + HKDF-SHA256 + AES-256-GCM primitives |
-| `sdk/internal/session/session.go`     | `CryptoSession` lifecycle (Establish / EncryptOrder / DecryptPush / Reset) |
+| `sdk/internal/noise/noise.go`         | Noise_XK_25519_AESGCM_SHA256 initiator |
+| `sdk/internal/bound/bound.go`         | SHA-256-bound AEAD framing helpers |
+| `sdk/internal/crypto/crypto.go`       | X25519 + AES-GCM primitives used by Noise |
+| `sdk/internal/session/session.go`     | Post-handshake `CryptoSession` (encrypt/decrypt) |
 | `sdk/internal/identity/identity.go`   | UUID <-> 16-byte wire helpers |
 | `sdk/internal/transport/transport.go` | WS transport + docs-wire envelope normalisation |
 | `sdk/internal/rest/transport.go`      | HTTP wrapper + `{code, data, message?}` envelope unwrap |
@@ -36,23 +38,26 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
   - **Trading WS endpoint**: `wss://api.godark-dex.com/ws/v1` (overridable
     via `GODARK_EDGE_URL` / `GDX_EDGE_URL`).
   - **REST root**: `https://api.godark-dex.com/api/v1` (auto-derived from
-    the WS host; overridable via `GODARK_REST_URL` / `GDX_REST_URL`).
+    the WS host). Not used by the examples — encrypted REST trading is
+    unsupported; all order flow goes over the WebSocket client.
   - **Public market-data WS**: `wss://api.godark-dex.com/ws/gomarket`.
   - **Envelope**: docs-wire `{id, op, args}` out; `{id, op, code, data?,
     message?}` in. The transport normalises both legacy and docs envelopes
     transparently.
-  - **Crypto**: every order body is AES-256-GCM-encrypted under a per-
-    session key derived via X25519 ECDH + HKDF-SHA256. AAD is the
-    serialised `OrderHeader` proto. Pushes carry a `ResponseHeader` AAD.
-    Both the WS and REST clients reuse the same `CryptoSession` state
-    machine (`sdk/internal/session/`).
+  - **Crypto**: after login the client runs `Noise_XK_25519_AESGCM_SHA256`
+    (`noise.handshake`). Pin the sequencer static key via
+    `ClientConfig.NoiseStaticPublicKeyHex` or `GDX_NOISE_STATIC_PUBLIC_KEY`.
+    Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
+    The legacy ECDH `session.setup` handshake is retired; all encrypted
+    order flow now uses the Noise XK WebSocket client. Encrypted REST
+    trading is unsupported.
 
 ## Examples mapping
 
 | Example                              | API touchpoints                                                                                                                   |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | `examples/quickstart/main.go`        | `NewClient` -> `Connect` -> `PlaceOrder` -> `CancelOrder` -> `Disconnect`                                                          |
-| `examples/full_trader_example/main.go` | `NewClient` (with `TransportConfig`) -> `Connect` -> `Subscribe` -> `PlaceOrder` / `ModifyOrder` / `CancelOrder` (mixed) -> drain push channels -> `Disconnect` |
+| `examples/full_trader_example/main.go` | `NewClient` (with `TransportConfig`) -> `Connect` -> `Subscribe` -> `PlaceOrder` / `ModifyOrder` / `CancelOrder` / `MassQuote` / `BatchCancel` (mixed) -> drain push channels -> `Disconnect` |
 
 Both examples share `examples/internal/envloader/envloader.go` for `.env`
 loading and `OrderError` pretty-printing.

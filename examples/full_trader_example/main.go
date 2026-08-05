@@ -3,15 +3,13 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. REST pre-flight: GetMe (identity + wallet) → GetMyBalance (margin check).
-//  3. Connect and authenticate (encrypted ECDH WS session).
-//  4. Wire up channel-first push receivers (order / position / health / etc.).
-//  5. Subscribe to the private order + position channels.
-//  6. Place, modify, and cancel `MARKET` / `LIMIT` orders.
-//  7. Drain queued updates between actions.
-//  8. REST post-flight: GetMyBalance (balance delta after trading).
-//  9. Print a session summary including per-stream counts.
-// 10. Clean disconnect.
+//  2. Connect and authenticate (Noise XK encrypted WebSocket session).
+//  3. Wire up channel-first push receivers (order / position / health / etc.).
+//  4. Subscribe to the private order + position channels.
+//  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
+//  6. Drain queued updates between actions.
+//  7. Print a session summary including per-stream counts.
+//  8. Clean disconnect.
 //
 // Run with:
 //
@@ -26,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +33,14 @@ import (
 )
 
 const symbol = "BTC-USDC-PERP"
+
+// btcSymbolID is BTC-USDC-PERP's numeric symbol id in position snapshots.
+const btcSymbolID = 1
+
+// lastBtcMark holds the most recent BTC mark seen in a positions snapshot, so
+// the mass-quote ladder/cross prices can anchor to the live touch. Zero means
+// "not seen yet" (fall back to GDX_BASE).
+var lastBtcMark float64
 
 func main() {
 	envloader.LoadDotenv()
@@ -54,46 +61,9 @@ func main() {
 	if wsURL == "" {
 		wsURL = "wss://api.godark-dex.com"
 	}
-	restURL := os.Getenv("GODARK_REST_URL")
-	if restURL == "" {
-		restURL = strings.Replace(strings.Replace(wsURL, "wss://", "https://", 1), "ws://", "http://", 1)
-	}
-	fmt.Printf("Endpoints: ws=%s  rest=%s\n", wsURL, restURL)
+	fmt.Printf("Endpoint: ws=%s\n", wsURL)
 
 	ctx := context.Background()
-
-	// --- REST pre-flight: identity + balance check ---
-	rest, err := godark.NewRestClient(godark.RestClientConfig{
-		APIKeyID:   apiKeyID,
-		APISecret:  apiSecret,
-		Passphrase: passphrase,
-		BaseURL:    restURL,
-	})
-	if err != nil {
-		log.Fatalf("REST config error: %v", err)
-	}
-	if err := rest.Connect(ctx); err != nil {
-		log.Fatalf("REST connect failed: %v", err)
-	}
-	defer func() { _ = rest.Disconnect(ctx) }()
-
-	me, err := rest.GetMe(ctx)
-	if err != nil {
-		log.Fatalf("GetMe: %v", err)
-	}
-	fmt.Printf("Identity: user_uuid=%s  wallet=%s\n", me.ID, me.WalletAddress)
-
-	preBal, err := rest.GetMyBalance(ctx)
-	if err != nil {
-		log.Fatalf("GetMyBalance: %v", err)
-	}
-	fmt.Printf("Balance:  shielded_raw=%d  wallet_raw=%d  pending_deposits_raw=%d  wallet_ui=%.6f\n",
-		preBal.ShieldedBalanceRaw, preBal.WalletUSDTRaw, preBal.PendingDepositsRaw, preBal.WalletUSDTUI)
-	if preBal.ShieldedBalanceRaw == 0 {
-		fmt.Println("No shielded balance -- deposit collateral before placing orders.")
-		fmt.Println("Done.")
-		return
-	}
 
 	// --- WS trading session ---
 	headers := http.Header{}
@@ -189,6 +159,133 @@ func main() {
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after SELL/CANCEL")
 
+	// --- Bulk quote (mass quote) ---
+	// Place a whole ladder of resting quotes in one batched request. With the
+	// default (post-only) mode -- pass nil for postOnly -- every leg is
+	// post-only: a leg that would cross is rejected as "failed" so the batch
+	// fuses into a single MPC round. Pass a *bool(false) for the relaxed path,
+	// where a crossing leg takes liquidity up to its limit and rests the
+	// remainder (the number of taker fills is reported per leg as FillCount).
+	// Anchor the ladder/cross to the live BTC mark captured from the snapshot so
+	// the crossing demo below is deterministic regardless of current price. Fall
+	// back to GDX_BASE (default 64000) only if no mark was seen yet.
+	base := lastBtcMark
+	if base <= 0 {
+		base = 64000.0
+		if v, perr := strconv.ParseFloat(os.Getenv("GDX_BASE"), 64); perr == nil && v > 0 {
+			base = v
+		}
+	}
+	fmt.Printf("Mass-quoting a 3-level BUY ladder (post-only), base=%.2f...\n", base)
+	ladder := []godark.MassQuoteLegInput{
+		{Side: godark.SideBuy, Price: base * (1 - 0.003), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: base * (1 - 0.006), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: base * (1 - 0.009), Quantity: 0.02},
+	}
+	var restingIDs []uint64
+	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, 1, nil); mqErr != nil {
+		envloader.PrintOrderError("Mass quote rejected", mqErr)
+	} else {
+		fmt.Printf("Mass quote: success=%v  sequence=%s  legs=%d\n", mq.Success, mq.Sequence, len(mq.Results))
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  new_order_id=%s  fills=%d  err=%s\n",
+				r.LegIndex, r.Status, r.NewOrderID, r.FillCount, errStr)
+			if r.Status == "open" && r.NewOrderID != "" {
+				if id, perr := strconv.ParseUint(r.NewOrderID, 10, 64); perr == nil {
+					restingIDs = append(restingIDs, id)
+				}
+			}
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+	drainOrderUpdates(client, "after MASS QUOTE")
+
+	if len(restingIDs) > 0 {
+		fmt.Printf("Batch-cancelling %d ladder orders (cleanup)...\n", len(restingIDs))
+		if bc, bcErr := client.BatchCancel(ctx, symbol, restingIDs); bcErr != nil {
+			envloader.PrintOrderError("Batch cancel rejected", bcErr)
+		} else {
+			for _, r := range bc.Results {
+				errStr := "<nil>"
+				if r.ErrorCode != nil {
+					errStr = fmt.Sprintf("%d", *r.ErrorCode)
+				}
+				fmt.Printf("  cancel id=%s: cancelled=%v  err=%s\n", r.OrderID, r.Cancelled, errStr)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		drainOrderUpdates(client, "after BATCH CANCEL")
+	}
+
+	// Demonstrate the batch-level post_only flag on a crossing leg. Price a BUY
+	// ~5% above the live mark: aggressive enough to cross the resting ask, yet
+	// within the exchange's 10%-of-oracle limit. Anchored to the live mark, this
+	// makes the post_only=true (reject) vs false (fill) contrast deterministic.
+	crossPx := base * 1.05
+	// post_only=true: a crossing leg is rejected (would-cross, error_code 2018).
+	postOnlyTrue := true
+	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
+	if mq, mqErr := client.MassQuote(ctx, symbol,
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.001}},
+		1, &postOnlyTrue); mqErr != nil {
+		envloader.PrintOrderError("post_only=true mass quote rejected", mqErr)
+	} else {
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  err=%s  fills=%d\n", r.LegIndex, r.Status, errStr, r.FillCount)
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// post_only=false (relaxed): the crossing leg takes liquidity up to its
+	// limit and rests the remainder; taker fills are reported per leg as FillCount.
+	postOnlyFalse := false
+	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
+	if mq, mqErr := client.MassQuote(ctx, symbol,
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.003}},
+		1, &postOnlyFalse); mqErr != nil {
+		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
+	} else {
+		var strayIDs []uint64
+		for _, r := range mq.Results {
+			errStr := "<nil>"
+			if r.ErrorCode != nil {
+				errStr = fmt.Sprintf("%d", *r.ErrorCode)
+			}
+			fmt.Printf("  leg %d: status=%s  new_order_id=%s  err=%s  fills=%d\n",
+				r.LegIndex, r.Status, r.NewOrderID, errStr, r.FillCount)
+			if r.Status == "open" && r.NewOrderID != "" {
+				if id, err := strconv.ParseUint(r.NewOrderID, 10, 64); err == nil {
+					strayIDs = append(strayIDs, id)
+				}
+			}
+		}
+		if len(strayIDs) > 0 {
+			fmt.Printf("Batch-cancelling %d post_only=false remainder(s)...\n", len(strayIDs))
+			if bc, bcErr := client.BatchCancel(ctx, symbol, strayIDs); bcErr != nil {
+				envloader.PrintOrderError("post_only=false remainder cancel rejected", bcErr)
+			} else {
+				for _, r := range bc.Results {
+					errStr := "<nil>"
+					if r.ErrorCode != nil {
+						errStr = fmt.Sprintf("%d", *r.ErrorCode)
+					}
+					fmt.Printf("  cancel id=%s: cancelled=%v err=%s\n", r.OrderID, r.Cancelled, errStr)
+				}
+			}
+		}
+	}
+	time.Sleep(1 * time.Second)
+	drainOrderUpdates(client, "after post_only mass quotes")
+
 	// Cleanup: cancel the original BUY (if still resting).
 	fmt.Println("Cancelling original BUY (cleanup)...")
 	if _, err := client.CancelOrder(ctx, buyAck.OrderID, symbol); err != nil {
@@ -204,13 +301,6 @@ func main() {
 	marginCount := drainMargins(client)
 	fundingCount := drainFunding(client)
 	settleCount := drainSettlement(client)
-
-	// --- REST post-flight: balance snapshot after trading ---
-	if postBal, err := rest.GetMyBalance(ctx); err == nil {
-		fmt.Printf("Balance after: shielded_raw=%d  (delta=%d)\n",
-			postBal.ShieldedBalanceRaw,
-			int64(postBal.ShieldedBalanceRaw)-int64(preBal.ShieldedBalanceRaw))
-	}
 
 	fmt.Println(sep)
 	fmt.Println("  Session complete")
@@ -269,6 +359,11 @@ func drainPositionsSnapshots(c *godark.GodarkClient) int {
 			fmt.Printf("SNAP   source=%s  rows=%d  ts=%d\n",
 				s.Source, len(s.Rows), s.ServerTimestamp)
 			for _, row := range s.Rows {
+				if row.SymbolID == btcSymbolID && row.MarkPrice != "" {
+					if v, perr := strconv.ParseFloat(row.MarkPrice, 64); perr == nil && v > 0 {
+						lastBtcMark = v
+					}
+				}
 				mark := row.MarkPrice
 				if mark == "" {
 					mark = "—"
@@ -289,8 +384,8 @@ func drainHealth(c *godark.GodarkClient) int {
 		select {
 		case h := <-ch:
 			count++
-			fmt.Printf("HEALTH nodes=%d  accepting=%v  ready=%v\n",
-				h.TotalNodes, h.AcceptingOrders, h.Ready)
+			fmt.Printf("HEALTH component=%s  state=%d  serving=%v  cause=%q\n",
+				h.ComponentID, h.State, h.Serving, h.Cause)
 		default:
 			return count
 		}

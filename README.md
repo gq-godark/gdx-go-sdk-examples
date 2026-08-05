@@ -22,7 +22,7 @@ gdx-go-sdk-examples/
 │   └── SDK_REFERENCE.md                  ships in the zip as ./SDK_REFERENCE.md
 ├── examples/
 │   ├── quickstart/main.go                place + cancel
-│   ├── full_trader_example/main.go       subscribe + place + modify + cancel
+│   ├── full_trader_example/main.go       subscribe + place + modify + cancel + mass-quote + batch-cancel
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
 │   ├── refresh_sdk.sh                    vendor a gdx-go-sdk checkout into sdk/
@@ -93,8 +93,10 @@ The GitHub App (`godark-ci`) used for cross-repo access only requires
 
 ## Concurrency contract
 
-  - `GodarkClient` and `GodarkRestClient` serialise trading commands so
-    only one is in flight at a time (matching python / rust).
+  - `GodarkClient` routes trading commands by correlation id, so multiple
+    commands can be in flight concurrently (matching python / rust /
+    java). Encrypted REST trading is not supported; all order flow goes
+    over the WebSocket client.
   - Push streams expose buffered Go channels (default 256) and per-stream
     callback registration; both surfaces fire concurrently with command
     issuance.
