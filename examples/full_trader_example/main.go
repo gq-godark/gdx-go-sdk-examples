@@ -254,6 +254,7 @@ func main() {
 		1, &postOnlyFalse); mqErr != nil {
 		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
 	} else {
+		var strayIDs []uint64
 		for _, r := range mq.Results {
 			errStr := "<nil>"
 			if r.ErrorCode != nil {
@@ -261,6 +262,25 @@ func main() {
 			}
 			fmt.Printf("  leg %d: status=%s  new_order_id=%s  err=%s  fills=%d\n",
 				r.LegIndex, r.Status, r.NewOrderID, errStr, r.FillCount)
+			if r.Status == "open" && r.NewOrderID != "" {
+				if id, err := strconv.ParseUint(r.NewOrderID, 10, 64); err == nil {
+					strayIDs = append(strayIDs, id)
+				}
+			}
+		}
+		if len(strayIDs) > 0 {
+			fmt.Printf("Batch-cancelling %d post_only=false remainder(s)...\n", len(strayIDs))
+			if bc, bcErr := client.BatchCancel(ctx, symbol, strayIDs); bcErr != nil {
+				envloader.PrintOrderError("post_only=false remainder cancel rejected", bcErr)
+			} else {
+				for _, r := range bc.Results {
+					errStr := "<nil>"
+					if r.ErrorCode != nil {
+						errStr = fmt.Sprintf("%d", *r.ErrorCode)
+					}
+					fmt.Printf("  cancel id=%s: cancelled=%v err=%s\n", r.OrderID, r.Cancelled, errStr)
+				}
+			}
 		}
 	}
 	time.Sleep(1 * time.Second)
