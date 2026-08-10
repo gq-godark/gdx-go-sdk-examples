@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
 	"github.com/gq-godark/gdx-go-sdk-examples/examples/internal/envloader"
@@ -79,6 +80,9 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Place OK -- order_id=%s\n", ack.OrderID)
+
+	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
+	time.Sleep(500 * time.Millisecond)
 
 	cancelAck, err := client.CancelOrder(ctx, ack.OrderID, symbol)
 	if err != nil {
