@@ -22,8 +22,74 @@ import (
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
 )
 
-// Default production WebSocket origin. The client appends `/ws/v1`.
+// Default testnet WebSocket origin. The client appends `/ws/v1`.
+//
+// Public mainnet is not currently exposed; testnet is the live network for
+// SDK users today and is the SDK default. For local development, override
+// via EnvironmentLocalnet, BaseURL, GODARK_EDGE_URL, or GDX_EDGE_URL.
 const defaultEdgeBaseURL = "wss://api.godark-dex.com"
+
+// Default devnet WebSocket origin. The client appends `/ws/v1`.
+const defaultDevnetEdgeBaseURL = "ws://18.143.165.149:13300"
+
+// Sequencer Noise XK static public key for public testnet (64 hex).
+// This is a public pin, not a user secret.
+const testnetNoiseStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
+
+// Sequencer Noise XK static public key for public devnet (64 hex).
+// This is a public pin, not a user secret.
+const devnetNoiseStaticPublicKeyHex = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
+
+// Environment names a deployment target. It selects the default edge URL and,
+// when known, a baked-in sequencer Noise XK public key pin.
+//
+// Explicit BaseURL / NoiseStaticPublicKeyHex and the corresponding
+// environment variables still win over these presets.
+type Environment string
+
+const (
+	// EnvironmentTestnet is the public testnet (default zero value). It bakes
+	// in the published Noise pin and wss://api.godark-dex.com.
+	EnvironmentTestnet Environment = "testnet"
+	// EnvironmentDevnet targets the public devnet edge
+	// (ws://18.143.165.149:13300) with its own published Noise pin.
+	EnvironmentDevnet Environment = "devnet"
+	// EnvironmentLocalnet targets ws://127.0.0.1:4000. No baked-in Noise pin —
+	// set NoiseStaticPublicKeyHex or GDX_NOISE_STATIC_PUBLIC_KEY.
+	EnvironmentLocalnet Environment = "localnet"
+)
+
+// EdgeBaseURL returns the default edge host origin for this environment.
+func (e Environment) EdgeBaseURL() string {
+	switch e.normalize() {
+	case EnvironmentDevnet:
+		return defaultDevnetEdgeBaseURL
+	case EnvironmentLocalnet:
+		return "ws://127.0.0.1:4000"
+	default:
+		return defaultEdgeBaseURL
+	}
+}
+
+// NoiseStaticPublicKeyHex returns the baked-in sequencer Noise XK static
+// public key (64 hex chars) when known for this environment; otherwise "".
+func (e Environment) NoiseStaticPublicKeyHex() string {
+	switch e.normalize() {
+	case EnvironmentTestnet:
+		return testnetNoiseStaticPublicKeyHex
+	case EnvironmentDevnet:
+		return devnetNoiseStaticPublicKeyHex
+	default:
+		return ""
+	}
+}
+
+func (e Environment) normalize() Environment {
+	if e == "" {
+		return EnvironmentTestnet
+	}
+	return e
+}
 
 // TransportConfig is the public alias for the WebSocket transport
 // configuration consumed by ClientConfig.Transport. It re-exports the
@@ -46,10 +112,15 @@ type ClientConfig struct {
 	APISecret  string
 	Passphrase string
 
+	// Environment selects a named deployment. Defaults to EnvironmentTestnet
+	// (zero value), which supplies the public testnet edge URL and Noise XK
+	// pin when those are not set explicitly or via environment variables.
+	Environment Environment
+
 	// BaseURL is the edge WebSocket origin (host only, e.g.
 	// `wss://api.godark-dex.com`). The client appends `/ws/v1` to produce
-	// the final upgrade URL. Defaults to production; override with this
-	// field or with the GODARK_EDGE_URL / GDX_EDGE_URL env vars.
+	// the final upgrade URL. Preference: this field → GODARK_EDGE_URL /
+	// GDX_EDGE_URL → Environment preset.
 	BaseURL string
 
 	// UserUUID is an optional fallback when the edge auth response omits
@@ -58,8 +129,8 @@ type ClientConfig struct {
 	UserUUID string
 
 	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 static key.
-	// It may also be supplied as GDX_NOISE_STATIC_PUBLIC_KEY,
-	// GDX_NOISE_STATIC_PUBKEY, or GODARK_NOISE_STATIC_PUBLIC_KEY.
+	// Preference: this field → GDX_NOISE_STATIC_PUBLIC_KEY (aliases) →
+	// baked-in pin from Environment (Testnet or Devnet, each with its own key).
 	NoiseStaticPublicKeyHex string
 
 	// SymbolMap overrides the embedded default symbol map. Useful when
@@ -177,7 +248,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		return nil, err
 	}
 
-	baseURL := resolveEdgeBaseURL(cfg.BaseURL)
+	baseURL := resolveEdgeBaseURL(cfg.BaseURL, cfg.Environment)
 	fallbackUUID := resolveUserUUID(cfg.UserUUID)
 
 	symbolMap := cfg.SymbolMap
@@ -212,7 +283,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		symbolMap:               symbolMap,
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
-		noiseStaticKey:          resolveNoiseStaticPublicKey(cfg.NoiseStaticPublicKeyHex),
+		noiseStaticKey:          resolveNoiseStaticPublicKey(cfg.NoiseStaticPublicKeyHex, cfg.Environment),
 		session:                 &session.CryptoSession{},
 		pendingEncryptedByNonce: make(map[uint64]transport.Message),
 		orderQueue:              make(chan *OrderUpdate, bufSize),
@@ -660,7 +731,7 @@ func (c *GodarkClient) OnDisconnect(cb func()) {
 
 func (c *GodarkClient) setupNoiseSession(ctx context.Context) error {
 	if c.noiseStaticKey == "" {
-		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex or GDX_NOISE_STATIC_PUBLIC_KEY")
+		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex, GDX_NOISE_STATIC_PUBLIC_KEY, or use EnvironmentTestnet/Devnet")
 	}
 	remoteStatic, err := noise.ParsePinnedStaticPublicKeyHex(c.noiseStaticKey)
 	if err != nil {
@@ -1476,7 +1547,7 @@ func resolveAuthToken(cfg ClientConfig) (string, error) {
 	return "", errors.New("provide APIKey or both APIKeyID + APISecret")
 }
 
-func resolveEdgeBaseURL(explicit string) string {
+func resolveEdgeBaseURL(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
@@ -1485,7 +1556,7 @@ func resolveEdgeBaseURL(explicit string) string {
 			return v
 		}
 	}
-	return defaultEdgeBaseURL
+	return env.EdgeBaseURL()
 }
 
 func resolveUserUUID(explicit string) string {
@@ -1500,7 +1571,7 @@ func resolveUserUUID(explicit string) string {
 	return ""
 }
 
-func resolveNoiseStaticPublicKey(explicit string) string {
+func resolveNoiseStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
@@ -1509,7 +1580,7 @@ func resolveNoiseStaticPublicKey(explicit string) string {
 			return v
 		}
 	}
-	return ""
+	return env.NoiseStaticPublicKeyHex()
 }
 
 func newCorrelationID() []byte {
