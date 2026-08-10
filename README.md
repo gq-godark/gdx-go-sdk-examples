@@ -38,6 +38,15 @@ gdx-go-sdk-examples/
     └── release.yml                       PR CI + tagged Release on main
 ```
 
+## Configure credentials
+
+Copy `.env.example` to `.env` and set `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
+and `GODARK_PASSPHRASE`. Public testnet needs only those three — the SDK
+`EnvironmentTestnet` preset supplies the edge URL and Noise pin.
+
+Optional overrides: `GODARK_EDGE_URL`, `GDX_NOISE_STATIC_PUBLIC_KEY` (not
+required for testnet).
+
 ## Local development
 
 ```bash
