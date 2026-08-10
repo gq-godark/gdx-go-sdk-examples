@@ -56,6 +56,10 @@ go run ./examples/quickstart             # run quickstart against testnet
 go run ./examples/full_trader_example    # run full trader against testnet
 ```
 
+`quickstart` subscribes to `orders` before placing so default **book** confirmation
+receives the private OPEN update (then cancel). Do not skip that subscribe when
+copying the pattern into your own scripts.
+
 The `replace github.com/gq-godark/gdx-go-sdk => ./sdk` directive in
 `go.mod` resolves the SDK from the vendored copy, so `go build` never has
 to fetch the godark module from a GOPROXY at all.

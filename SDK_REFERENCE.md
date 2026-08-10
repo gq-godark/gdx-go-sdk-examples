@@ -56,7 +56,7 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
 
 | Example                              | API touchpoints                                                                                                                   |
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `examples/quickstart/main.go`        | `NewClient` -> `Connect` -> `PlaceOrder` -> `CancelOrder` -> `Disconnect`                                                          |
+| `examples/quickstart/main.go`        | `NewClient` -> `Connect` -> `Subscribe("orders")` -> `PlaceOrder` (book) -> `CancelOrder` -> `Disconnect`                          |
 | `examples/full_trader_example/main.go` | `NewClient` (with `TransportConfig`) -> `Connect` -> `Subscribe` -> `PlaceOrder` / `ModifyOrder` / `CancelOrder` / `MassQuote` / `BatchCancel` (mixed) -> drain push channels -> `Disconnect` |
 
 Both examples share `examples/internal/envloader/envloader.go` for `.env`
