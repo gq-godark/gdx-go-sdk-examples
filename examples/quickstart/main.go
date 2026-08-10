@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
 	"github.com/gq-godark/gdx-go-sdk-examples/examples/internal/envloader"
@@ -61,24 +62,27 @@ func main() {
 
 	fmt.Printf("Connected as user %s\n", client.UserUUID())
 
-	// Book confirmation waits on order-channel pushes; subscribe first (or use Ack).
+	// Book confirmation waits on order-channel pushes; subscribe first.
 	if err := client.Subscribe(ctx, "orders"); err != nil {
 		log.Fatal(err)
 	}
 
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
-		Symbol:       symbol,
-		Side:         godark.SideSell,
-		OrderType:    godark.OrderTypeLimit,
-		Price:        999_999,
-		Quantity:     0.01,
-		Confirmation: godark.PlaceOrderConfirmationAck,
+		Symbol:    symbol,
+		Side:      godark.SideSell,
+		OrderType: godark.OrderTypeLimit,
+		Price:     999_999,
+		Quantity:  0.01,
+		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
 	if err != nil {
 		envloader.PrintOrderError("PlaceOrder", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Place OK -- order_id=%s\n", ack.OrderID)
+
+	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
+	time.Sleep(500 * time.Millisecond)
 
 	cancelAck, err := client.CancelOrder(ctx, ack.OrderID, symbol)
 	if err != nil {
