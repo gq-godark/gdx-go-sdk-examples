@@ -36,7 +36,6 @@ Copy `.env.example` to `.env` and set:
 - `GODARK_API_KEY_ID`
 - `GODARK_API_SECRET`
 - `GODARK_PASSPHRASE` — required for API key-pair auth.
-- `GDX_NOISE_STATIC_PUBLIC_KEY` — required for encrypted WebSocket trading (64-hex sequencer static key). Aliases: `GDX_NOISE_STATIC_PUBKEY`, `GODARK_NOISE_STATIC_PUBLIC_KEY`.
 
 ```bash
 cp .env.example .env
@@ -45,7 +44,8 @@ $EDITOR .env       # fill in your testnet creds
 
 Optional override:
 
-- `GODARK_EDGE_URL` — defaults to `wss://api.godark-dex.com` if unset.
+- `GODARK_EDGE_URL` — override the edge URL (default: public testnet `wss://api.godark-dex.com` via the SDK Testnet environment preset).
+- `GDX_NOISE_STATIC_PUBLIC_KEY` — override the sequencer Noise pin. **Not required for public testnet** — the SDK Environment Testnet preset bakes it in. Aliases: `GDX_NOISE_STATIC_PUBKEY`, `GODARK_NOISE_STATIC_PUBLIC_KEY`.
 
 The OS environment always wins over `.env`.
 

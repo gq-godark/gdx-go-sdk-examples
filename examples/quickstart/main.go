@@ -8,7 +8,7 @@
 //	GODARK_API_KEY_ID=gdk_...
 //	GODARK_API_SECRET=...
 //	GODARK_PASSPHRASE=...
-//	# GODARK_EDGE_URL=wss://api.godark-dex.com   (optional override)
+//	# GODARK_EDGE_URL=...   (optional; default EnvironmentTestnet)
 //
 // Run with:
 //
@@ -41,10 +41,11 @@ func main() {
 	}
 
 	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:   apiKeyID,
-		APISecret:  apiSecret,
-		Passphrase: passphrase,
-		BaseURL:    baseURL, // empty => SDK default
+		APIKeyID:    apiKeyID,
+		APISecret:   apiSecret,
+		Passphrase:  passphrase,
+		Environment: godark.EnvironmentTestnet,
+		BaseURL:     baseURL, // empty => Testnet preset
 	})
 	if err != nil {
 		log.Fatal(err)

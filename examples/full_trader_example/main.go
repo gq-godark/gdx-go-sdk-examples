@@ -59,7 +59,7 @@ func main() {
 	}
 	wsURL := os.Getenv("GODARK_EDGE_URL")
 	if wsURL == "" {
-		wsURL = "wss://api.godark-dex.com"
+		wsURL = godark.EnvironmentTestnet.EdgeBaseURL()
 	}
 	fmt.Printf("Endpoint: ws=%s\n", wsURL)
 
@@ -70,10 +70,11 @@ func main() {
 	headers.Set("X-Trader-Tag", "go-full-trader-demo")
 
 	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:   apiKeyID,
-		APISecret:  apiSecret,
-		Passphrase: passphrase,
-		BaseURL:    wsURL,
+		APIKeyID:    apiKeyID,
+		APISecret:   apiSecret,
+		Passphrase:  passphrase,
+		Environment: godark.EnvironmentTestnet,
+		BaseURL:     os.Getenv("GODARK_EDGE_URL"), // empty => Testnet preset
 		Transport: godark.TransportConfig{
 			Headers:           headers,
 			HeartbeatInterval: 30 * time.Second,
