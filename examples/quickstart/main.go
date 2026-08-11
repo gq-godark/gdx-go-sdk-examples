@@ -33,10 +33,10 @@ const symbol = "BTC-USDC-PERP"
 func main() {
 	envloader.LoadDotenv()
 
-	apiKeyID := os.Getenv("GODARK_API_KEY_ID")
-	apiSecret := os.Getenv("GODARK_API_SECRET")
-	passphrase := os.Getenv("GODARK_PASSPHRASE")
-	baseURL := os.Getenv("GODARK_EDGE_URL")
+	apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
+	apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
+	passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+	baseURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")
 	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
 		log.Fatal("Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE in .env or your environment")
 	}
@@ -71,7 +71,7 @@ func main() {
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
-		Price:     999_999,
+		Price:     69515.2,
 		Quantity:  0.01,
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})

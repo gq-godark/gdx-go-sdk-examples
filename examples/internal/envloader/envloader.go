@@ -20,6 +20,37 @@ import (
 	"github.com/gq-godark/gdx-go-sdk"
 )
 
+var (
+	osPresent     map[string]struct{}
+	fileVals      map[string]string
+	osSnapshotted bool
+)
+
+// First returns OS values among keys (GODARK then GDX), then the same keys from .env.
+func First(keys ...string) string {
+	if osSnapshotted {
+		for _, k := range keys {
+			if _, ok := osPresent[k]; ok {
+				if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+					return v
+				}
+			}
+		}
+		for _, k := range keys {
+			if v := strings.TrimSpace(fileVals[k]); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // LoadDotenv reads a `.env` file from one of:
 //   1. the directory of the currently running executable (so the unzipped
 //      bundle's `.env` is picked up when MMs run ./quickstart from the
@@ -31,6 +62,18 @@ import (
 // values (single or double) are unquoted. Keys already present in os.Environ
 // are NOT overwritten -- the OS environment always wins.
 func LoadDotenv() {
+	if osSnapshotted {
+		return
+	}
+	osPresent = map[string]struct{}{}
+	fileVals = map[string]string{}
+	for _, e := range os.Environ() {
+		k, v, ok := strings.Cut(e, "=")
+		if ok && strings.TrimSpace(v) != "" {
+			osPresent[k] = struct{}{}
+		}
+	}
+	osSnapshotted = true
 	candidates := []string{}
 	if exe, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(exe), ".env"))
@@ -68,6 +111,7 @@ func applyEnvFile(path string) bool {
 		if key == "" {
 			continue
 		}
+		fileVals[key] = val
 		if _, exists := os.LookupEnv(key); exists {
 			continue
 		}

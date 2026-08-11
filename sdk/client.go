@@ -55,7 +55,7 @@ const (
 	// (ws://18.143.165.149:13300) with its own published Noise pin.
 	EnvironmentDevnet Environment = "devnet"
 	// EnvironmentLocalnet targets ws://127.0.0.1:4000. No baked-in Noise pin —
-	// set NoiseStaticPublicKeyHex or GDX_NOISE_STATIC_PUBLIC_KEY.
+	// set NoiseStaticPublicKeyHex or GODARK_NOISE_STATIC_PUBLIC_KEY.
 	EnvironmentLocalnet Environment = "localnet"
 )
 
@@ -129,7 +129,7 @@ type ClientConfig struct {
 	UserUUID string
 
 	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 static key.
-	// Preference: this field → GDX_NOISE_STATIC_PUBLIC_KEY (aliases) →
+	// Preference: this field → GODARK_NOISE_STATIC_PUBLIC_KEY (then GDX_*) →
 	// baked-in pin from Environment (Testnet or Devnet, each with its own key).
 	NoiseStaticPublicKeyHex string
 
@@ -731,7 +731,7 @@ func (c *GodarkClient) OnDisconnect(cb func()) {
 
 func (c *GodarkClient) setupNoiseSession(ctx context.Context) error {
 	if c.noiseStaticKey == "" {
-		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex, GDX_NOISE_STATIC_PUBLIC_KEY, or use EnvironmentTestnet/Devnet")
+		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex, GODARK_NOISE_STATIC_PUBLIC_KEY, or use EnvironmentTestnet/Devnet")
 	}
 	remoteStatic, err := noise.ParsePinnedStaticPublicKeyHex(c.noiseStaticKey)
 	if err != nil {
@@ -1575,7 +1575,7 @@ func resolveNoiseStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
-	for _, key := range []string{"GDX_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBKEY", "GODARK_NOISE_STATIC_PUBLIC_KEY"} {
+	for _, key := range []string{"GODARK_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBKEY"} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
