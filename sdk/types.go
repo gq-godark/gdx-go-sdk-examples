@@ -10,10 +10,14 @@ type LeverageSetting struct {
 	Leverage int32
 }
 
-// LeverageSettings is the REST snapshot returned by
-// GodarkRestClient.GetLeverage via `GET /api/v1/leverage`.
+// LeverageSettings is the per-user leverage snapshot returned by
+// GodarkRestClient.GetLeverage via `GET /api/v1/leverage` and pushed over
+// the encrypted WS as `leverage_settings`. REST responses leave UserUUID
+// empty and ServerTimestamp at zero.
 type LeverageSettings struct {
-	Settings []LeverageSetting
+	UserUUID        string
+	Settings        []LeverageSetting
+	ServerTimestamp uint64
 }
 
 // OrderAck is the response to a Place / Cancel / Modify command.
@@ -138,6 +142,24 @@ type PositionUpdate struct {
 	FillQty       string
 	CorrelationID uint64
 	Timestamp     uint64
+}
+
+// OpenOrderRow is one resting order within an OpenOrdersSnapshot.
+type OpenOrderRow struct {
+	OrderID      string
+	SymbolID     int64
+	Leverage     int32
+	Price        string
+	Quantity     string
+	RemainingQty string
+}
+
+// OpenOrdersSnapshot is the authoritative view of all open orders for the
+// authenticated user, returned in response to GetOpenOrders.
+type OpenOrdersSnapshot struct {
+	Rows            []OpenOrderRow
+	ServerTimestamp uint64
+	CorrelationID   uint64
 }
 
 // PositionRow is one row within a PositionsSnapshot.

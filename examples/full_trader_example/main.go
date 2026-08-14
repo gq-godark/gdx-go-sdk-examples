@@ -107,6 +107,15 @@ func main() {
 	drainPositionUpdates(client)
 	drainPositionsSnapshots(client)
 
+	// Leverage is per-symbol account state (not a PlaceOrder/MassQuote field).
+	fmt.Println("Setting leverage to 1 via UpdateLeverage...")
+	if levAck, levErr := client.UpdateLeverage(ctx, symbol, 1); levErr != nil {
+		envloader.PrintOrderError("UpdateLeverage rejected", levErr)
+		os.Exit(1)
+	} else {
+		fmt.Printf("UpdateLeverage: success=%v  order_id=%s\n", levAck.Success, levAck.OrderID)
+	}
+
 	// Place a limit BUY.
 	fmt.Println("Placing limit BUY @ 67500...")
 	buyAck, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
@@ -184,7 +193,7 @@ func main() {
 		{Side: godark.SideBuy, Price: base * (1 - 0.009), Quantity: 0.02},
 	}
 	var restingIDs []uint64
-	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, 1, nil); mqErr != nil {
+	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, nil); mqErr != nil {
 		envloader.PrintOrderError("Mass quote rejected", mqErr)
 	} else {
 		fmt.Printf("Mass quote: success=%v  sequence=%s  legs=%d\n", mq.Success, mq.Sequence, len(mq.Results))
@@ -233,7 +242,7 @@ func main() {
 	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
 		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.001}},
-		1, &postOnlyTrue); mqErr != nil {
+		&postOnlyTrue); mqErr != nil {
 		envloader.PrintOrderError("post_only=true mass quote rejected", mqErr)
 	} else {
 		for _, r := range mq.Results {
@@ -252,7 +261,7 @@ func main() {
 	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
 		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.003}},
-		1, &postOnlyFalse); mqErr != nil {
+		&postOnlyFalse); mqErr != nil {
 		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
 	} else {
 		var strayIDs []uint64

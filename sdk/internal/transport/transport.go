@@ -44,7 +44,8 @@ type Config struct {
 	HTTPClient *http.Client
 	// Headers are extra HTTP headers sent on the upgrade request.
 	Headers http.Header
-	// MaxMessageSize is the per-frame size limit. Default 65536 bytes.
+	// MaxMessageSize is the per-frame size limit. Default 8 MiB (aligned with
+	// Java/Python; open_orders_snapshot frames grow with resting-order count).
 	MaxMessageSize int64
 	// HeartbeatInterval is the ping period. Default 30s.
 	HeartbeatInterval time.Duration
@@ -61,7 +62,7 @@ type Config struct {
 
 func (c *Config) applyDefaults() {
 	if c.MaxMessageSize == 0 {
-		c.MaxMessageSize = 65536
+		c.MaxMessageSize = 8 * 1024 * 1024
 	}
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = 30 * time.Second
