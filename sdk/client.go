@@ -214,18 +214,22 @@ type GodarkClient struct {
 	balanceQueue      chan *BalanceUpdate
 	marginAlertQueue  chan *MarginAlert
 	fundingRateQueue  chan *FundingRateUpdate
-	settlementQueue   chan *SettlementUpdate
+	settlementQueue          chan *SettlementUpdate
+	leverageSettingsQueue    chan *LeverageSettings
+	openOrdersSnapshotQueue  chan *OpenOrdersSnapshot
 
-	cbMu              sync.RWMutex
-	orderCallbacks    []func(*OrderUpdate)
-	positionCallbacks []func(*PositionUpdate)
-	snapshotCallbacks []func(*PositionsSnapshot)
+	cbMu                        sync.RWMutex
+	orderCallbacks              []func(*OrderUpdate)
+	positionCallbacks           []func(*PositionUpdate)
+	snapshotCallbacks           []func(*PositionsSnapshot)
+	openOrdersSnapshotCallbacks []func(*OpenOrdersSnapshot)
 	healthCallbacks   []func(*SystemHealthUpdate)
 	balanceCallbacks  []func(*BalanceUpdate)
 	marginCallbacks   []func(*MarginAlert)
 	fundingCallbacks  []func(*FundingRateUpdate)
-	settlementCBs     []func(*SettlementUpdate)
-	errorCallbacks    []func(error)
+	settlementCBs            []func(*SettlementUpdate)
+	leverageSettingsCallbacks []func(*LeverageSettings)
+	errorCallbacks           []func(error)
 	disconnectCB      []func()
 
 	// session-setup waiter
@@ -294,6 +298,8 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		marginAlertQueue:        make(chan *MarginAlert, bufSize),
 		fundingRateQueue:        make(chan *FundingRateUpdate, bufSize),
 		settlementQueue:         make(chan *SettlementUpdate, bufSize),
+		leverageSettingsQueue: make(chan *LeverageSettings, bufSize),
+		openOrdersSnapshotQueue: make(chan *OpenOrdersSnapshot, bufSize),
 	}
 
 	c.transport = transport.New(transport.EdgeURL(baseURL), cfg.Transport, transport.Handlers{
@@ -652,6 +658,17 @@ func (c *GodarkClient) FundingRateUpdates() <-chan *FundingRateUpdate {
 // SettlementUpdates emits settlement-batch lifecycle transitions.
 func (c *GodarkClient) SettlementUpdates() <-chan *SettlementUpdate { return c.settlementQueue }
 
+// LeverageSettingsUpdates emits authoritative per-user leverage snapshots.
+func (c *GodarkClient) LeverageSettingsUpdates() <-chan *LeverageSettings {
+	return c.leverageSettingsQueue
+}
+
+// OpenOrdersSnapshots returns a receive-only channel of authoritative open-order
+// book batches returned by GetOpenOrders.
+func (c *GodarkClient) OpenOrdersSnapshots() <-chan *OpenOrdersSnapshot {
+	return c.openOrdersSnapshotQueue
+}
+
 // OnOrderUpdate registers a callback invoked on every decoded order update.
 // Callbacks fire from the WS recv goroutine; keep them fast and non-blocking.
 func (c *GodarkClient) OnOrderUpdate(cb func(*OrderUpdate)) {
@@ -706,6 +723,20 @@ func (c *GodarkClient) OnFundingRateUpdate(cb func(*FundingRateUpdate)) {
 func (c *GodarkClient) OnSettlementUpdate(cb func(*SettlementUpdate)) {
 	c.cbMu.Lock()
 	c.settlementCBs = append(c.settlementCBs, cb)
+	c.cbMu.Unlock()
+}
+
+// OnLeverageSettings registers a callback for leverage-settings snapshots.
+func (c *GodarkClient) OnLeverageSettings(cb func(*LeverageSettings)) {
+	c.cbMu.Lock()
+	c.leverageSettingsCallbacks = append(c.leverageSettingsCallbacks, cb)
+	c.cbMu.Unlock()
+}
+
+// OnOpenOrdersSnapshot registers a callback for open-order book batches.
+func (c *GodarkClient) OnOpenOrdersSnapshot(cb func(*OpenOrdersSnapshot)) {
+	c.cbMu.Lock()
+	c.openOrdersSnapshotCallbacks = append(c.openOrdersSnapshotCallbacks, cb)
 	c.cbMu.Unlock()
 }
 
@@ -878,6 +909,10 @@ func (c *GodarkClient) sendEncryptedOrder(ctx context.Context, requestType strin
 // requestType, and returns the raw response. Shared by the single-order path
 // and the mass-quote / batch paths.
 func (c *GodarkClient) sendEncryptedCommand(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte) (transport.Message, error) {
+	return c.sendEncryptedCommandEx(ctx, requestType, symbolID, plaintext, correlationID, false, nil)
+}
+
+func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte, forceLegacy bool, headerLeverage *int) (transport.Message, error) {
 	bodyLength := uint32(len(plaintext) + 32 + gdxcrypto.GCMTagLen)
 	corrIDStr := hex.EncodeToString(correlationID)
 
@@ -902,7 +937,10 @@ func (c *GodarkClient) sendEncryptedCommand(ctx context.Context, requestType str
 			"body_length":    bodyLength,
 			"correlation_id": corrIDStr,
 		}
-		if c.transport.UseDocsWire() {
+		if headerLeverage != nil {
+			headerObj["leverage"] = *headerLeverage
+		}
+		if c.transport.UseDocsWire() && !forceLegacy {
 			opMap := map[string]string{
 				"place":        "order.place",
 				"cancel":       "order.cancel",
@@ -1085,11 +1123,12 @@ func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMes
 // symbol (up to 20 legs), which fuses into one MPC round. Returns one result
 // per leg.
 //
-// postOnly is the batch-level post-only flag. When nil (the default) or true,
-// a replacement leg that would cross is rejected as "failed". Pass a pointer to
-// false to enable the relaxed path: a crossing leg takes liquidity up to its
-// limit and rests the remainder; such a leg reports FillCount > 0 on its result.
-func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []MassQuoteLegInput, leverage uint32, postOnly *bool) (*MassQuoteAck, error) {
+// Per-symbol leverage is account state; set it with UpdateLeverage before
+// mass-quoting. postOnly is the batch-level post-only flag. When nil (the
+// default) or true, a replacement leg that would cross is rejected as "failed".
+// Pass a pointer to false to enable the relaxed path: a crossing leg takes
+// liquidity up to its limit and rests the remainder; such a leg reports FillCount > 0.
+func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []MassQuoteLegInput, postOnly *bool) (*MassQuoteAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -1097,11 +1136,8 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 	if err != nil {
 		return nil, err
 	}
-	if leverage < 1 {
-		leverage = 1
-	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, leverage, postOnly)
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1121,6 +1157,33 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 		return nil, newOrderError("expected mass_quote_ack inside encrypted push", "")
 	}
 	return ack, nil
+}
+
+// UpdateLeverage sets per-symbol account leverage over Noise XK WebSocket.
+// Place/mass-quote inherit this setting server-side. Always uses the legacy
+// encrypted_order frame (docs-wire has no update_leverage op).
+func (c *GodarkClient) UpdateLeverage(ctx context.Context, symbol string, leverage int) (*OrderAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	lev := leverage
+	if lev < 1 {
+		lev = 1
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommandEx(ctx, "update_leverage", uint64(symbolID), plaintext, corrID, true, &lev)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseOrderResponse(resp)
 }
 
 // BatchCancel cancels multiple resting orders on one symbol in a single
@@ -1281,6 +1344,16 @@ func (c *GodarkClient) dispatchEncryptedPushInOrder(msg transport.Message) {
 	pt, err := c.session.DecryptPush(nonce, aad, ct)
 	if err != nil {
 		c.emitError(newEncryptionError(fmt.Sprintf("decrypt push: %v", err)))
+		return
+	}
+
+	if messageType == "open_orders_snapshot" {
+		snap, err := ParseOpenOrdersSnapshot(pt)
+		if err != nil {
+			c.emitError(fmt.Errorf("parse open_orders_snapshot: %w", err))
+			return
+		}
+		c.dispatchOpenOrdersSnapshot(snap)
 		return
 	}
 
@@ -1448,8 +1521,22 @@ func (c *GodarkClient) dispatchSequencerPush(parsed SequencerPush) {
 		for _, cb := range c.settlementCBs {
 			safeCallSettlement(cb, v)
 		}
+	case *LeverageSettings:
+		nonBlockingSend(c.leverageSettingsQueue, v)
+		for _, cb := range c.leverageSettingsCallbacks {
+			safeCallLeverageSettings(cb, v)
+		}
 	case *UnknownSequencerPush:
 		// silently ignored - forward-compat contract
+	}
+}
+
+func (c *GodarkClient) dispatchOpenOrdersSnapshot(snap *OpenOrdersSnapshot) {
+	c.cbMu.RLock()
+	defer c.cbMu.RUnlock()
+	nonBlockingSend(c.openOrdersSnapshotQueue, snap)
+	for _, cb := range c.openOrdersSnapshotCallbacks {
+		safeCallOpenOrdersSnap(cb, snap)
 	}
 }
 
@@ -1745,6 +1832,14 @@ func safeCallFunding(cb func(*FundingRateUpdate), v *FundingRateUpdate) {
 	cb(v)
 }
 func safeCallSettlement(cb func(*SettlementUpdate), v *SettlementUpdate) {
+	defer func() { _ = recover() }()
+	cb(v)
+}
+func safeCallLeverageSettings(cb func(*LeverageSettings), v *LeverageSettings) {
+	defer func() { _ = recover() }()
+	cb(v)
+}
+func safeCallOpenOrdersSnap(cb func(*OpenOrdersSnapshot), v *OpenOrdersSnapshot) {
 	defer func() { _ = recover() }()
 	cb(v)
 }

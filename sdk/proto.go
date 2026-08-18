@@ -34,6 +34,7 @@ func (*BalanceUpdate) isSequencerPush()        {}
 func (*MarginAlert) isSequencerPush()          {}
 func (*FundingRateUpdate) isSequencerPush()    {}
 func (*SettlementUpdate) isSequencerPush()     {}
+func (*LeverageSettings) isSequencerPush()    {}
 func (*UnknownSequencerPush) isSequencerPush() {}
 
 // ---------------------------------------------------------------------------
@@ -266,7 +267,7 @@ const maxBatchLegs = 20
 // postOnly is the batch-level post-only flag: when non-nil and false, a crossing
 // leg takes liquidity up to its limit and rests the remainder instead of being
 // rejected. A nil pointer omits the field on the wire (node defaults to post-only).
-func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, leverage uint32, postOnly *bool) ([]byte, error) {
+func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("mass quote requires at least one leg")
 	}
@@ -311,7 +312,6 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
 		UserUuid:      userUUID,
-		Leverage:      leverage,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 		PostOnly:      postOnly,
 	}
@@ -571,6 +571,38 @@ func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
 	}, true, nil
 }
 
+// ParseOpenOrdersSnapshot decodes a NodeResponse carrying an OpenOrdersSnapshot.
+func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_OpenOrdersSnapshot)
+	if !ok || inner.OpenOrdersSnapshot == nil {
+		return nil, fmt.Errorf("NodeResponse is not open_orders_snapshot")
+	}
+	s := inner.OpenOrdersSnapshot
+	rows := make([]OpenOrderRow, 0, len(s.Rows))
+	for _, r := range s.Rows {
+		if r == nil {
+			continue
+		}
+		rows = append(rows, OpenOrderRow{
+			OrderID:      fmt.Sprintf("%d", r.OrderId),
+			SymbolID:     int64(r.SymbolId),
+			Leverage:     int32(r.Leverage),
+			Price:        r.Price,
+			Quantity:     r.Quantity,
+			RemainingQty: r.RemainingQty,
+		})
+	}
+	return &OpenOrdersSnapshot{
+		Rows:            rows,
+		ServerTimestamp: s.ServerTimestamp,
+		CorrelationID:   correlationIDToUint64(s.CorrelationId),
+	}, nil
+}
+
 // ParseBatchModifyAck decodes a NodeResponse carrying a BatchModifyAck. Success
 // is true when every leg was modified.
 func ParseBatchModifyAck(data []byte) (*BatchModifyAck, bool, error) {
@@ -760,6 +792,23 @@ func ParsePositionsSnapshot(msg *sequencerpb.PositionsSnapshot) *PositionsSnapsh
 	return out
 }
 
+// ParseLeverageSettings converts a sequencer LeverageSettings proto into the
+// public snapshot type.
+func ParseLeverageSettings(msg *sequencerpb.LeverageSettings) *LeverageSettings {
+	settings := make([]LeverageSetting, len(msg.Settings))
+	for i, row := range msg.Settings {
+		settings[i] = LeverageSetting{
+			SymbolID: int64(row.SymbolId),
+			Leverage: int32(row.Leverage),
+		}
+	}
+	return &LeverageSettings{
+		UserUUID:        uuidBytesToString(msg.UserUuid),
+		Settings:        settings,
+		ServerTimestamp: msg.ServerTimestamp,
+	}
+}
+
 // ParseSequencerToEdgeMessage is the umbrella push-frame parser. Decodes a
 // SequencerToEdgeMessage and returns the appropriate public type based on the
 // inner oneof variant. Unknown variants become *UnknownSequencerPush.
@@ -827,6 +876,8 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 			ShieldedBalanceRaw: b.ShieldedBalanceRaw,
 			Timestamp:          b.Timestamp,
 		}, nil
+	case *sequencerpb.SequencerToEdgeMessage_LeverageSettings:
+		return ParseLeverageSettings(inner.LeverageSettings), nil
 	default:
 		// New variants (OrderHistoryInsert, OpenInterestUpdate, VolumeUpdate,
 		// future additions) fall through here.
