@@ -22,8 +22,8 @@ gdx-go-sdk-examples/
 │   └── SDK_REFERENCE.md                  ships in the zip as ./SDK_REFERENCE.md
 ├── examples/
 │   ├── quickstart/main.go                place + cancel
-│   ├── full_trader_example/main.go
-│   ├── rest_client_example/main.go       REST residual reads       subscribe + place + modify + cancel + mass-quote + batch-cancel
+│   ├── full_trader_example/main.go       subscribe + place + modify + cancel + mass-quote + batch-cancel
+│   ├── rest_client_example/main.go       REST residual reads
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
 │   ├── refresh_sdk.sh                    vendor a gdx-go-sdk checkout into sdk/
