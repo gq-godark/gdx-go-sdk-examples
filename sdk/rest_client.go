@@ -502,6 +502,21 @@ func (c *GodarkRestClient) GetLeverage(ctx context.Context) (*LeverageSettings, 
 	return out, nil
 }
 
+// GetFundingRates calls `GET /api/v1/market-data/funding-rates` (public; Connect not required).
+func (c *GodarkRestClient) GetFundingRates(ctx context.Context) ([]map[string]any, error) {
+	return c.http.GetFundingRates(ctx)
+}
+
+// GetOpenInterest calls `GET /api/v1/market-data/open-interest` (public; Connect not required).
+func (c *GodarkRestClient) GetOpenInterest(ctx context.Context) ([]map[string]any, error) {
+	return c.http.GetOpenInterest(ctx)
+}
+
+// GetVolume calls `GET /api/v1/market-data/volume` (public; Connect not required).
+func (c *GodarkRestClient) GetVolume(ctx context.Context) (map[string]any, error) {
+	return c.http.GetVolume(ctx)
+}
+
 // UpdateLeverage sends an encrypted leverage update via `POST /api/v1/leverage`.
 // The JSON header must include `leverage` so the edge can update its DB cache
 // and fan out WS pushes on success.
