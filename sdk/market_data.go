@@ -60,7 +60,7 @@ type MarketDataConfig struct {
 	EventBufferSize int
 }
 
-const orderbookDocsWireMsg = "L2 orderbook is not available on /ws/v1; set GODARK_ORDERBOOK_WS_URL to a direct L2 " +
+const orderbookDocsWireMsg = "L2 orderbook is not available on /ws/v1; set GODARK_MARKET_DATA_WS_URL to a direct L2 " +
 	"stream URL, use SubscribePublicChannel for public edge feeds, or " +
 	"GODARK_MARKET_DATA_USE_GOMARKET=1 for local /ws/gomarket"
 
@@ -101,9 +101,19 @@ func envTruthy(keys ...string) bool {
 	return false
 }
 
+func rewriteHTTPToWS(url string) string {
+	if strings.HasPrefix(url, "http://") {
+		return "ws://" + strings.TrimPrefix(url, "http://")
+	}
+	if strings.HasPrefix(url, "https://") {
+		return "wss://" + strings.TrimPrefix(url, "https://")
+	}
+	return url
+}
+
 // tradingWsURL mirrors Java GodarkClient.wsUrl / Python _ws_url.
 func tradingWsURL(baseURL string) string {
-	url := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	url := rewriteHTTPToWS(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
 	if strings.HasSuffix(url, "/ws/v1") {
 		return url
 	}
@@ -111,6 +121,18 @@ func tradingWsURL(baseURL string) string {
 		return url + "/v1"
 	}
 	return url + "/ws/v1"
+}
+
+func isDocsWireURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Path != "" {
+		return strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/ws/v1")
+	}
+	cut := raw
+	if i := strings.IndexAny(cut, "?#"); i >= 0 {
+		cut = cut[:i]
+	}
+	return strings.HasSuffix(strings.TrimRight(cut, "/"), "/ws/v1")
 }
 
 // ResolveMarketDataWsURL resolves the market-data WebSocket URL.
@@ -215,7 +237,7 @@ func NewMarketDataClient(cfg MarketDataConfig) *MarketDataClient {
 
 	return &MarketDataClient{
 		url:         resolved,
-		docsWire:    strings.HasSuffix(resolved, "/ws/v1"),
+		docsWire:    isDocsWireURL(resolved),
 		cfg:         cfg,
 		bufSize:     bufSize,
 		callbacks:   make(map[string][]func(MarketDataMessage)),
@@ -360,10 +382,15 @@ func (m *MarketDataClient) Unsubscribe(ctx context.Context, channel, symbol stri
 	key := subKey(channel, symbol)
 	m.cbMu.Lock()
 	delete(m.callbacks, key)
+	delete(m.callbacks, channel+":")
 	m.cbMu.Unlock()
 	m.desiredMu.Lock()
 	delete(m.desired, key)
+	delete(m.desired, "public\x00"+channel)
 	m.desiredMu.Unlock()
+	if m.docsWire {
+		return m.sendUnsubscribeFrame(ctx, channel, symbol)
+	}
 	return m.sendAction(ctx, "unsubscribe", channel, symbol)
 }
 
@@ -451,6 +478,29 @@ func (m *MarketDataClient) sendSubscribeFrame(ctx context.Context, channel, symb
 			"channel": channel,
 			"symbol":  symbol,
 		}
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, websocket.MessageText, b)
+}
+
+func (m *MarketDataClient) sendUnsubscribeFrame(ctx context.Context, channel, symbol string) error {
+	m.connMu.Lock()
+	conn := m.conn
+	m.connMu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	arg := map[string]any{"channel": channel}
+	if symbol != "" {
+		arg["symbol"] = symbol
+	}
+	payload := map[string]any{
+		"id":   uuid.NewString(),
+		"op":   "unsubscribe",
+		"args": []map[string]any{arg},
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
