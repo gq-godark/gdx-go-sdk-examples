@@ -51,13 +51,13 @@ func main() {
 	fmt.Println(sep)
 	fmt.Println("Order-type support in this distribution: MARKET, LIMIT")
 
-	apiKeyID := os.Getenv("GODARK_API_KEY_ID")
-	apiSecret := os.Getenv("GODARK_API_SECRET")
-	passphrase := os.Getenv("GODARK_PASSPHRASE")
+	apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
+	apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
+	passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
 	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
 		log.Fatal("Missing credentials. Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE (or provide them in .env).")
 	}
-	wsURL := os.Getenv("GODARK_EDGE_URL")
+	wsURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")
 	if wsURL == "" {
 		wsURL = godark.EnvironmentTestnet.EdgeBaseURL()
 	}
@@ -74,7 +74,7 @@ func main() {
 		APISecret:   apiSecret,
 		Passphrase:  passphrase,
 		Environment: godark.EnvironmentTestnet,
-		BaseURL:     os.Getenv("GODARK_EDGE_URL"), // empty => Testnet preset
+		BaseURL:     envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL"), // empty => Testnet preset
 		Transport: godark.TransportConfig{
 			Headers:           headers,
 			HeartbeatInterval: 30 * time.Second,
