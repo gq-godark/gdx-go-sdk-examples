@@ -91,3 +91,7 @@ event here. Our `auto-bump-sdk-pin.yml` listener:
 
 The PR is annotated with a checklist: review the descriptor diff under
 `sdk/proto/`, confirm CI is green, and merge to cut a new Release zip.
+
+## RestClient example
+
+`GodarkRestClient` is exercised by `rest_client_example` / `rest-client-example`: REST auth, `/auth/me`, leverage read, and public funding/OI/volume GETs. Encrypted place/cancel/modify/update-leverage remain WebSocket-only via `GodarkClient`.

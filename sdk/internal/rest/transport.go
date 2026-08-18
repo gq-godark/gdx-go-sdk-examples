@@ -75,6 +75,19 @@ func (t *Transport) doJSON(ctx context.Context, method, path string, bearer stri
 // payload at the response root (e.g. legacy / non-docs APIs like
 // shielded-pool, auth/me). Status >= 400 still surfaces as an error.
 func (t *Transport) doJSONRaw(ctx context.Context, method, path string, bearer string, body any, query url.Values) (map[string]any, error) {
+	v, err := t.doJSONValue(ctx, method, path, bearer, body, query)
+	if err != nil {
+		return nil, err
+	}
+	out, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s %s: expected JSON object at root", method, path)
+	}
+	return out, nil
+}
+
+// doJSONValue is like doJSONRaw but accepts any JSON root (object or array).
+func (t *Transport) doJSONValue(ctx context.Context, method, path string, bearer string, body any, query url.Values) (any, error) {
 	u := t.base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -120,7 +133,7 @@ func (t *Transport) doJSONRaw(ctx context.Context, method, path string, bearer s
 		return nil, fmt.Errorf("%s %s: status %d: %s", method, u, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	var out map[string]any
+	var out any
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("%s %s: bad JSON (status %d): %w", method, u, resp.StatusCode, err)
 	}
@@ -183,7 +196,8 @@ func (t *Transport) AuthTokenLegacy(ctx context.Context, token string) (map[stri
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token", "", map[string]any{"token": token}, nil)
 }
 
-// SessionSetup performs the ECDH session-setup handshake.
+// SessionSetup is deprecated: ECDH REST session setup is retired (Noise XK is
+// WS-only). GodarkRestClient never calls this; kept for transport unit tests.
 func (t *Transport) SessionSetup(ctx context.Context, bearer, clientECDHPubKey string) (map[string]any, error) {
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/session/setup", bearer, map[string]any{
 		"client_ecdh_pubkey": clientECDHPubKey,
@@ -270,6 +284,47 @@ func (t *Transport) GetShieldedPoolBalances(ctx context.Context, bearer, owner s
 // user's profile (raw JSON root, snake_case keys -- not envelope-wrapped).
 func (t *Transport) GetAuthMe(ctx context.Context, bearer string) (map[string]any, error) {
 	return t.doJSONRaw(ctx, http.MethodGet, "/api/v1/auth/me", bearer, nil, nil)
+}
+
+func asObjectSlice(v any, path string) ([]map[string]any, error) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("GET %s: expected JSON array", path)
+	}
+	out := make([]map[string]any, 0, len(arr))
+	for i, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("GET %s: element %d is not an object", path, i)
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// GetFundingRates issues `GET /api/v1/market-data/funding-rates` (public, raw array).
+func (t *Transport) GetFundingRates(ctx context.Context) ([]map[string]any, error) {
+	const path = "/api/v1/market-data/funding-rates"
+	v, err := t.doJSONValue(ctx, http.MethodGet, path, "", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return asObjectSlice(v, path)
+}
+
+// GetOpenInterest issues `GET /api/v1/market-data/open-interest` (public, raw array).
+func (t *Transport) GetOpenInterest(ctx context.Context) ([]map[string]any, error) {
+	const path = "/api/v1/market-data/open-interest"
+	v, err := t.doJSONValue(ctx, http.MethodGet, path, "", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return asObjectSlice(v, path)
+}
+
+// GetVolume issues `GET /api/v1/market-data/volume` (public, raw object).
+func (t *Transport) GetVolume(ctx context.Context) (map[string]any, error) {
+	return t.doJSONRaw(ctx, http.MethodGet, "/api/v1/market-data/volume", "", nil, nil)
 }
 
 // IsEnvelopeError reports whether err is (or wraps) an *EnvelopeError.
