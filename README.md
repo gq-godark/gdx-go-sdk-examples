@@ -22,7 +22,8 @@ gdx-go-sdk-examples/
 │   └── SDK_REFERENCE.md                  ships in the zip as ./SDK_REFERENCE.md
 ├── examples/
 │   ├── quickstart/main.go                place + cancel
-│   ├── full_trader_example/main.go       subscribe + place + modify + cancel + mass-quote + batch-cancel
+│   ├── full_trader_example/main.go
+│   ├── rest_client_example/main.go       REST residual reads       subscribe + place + modify + cancel + mass-quote + batch-cancel
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
 │   ├── refresh_sdk.sh                    vendor a gdx-go-sdk checkout into sdk/
@@ -54,6 +55,7 @@ go build ./examples/...                  # compile both example binaries
 go vet ./...                             # static checks
 go run ./examples/quickstart             # run quickstart against testnet
 go run ./examples/full_trader_example    # run full trader against testnet
+go run ./examples/rest_client_example   # REST auth + account/public MD reads
 ```
 
 `quickstart` subscribes to `orders` before placing so default **book** confirmation

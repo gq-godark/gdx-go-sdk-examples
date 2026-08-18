@@ -201,6 +201,8 @@ var responseMessageTypeToProto = map[string]int32{
 	"mass_quote_ack":         10,
 	"batch_cancel_ack":       11,
 	"batch_modify_ack":       12,
+	"tpsl_update":            13,
+	"leverage_settings":      14,
 }
 
 // SideFromProto / OrderTypeFromProto / ... are exported because the proto
