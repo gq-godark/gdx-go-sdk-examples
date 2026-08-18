@@ -72,6 +72,7 @@ fi
 for required in bundle/README.md bundle/SDK_REFERENCE.md bundle/go.mod \
                 go.sum .env.example \
                 examples/quickstart/main.go examples/full_trader_example/main.go \
+                examples/rest_client_example/main.go \
                 examples/internal/envloader/envloader.go; do
   if [[ ! -f "${REPO_ROOT}/${required}" ]]; then
     echo "error: required source file missing: ${required}" >&2
@@ -177,6 +178,7 @@ mkdir -p "$DEST"
 
 echo "Staging distribution at $DEST ..."
 mkdir -p "$DEST/examples/quickstart" "$DEST/examples/full_trader_example" \
+         "$DEST/examples/rest_client_example" \
          "$DEST/examples/internal/envloader" "$DEST/sdk"
 
 # Recipient docs come from bundle/, never from the repo-root copies.
@@ -198,6 +200,8 @@ rewrite_example "${REPO_ROOT}/examples/quickstart/main.go" \
   "$DEST/examples/quickstart/main.go"
 rewrite_example "${REPO_ROOT}/examples/full_trader_example/main.go" \
   "$DEST/examples/full_trader_example/main.go"
+rewrite_example "${REPO_ROOT}/examples/rest_client_example/main.go" \
+  "$DEST/examples/rest_client_example/main.go"
 cp "${REPO_ROOT}/examples/internal/envloader/envloader.go" \
   "$DEST/examples/internal/envloader/envloader.go"
 
@@ -271,6 +275,7 @@ for required in \
   "${DIST_NAME}/\\.env\\.example" \
   "${DIST_NAME}/examples/quickstart/main\\.go" \
   "${DIST_NAME}/examples/full_trader_example/main\\.go" \
+  "${DIST_NAME}/examples/rest_client_example/main\\.go" \
   "${DIST_NAME}/examples/internal/envloader/envloader\\.go" \
   "${DIST_NAME}/sdk/go\\.mod" \
   "${DIST_NAME}/sdk/go\\.sum" \
