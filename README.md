@@ -42,11 +42,22 @@ gdx-go-sdk-examples/
 ## Configure credentials
 
 Copy `.env.example` to `.env` and set `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
-and `GODARK_PASSPHRASE`. Public testnet needs only those three — the SDK
-`EnvironmentTestnet` preset supplies the edge URL and Noise pin.
+and `GODARK_PASSPHRASE`. Public testnet needs only those three for hosted
+testnet; localnet/devnet also require `GDX_HPKE_STATIC_PUBLIC_KEY`.
 
-Optional overrides: `GODARK_EDGE_URL`, `GDX_NOISE_STATIC_PUBLIC_KEY` (not
-required for testnet).
+Optional overrides: `GODARK_EDGE_URL`, `GDX_HPKE_STATIC_PUBLIC_KEY` (legacy
+`GDX_NOISE_*` names still accepted).
+
+## Localnet (`gdx up`)
+
+```bash
+GODARK_EDGE_URL=ws://127.0.0.1:13300
+GODARK_API_KEY=test-key-1
+GDX_HPKE_STATIC_PUBLIC_KEY=1d61f116451fdfda1aa4aaf50b7200c3b362d0445bfa2d7ef1f80b3b8881a533
+gdx fund 00000000-0000-4000-8000-000000000001
+```
+
+Copy `VITE_GDX_HPKE_STATIC_PUBKEY` from `gdx-web/.env.localnet` if your pin differs.
 
 ## Local development
 

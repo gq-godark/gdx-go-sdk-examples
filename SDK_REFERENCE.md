@@ -49,7 +49,7 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
     `ClientConfig.NoiseStaticPublicKeyHex` or `GDX_NOISE_STATIC_PUBLIC_KEY`.
     Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
     The legacy ECDH `session.setup` handshake is retired; all encrypted
-    order flow now uses the Noise XK WebSocket client. Encrypted REST
+    order flow now uses the HPKE WebSocket client. Encrypted REST
     trading is unsupported.
 
 ## Examples mapping

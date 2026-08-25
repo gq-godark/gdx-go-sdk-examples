@@ -1,7 +1,7 @@
 // GoDark Go SDK — minimal GodarkRestClient demo.
 //
 // Auth + account reads + public market-data GETs. Encrypted place/cancel/
-// modify/update-leverage require GodarkClient (WebSocket / Noise XK); see
+// modify/update-leverage require GodarkClient (WebSocket / HPKE); see
 // quickstart and full_trader_example.
 //
 //	go run ./examples/rest_client_example
@@ -95,7 +95,7 @@ func main() {
 	}
 
 	fmt.Println("REST reads succeeded.")
-	fmt.Println("Encrypted trading requires GodarkClient over WebSocket (Noise XK).")
+	fmt.Println("Encrypted trading requires GodarkClient over WebSocket (HPKE).")
 }
 
 func firstOrNil(rows []map[string]any) any {

@@ -3,7 +3,7 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. Connect and authenticate (Noise XK encrypted WebSocket session).
+//  2. Connect and authenticate (HPKE WebSocket session).
 //  3. Wire up channel-first push receivers (order / position / health / etc.).
 //  4. Subscribe to the private order + position channels.
 //  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
