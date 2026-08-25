@@ -21,7 +21,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
@@ -29,6 +31,15 @@ import (
 )
 
 const symbol = "BTC-USDC-PERP"
+
+func liveMarkPrice() float64 {
+	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f
+		}
+	}
+	return 79000.0
+}
 
 func main() {
 	envloader.LoadDotenv()
@@ -67,11 +78,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	mark := liveMarkPrice()
+	sellPx := math.Round(mark*1.03*10) / 10
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
-		Price:     69515.2,
+		Price:     sellPx,
 		Quantity:  0.01,
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
@@ -79,7 +92,7 @@ func main() {
 		envloader.PrintOrderError("PlaceOrder", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Place OK -- order_id=%s\n", ack.OrderID)
+	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %.1f, mark=%.1f)\n", ack.OrderID, sellPx, mark)
 
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)
