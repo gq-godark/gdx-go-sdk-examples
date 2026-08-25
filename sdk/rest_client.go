@@ -49,7 +49,7 @@ type RestClientConfig struct {
 }
 
 // GodarkRestClient exposes REST account and market endpoints. Encrypted
-// trading requires the Noise XK WebSocket session and is intentionally refused.
+// trading requires the HPKE WebSocket session and is intentionally refused.
 type GodarkRestClient struct {
 	legacyToken string
 	apiKeyID    string
@@ -133,7 +133,7 @@ func resolveRestCredentials(cfg RestClientConfig) (restCredentials, error) {
 	return restCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
 }
 
-// IsSessionEstablished is always false: REST cannot establish Noise XK.
+// IsSessionEstablished is always false: REST cannot establish an HPKE session.
 func (c *GodarkRestClient) IsSessionEstablished() bool {
 	return c.session.IsEstablished()
 }
@@ -157,7 +157,7 @@ func (c *GodarkRestClient) BearerToken() string {
 }
 
 // Connect authenticates REST requests. It does not create an encrypted trading
-// session because Noise XK is a WebSocket flow.
+// session because HPKE setup is a WebSocket binary flow.
 func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	var (
 		authData map[string]any
@@ -705,7 +705,7 @@ func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error)
 	if err != nil {
 		return nil, err
 	}
-	pt, err := c.session.DecryptPush(nonce, aad, ct)
+	pt, err := c.session.DecryptPush(uint64(nonce), aad, ct)
 	if err != nil {
 		return nil, newEncryptionError(fmt.Sprintf("decrypt ack: %v", err))
 	}
@@ -773,7 +773,7 @@ func (c *GodarkRestClient) ensureReady() error {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
-		return newSessionError("encrypted REST trading is not supported; use GodarkClient over WebSocket with Noise XK")
+		return newSessionError("encrypted REST trading is not supported; use GodarkClient over WebSocket with HPKE")
 	}
 	return nil
 }

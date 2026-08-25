@@ -197,11 +197,14 @@ type SystemHealthUpdate struct {
 	SchemaVersion  uint32
 }
 
-// BalanceUpdate is a push frame describing the user's shielded balance.
+// BalanceUpdate is a push frame describing the user's collateral balance.
 type BalanceUpdate struct {
-	UserUUID           string
-	ShieldedBalanceRaw uint64
-	Timestamp          uint64
+	UserUUID          string
+	BalanceRaw        uint64
+	Timestamp         uint64
+	Balance           string
+	SignedBalance8dp  int64
+	FreeCollateral8dp uint64
 }
 
 // Balance is the REST snapshot returned by

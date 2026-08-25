@@ -6,7 +6,7 @@
 //     message?}` in) and its translation to the legacy `{type, event, ...}`
 //     shape the client uses internally.
 //   - Authentication (login op -> auth_result frame).
-//   - Noise XK handshake relay (noise.handshake -> noise_handshake_reply).
+//   - HPKE setup relay (binary HpkeSetup -> HpkeSetupReply).
 //   - Command serialization (one in flight at a time) with timeout.
 //   - Subscribe / unsubscribe ack collation.
 //   - Heartbeat + staleness detection.
@@ -35,6 +35,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
+
+	"github.com/gq-godark/gdx-go-sdk/internal/wire"
 )
 
 // Config holds optional WebSocket transport settings.
@@ -117,6 +119,10 @@ type Transport struct {
 	pendingMu sync.Mutex
 	byCorr    map[string]chan Message
 	byWireID  map[string]chan Message
+
+	// HPKE setup waiter (binary HpkeSetupReply).
+	sessionMu     sync.Mutex
+	pendingSession chan Message
 
 	// subscription ack waiter
 	subWaiter chan error
@@ -217,6 +223,18 @@ func (t *Transport) Disconnect() {
 	}
 	t.rejectPending(errors.New("disconnected"))
 	t.wg.Wait()
+}
+
+// SendBinary writes a single WebSocket binary frame.
+func (t *Transport) SendBinary(ctx context.Context, payload []byte) error {
+	t.mu.Lock()
+	conn := t.conn
+	connected := t.connected
+	t.mu.Unlock()
+	if conn == nil || !connected {
+		return errors.New("not connected")
+	}
+	return conn.Write(ctx, websocket.MessageBinary, payload)
 }
 
 // SendJSON serializes obj and writes it as a single WebSocket text frame.
@@ -322,6 +340,60 @@ func (t *Transport) SendCommandFunc(ctx context.Context, prepare func() (any, er
 	}
 
 	if err := t.SendJSON(ctx, payload); err != nil {
+		cleanup()
+		t.cmdLock.Unlock()
+		return nil, err
+	}
+	t.cmdLock.Unlock()
+
+	defer cleanup()
+	return t.awaitWaiter(ctx, waiter)
+}
+
+// SendHpkeSetup sends a binary HpkeSetup frame and waits for HpkeSetupReply.
+func (t *Transport) SendHpkeSetup(ctx context.Context, frame []byte) (Message, error) {
+	waiter := make(chan Message, 1)
+	t.sessionMu.Lock()
+	t.pendingSession = waiter
+	t.sessionMu.Unlock()
+	defer func() {
+		t.sessionMu.Lock()
+		t.pendingSession = nil
+		t.sessionMu.Unlock()
+	}()
+
+	if err := t.SendBinary(ctx, frame); err != nil {
+		return nil, err
+	}
+	return t.awaitWaiter(ctx, waiter)
+}
+
+// SendBinaryCommand builds a binary TradingWsBinaryFrame via prepare while
+// holding the send lock, registers a correlation-keyed waiter, sends the frame,
+// and awaits the matching encrypted_push ack.
+func (t *Transport) SendBinaryCommand(ctx context.Context, corrID string, prepare func() ([]byte, error)) (Message, error) {
+	if corrID == "" {
+		return nil, errors.New("encrypted command requires correlation id")
+	}
+	waiter := make(chan Message, 1)
+
+	t.cmdLock.Lock()
+	payload, err := prepare()
+	if err != nil {
+		t.cmdLock.Unlock()
+		return nil, err
+	}
+	t.pendingMu.Lock()
+	t.byCorr[corrID] = waiter
+	t.pendingMu.Unlock()
+
+	cleanup := func() {
+		t.pendingMu.Lock()
+		delete(t.byCorr, corrID)
+		t.pendingMu.Unlock()
+	}
+
+	if err := t.SendBinary(ctx, payload); err != nil {
 		cleanup()
 		t.cmdLock.Unlock()
 		return nil, err
@@ -606,6 +678,13 @@ func (t *Transport) rejectPending(err error) {
 	t.byWireID = make(map[string]chan Message)
 	t.pendingMu.Unlock()
 
+	t.sessionMu.Lock()
+	if t.pendingSession != nil {
+		close(t.pendingSession)
+		t.pendingSession = nil
+	}
+	t.sessionMu.Unlock()
+
 	t.subMu.Lock()
 	if t.subWaiter != nil {
 		select {
@@ -635,7 +714,7 @@ func (t *Transport) recvLoop() {
 			return
 		}
 
-		_, raw, err := conn.Read(t.loopCtx)
+		typ, raw, err := conn.Read(t.loopCtx)
 		if err != nil {
 			return
 		}
@@ -644,11 +723,59 @@ func (t *Transport) recvLoop() {
 		t.lastInbound = time.Now()
 		t.livenessMu.Unlock()
 
+		if websocket.MessageType(typ) == websocket.MessageBinary {
+			t.dispatchBinary(raw)
+			continue
+		}
+
 		var msg Message
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			continue
 		}
 		t.dispatch(normalizeInboundMessage(msg))
+	}
+}
+
+func (t *Transport) dispatchBinary(raw []byte) {
+	decoded, err := wire.DecodeBinaryFrame(raw)
+	if err != nil {
+		return
+	}
+	switch decoded.Kind {
+	case wire.DecodedHpkeSetupReply:
+		reply := decoded.HpkeSetupReply
+		if reply == nil {
+			return
+		}
+		msg := Message{
+			"type":        "hpke_setup_reply",
+			"conn_id":     reply.GetConnId(),
+			"established": reply.GetEstablished(),
+		}
+		t.sessionMu.Lock()
+		ch := t.pendingSession
+		t.sessionMu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- msg:
+			default:
+			}
+			return
+		}
+		if t.handler.OnSessionEstablished != nil {
+			t.handler.OnSessionEstablished(msg)
+		}
+	case wire.DecodedEncryptedPush:
+		if decoded.EncryptedPush == nil {
+			return
+		}
+		msg := wire.EncryptedPushToMessage(decoded.EncryptedPush)
+		if msg == nil {
+			return
+		}
+		if t.handler.OnEncryptedPush != nil {
+			t.handler.OnEncryptedPush(msg)
+		}
 	}
 }
 
@@ -863,7 +990,7 @@ func normalizeInboundMessage(msg Message) Message {
 		}
 
 	case op == "session.setup" || op == "session_setup":
-		return Message{"type": "error", "message": "session.setup is not supported (Noise XK required)"}
+		return Message{"type": "error", "message": "session.setup is not supported (HPKE WebSocket required)"}
 
 	case op == "subscribe" || op == "unsubscribe":
 		if code != 0 {

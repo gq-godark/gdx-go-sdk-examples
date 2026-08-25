@@ -3,7 +3,6 @@ package godark
 import (
 	"context"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,11 +14,13 @@ import (
 
 	"github.com/google/uuid"
 
-	gdxcrypto "github.com/gq-godark/gdx-go-sdk/internal/crypto"
 	"github.com/gq-godark/gdx-go-sdk/internal/identity"
-	"github.com/gq-godark/gdx-go-sdk/internal/noise"
+	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
 	"github.com/gq-godark/gdx-go-sdk/internal/session"
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
+	"github.com/gq-godark/gdx-go-sdk/internal/wire"
+	edgepb "github.com/gq-godark/gdx-go-sdk/proto/gdx/edge/v1"
+	commonpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/common/v1"
 )
 
 // Default testnet WebSocket origin. The client appends `/ws/v1`.
@@ -32,30 +33,30 @@ const defaultEdgeBaseURL = "wss://api.godark-dex.com"
 // Default devnet WebSocket origin. The client appends `/ws/v1`.
 const defaultDevnetEdgeBaseURL = "ws://18.143.165.149:13300"
 
-// Sequencer Noise XK static public key for public testnet (64 hex).
-// This is a public pin, not a user secret.
-const testnetNoiseStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
+// Sequencer HPKE static public key for public testnet (64 hex).
+// HPKE pins are environment-specific; set explicitly for production testnet.
+const testnetHpkeStaticPublicKeyHex = ""
 
-// Sequencer Noise XK static public key for public devnet (64 hex).
-// This is a public pin, not a user secret.
-const devnetNoiseStaticPublicKeyHex = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
+// Sequencer HPKE static public key for public devnet (64 hex).
+const devnetHpkeStaticPublicKeyHex = ""
 
 // Environment names a deployment target. It selects the default edge URL and,
-// when known, a baked-in sequencer Noise XK public key pin.
+// when known, a baked-in sequencer HPKE public key pin.
 //
 // Explicit BaseURL / NoiseStaticPublicKeyHex and the corresponding
 // environment variables still win over these presets.
 type Environment string
 
 const (
-	// EnvironmentTestnet is the public testnet (default zero value). It bakes
-	// in the published Noise pin and wss://api.godark-dex.com.
+	// EnvironmentTestnet is the public testnet (default zero value). It uses
+	// the public testnet edge URL; set NoiseStaticPublicKeyHex or
+	// GDX_HPKE_STATIC_PUBLIC_KEY for encrypted trading.
 	EnvironmentTestnet Environment = "testnet"
 	// EnvironmentDevnet targets the public devnet edge
-	// (ws://18.143.165.149:13300) with its own published Noise pin.
+	// (ws://18.143.165.149:13300). Set HPKE static key via config or env.
 	EnvironmentDevnet Environment = "devnet"
-	// EnvironmentLocalnet targets ws://127.0.0.1:4000. No baked-in Noise pin —
-	// set NoiseStaticPublicKeyHex or GODARK_NOISE_STATIC_PUBLIC_KEY.
+	// EnvironmentLocalnet targets ws://127.0.0.1:4000. Set
+	// NoiseStaticPublicKeyHex or GODARK_HPKE_STATIC_PUBLIC_KEY.
 	EnvironmentLocalnet Environment = "localnet"
 )
 
@@ -71,14 +72,14 @@ func (e Environment) EdgeBaseURL() string {
 	}
 }
 
-// NoiseStaticPublicKeyHex returns the baked-in sequencer Noise XK static
+// NoiseStaticPublicKeyHex returns the baked-in sequencer HPKE static
 // public key (64 hex chars) when known for this environment; otherwise "".
 func (e Environment) NoiseStaticPublicKeyHex() string {
 	switch e.normalize() {
 	case EnvironmentTestnet:
-		return testnetNoiseStaticPublicKeyHex
+		return testnetHpkeStaticPublicKeyHex
 	case EnvironmentDevnet:
-		return devnetNoiseStaticPublicKeyHex
+		return devnetHpkeStaticPublicKeyHex
 	default:
 		return ""
 	}
@@ -128,9 +129,9 @@ type ClientConfig struct {
 	// GDX_USER_UUID env vars.
 	UserUUID string
 
-	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 static key.
-	// Preference: this field → GODARK_NOISE_STATIC_PUBLIC_KEY (then GDX_*) →
-	// baked-in pin from Environment (Testnet or Devnet, each with its own key).
+	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key.
+	// Preference: this field → GODARK_HPKE_STATIC_PUBLIC_KEY (then GDX_*,
+	// legacy GODARK_NOISE_*) → baked-in pin from Environment when set.
 	NoiseStaticPublicKeyHex string
 
 	// SymbolMap overrides the embedded default symbol map. Useful when
@@ -287,7 +288,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		symbolMap:               symbolMap,
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
-		noiseStaticKey:          resolveNoiseStaticPublicKey(cfg.NoiseStaticPublicKeyHex, cfg.Environment),
+	noiseStaticKey:          resolveHpkeStaticPublicKey(cfg.NoiseStaticPublicKeyHex, cfg.Environment),
 		session:                 &session.CryptoSession{},
 		pendingEncryptedByNonce: make(map[uint64]transport.Message),
 		orderQueue:              make(chan *OrderUpdate, bufSize),
@@ -354,7 +355,7 @@ func (c *GodarkClient) IsConnected() bool {
 // -----------------------------------------------------------------------
 
 // Connect opens the WebSocket, authenticates with the configured API key, and
-// completes the Noise XK handshake. After Connect returns nil, the client
+// completes the HPKE binary session setup. After Connect returns nil, the client
 // can issue trading commands.
 func (c *GodarkClient) Connect(ctx context.Context) error {
 	if err := c.transport.Connect(ctx); err != nil {
@@ -404,12 +405,12 @@ func (c *GodarkClient) Connect(ctx context.Context) error {
 	connID := coerceUint64(auth["conn_id"])
 	if connID == 0 {
 		_ = c.disconnectInternal()
-		return newAuthenticationError("auth response did not include a non-zero conn_id (required for Noise XK)")
+		return newAuthenticationError("auth response did not include a non-zero conn_id (required for HPKE)")
 	}
 	c.mu.Lock()
 	c.connID = connID
 	c.mu.Unlock()
-	if err := c.setupNoiseSession(ctx); err != nil {
+	if err := c.setupHpkeSession(ctx); err != nil {
 		_ = c.disconnectInternal()
 		return err
 	}
@@ -420,7 +421,7 @@ func (c *GodarkClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Disconnect closes the WebSocket and clears the Noise session. Safe to call
+// Disconnect closes the WebSocket and clears the HPKE session. Safe to call
 // from multiple goroutines.
 func (c *GodarkClient) Disconnect() error {
 	return c.disconnectInternal()
@@ -760,86 +761,30 @@ func (c *GodarkClient) OnDisconnect(cb func()) {
 // Internals
 // -----------------------------------------------------------------------
 
-func (c *GodarkClient) setupNoiseSession(ctx context.Context) error {
+func (c *GodarkClient) setupHpkeSession(ctx context.Context) error {
 	if c.noiseStaticKey == "" {
-		return newSessionError("Noise static public key unset — set NoiseStaticPublicKeyHex, GODARK_NOISE_STATIC_PUBLIC_KEY, or use EnvironmentTestnet/Devnet")
+		return newSessionError("HPKE static public key unset — set NoiseStaticPublicKeyHex, GDX_HPKE_STATIC_PUBLIC_KEY, or GODARK_HPKE_STATIC_PUBLIC_KEY")
 	}
-	remoteStatic, err := noise.ParsePinnedStaticPublicKeyHex(c.noiseStaticKey)
+	remoteStatic, err := hpke.ParsePinnedStaticPublicKey(c.noiseStaticKey)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
-	prologue, err := noise.PrologueForUser(c.userUUIDBytes())
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	initiator, err := noise.NewHandshakeInitiator(remoteStatic, prologue)
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	c.sessionMu.Lock()
-	c.sessionReady = make(chan transport.Message, 1)
-	ready := c.sessionReady
-	c.sessionMu.Unlock()
 
-	defer func() {
-		c.sessionMu.Lock()
-		c.sessionReady = nil
-		c.sessionMu.Unlock()
-	}()
+	encapped, err := c.session.Setup(remoteStatic, c.userUUIDBytes(), c.connID)
+	if err != nil {
+		return newSessionError(err.Error())
+	}
+	frame, err := wire.EncodeHpkeSetup(c.userUUIDBytes(), c.connID, encapped)
+	if err != nil {
+		return newSessionError(err.Error())
+	}
 
-	sendAndWait := func(message []byte, established bool) (transport.Message, error) {
-		payload := map[string]any{"id": uuid.NewString(), "op": "noise.handshake", "args": map[string]any{"message": base64.StdEncoding.EncodeToString(message)}}
-		if !c.transport.UseDocsWire() {
-			payload = map[string]any{"type": "noise_handshake", "data": map[string]any{"message": base64.StdEncoding.EncodeToString(message)}}
-		}
-		if err := c.transport.SendJSON(ctx, payload); err != nil {
-			return nil, err
-		}
-		timer := time.NewTimer(10 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, errors.New("Noise XK handshake timed out")
-		case msg := <-ready:
-			if msg["type"] == "error" {
-				return nil, errors.New(stringValue(msg["message"]))
-			}
-			if coerceUint64(msg["conn_id"]) != c.connID || msg["established"] != established {
-				return nil, errors.New("invalid Noise XK handshake reply")
-			}
-			return msg, nil
-		}
-	}
-	msg1, err := initiator.WriteMessage(nil)
+	reply, err := c.transport.SendHpkeSetup(ctx, frame)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
-	reply, err := sendAndWait(msg1, false)
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	msg2, err := base64.StdEncoding.DecodeString(stringValue(reply["message"]))
-	if err != nil {
-		return newSessionError(fmt.Sprintf("decode Noise reply: %v", err))
-	}
-	if _, err := initiator.ReadMessage(msg2); err != nil {
-		return newSessionError(fmt.Sprintf("read Noise reply: %v", err))
-	}
-	msg3, err := initiator.WriteMessage(nil)
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	if _, err := sendAndWait(msg3, true); err != nil {
-		return newSessionError(err.Error())
-	}
-	transportState, err := initiator.IntoTransport()
-	if err != nil {
-		return newSessionError(err.Error())
-	}
-	if err := c.session.Establish(transportState, c.connID); err != nil {
-		return newSessionError(err.Error())
+	if coerceUint64(reply["conn_id"]) != c.connID || reply["established"] != true {
+		return newSessionError("invalid HPKE setup reply")
 	}
 	return nil
 }
@@ -857,12 +802,10 @@ func (c *GodarkClient) handleSessionEstablished(msg transport.Message) {
 }
 
 func (c *GodarkClient) handleRekeyRequired(msg transport.Message) {
-	// Noise XK rekey re-runs the complete handshake. Failures are surfaced via OnError
-	// rather than the connection being torn down (caller can choose to
-	// reconnect manually).
+	// HPKE rekey re-runs the complete binary setup. Failures surface via OnError.
 	go func() {
 		c.session.Reset()
-		if err := c.setupNoiseSession(context.Background()); err != nil {
+		if err := c.setupHpkeSession(context.Background()); err != nil {
 			c.emitError(err)
 		}
 	}()
@@ -912,16 +855,19 @@ func (c *GodarkClient) sendEncryptedCommand(ctx context.Context, requestType str
 	return c.sendEncryptedCommandEx(ctx, requestType, symbolID, plaintext, correlationID, false, nil)
 }
 
-func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte, forceLegacy bool, headerLeverage *int) (transport.Message, error) {
-	bodyLength := uint32(len(plaintext) + 32 + gdxcrypto.GCMTagLen)
-	corrIDStr := hex.EncodeToString(correlationID)
+func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte, _forceLegacy bool, _headerLeverage *int) (transport.Message, error) {
+	bodyLength, err := session.BodyLengthForPlaintext(len(plaintext))
+	if err != nil {
+		return nil, newEncryptionError(err.Error())
+	}
+	corrKey := wire.CorrelationKeyFromBytes(correlationID)
+	if corrKey == "" {
+		return nil, newSessionError("encrypted command requires non-zero correlation_id")
+	}
 
-	// Nonce assignment + encryption run inside prepare so they stay atomic with
-	// the send: the transport holds its send lock for the duration, keeping
-	// concurrent commands in nonce order on the wire.
-	prepare := func() (any, error) {
+	resp, err := c.transport.SendBinaryCommand(ctx, corrKey, func() ([]byte, error) {
 		nonceCounter := c.session.NextNonce()
-		aad, err := BuildOrderHeaderAADWithConn(c.userUUIDBytes(), symbolID, requestType, uint64(nonceCounter), bodyLength, correlationID, c.connectionID())
+		aad, err := BuildOrderHeaderAADWithConn(c.userUUIDBytes(), symbolID, requestType, nonceCounter, bodyLength, correlationID, c.connectionID())
 		if err != nil {
 			return nil, err
 		}
@@ -929,39 +875,22 @@ func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType s
 		if err != nil {
 			return nil, newEncryptionError(fmt.Sprintf("encrypt order: %v", err))
 		}
-		bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
-		headerObj := map[string]any{
-			"symbol_id":      symbolID,
-			"request_type":   requestType,
-			"nonce":          actualNonce,
-			"body_length":    bodyLength,
-			"correlation_id": corrIDStr,
+		rt, ok := requestTypeToProto[requestType]
+		if !ok {
+			return nil, fmt.Errorf("unknown request_type %q", requestType)
 		}
-		if headerLeverage != nil {
-			headerObj["leverage"] = *headerLeverage
+		header := &edgepb.OrderHeader{
+			UserUuid:      c.userUUIDBytes(),
+			SymbolId:      symbolID,
+			RequestType:   commonpb.RequestType(rt),
+			Nonce:         actualNonce,
+			BodyLength:    bodyLength,
+			CorrelationId: correlationID,
+			ConnId:        c.connectionID(),
 		}
-		if c.transport.UseDocsWire() && !forceLegacy {
-			opMap := map[string]string{
-				"place":        "order.place",
-				"cancel":       "order.cancel",
-				"modify":       "order.modify",
-				"mass_quote":   "order.mass_quote",
-				"batch_cancel": "order.batch_cancel",
-				"batch_modify": "order.batch_modify",
-			}
-			return map[string]any{
-				"id":   uuid.NewString(),
-				"op":   opMap[requestType],
-				"args": map[string]any{"header": headerObj, "ciphertext": bodyB64},
-			}, nil
-		}
-		return map[string]any{
-			"type": "encrypted_order",
-			"data": map[string]any{"header": headerObj, "encrypted_body": bodyB64},
-		}, nil
-	}
-
-	resp, err := c.transport.SendCommandFunc(ctx, prepare)
+		req := wire.EncryptedOrderRequest(header, ciphertext)
+		return wire.EncodeEncryptedOrder(req)
+	})
 	if err != nil {
 		var to *TimeoutError
 		if errors.As(err, &to) {
@@ -1032,7 +961,7 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	if err != nil {
 		return nil, newEncryptionError(fmt.Sprintf("decode ack body: %v", err))
 	}
-	nonce := coerceUint32(msg["nonce"])
+	nonce := coerceUint64(msg["nonce"])
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 	if messageType == "" {
@@ -1040,7 +969,7 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1099,14 +1028,14 @@ func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMes
 	if err != nil {
 		return nil, newEncryptionError(fmt.Sprintf("decode ack body: %v", err))
 	}
-	nonce := coerceUint32(msg["nonce"])
+	nonce := coerceUint64(msg["nonce"])
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 	if messageType == "" {
 		messageType = defaultMessageType
 	}
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1259,58 +1188,24 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 }
 
 func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
-	if !session.StampedNoncePush() {
-		// Legacy path: pushes are keyed by the sequential Noise receive counter,
-		// so deliver strictly in nonce order and buffer any that arrive early.
-		nonce := uint64(coerceUint32(msg["nonce"]))
-		expected := c.session.RecvNonce()
-		if nonce > expected {
-			c.pendingMu.Lock()
-			c.pendingEncryptedByNonce[nonce] = msg
-			c.pendingMu.Unlock()
-			return
-		}
-		if nonce < expected {
-			return
-		}
-	}
-	// Stamped-nonce mode: decrypt each frame in arrival order at its own stamped
-	// nonce; relayed gaps are tolerated, so no reorder buffer is needed.
-	c.dispatchEncryptedPushInOrder(msg)
-	c.flushPendingEncrypted()
+	c.dispatchEncryptedPush(msg)
 }
 
-func (c *GodarkClient) flushPendingEncrypted() {
-	for {
-		expected := c.session.RecvNonce()
-		c.pendingMu.Lock()
-		msg, ok := c.pendingEncryptedByNonce[expected]
-		if ok {
-			delete(c.pendingEncryptedByNonce, expected)
-		}
-		c.pendingMu.Unlock()
-		if !ok {
-			return
-		}
-		c.dispatchEncryptedPushInOrder(msg)
-	}
-}
-
-func (c *GodarkClient) dispatchEncryptedPushInOrder(msg transport.Message) {
+func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
 	if err != nil {
 		c.emitError(newEncryptionError(fmt.Sprintf("decode push body: %v", err)))
 		return
 	}
-	nonce := coerceUint32(msg["nonce"])
+	nonce := coerceUint64(msg["nonce"])
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 
 	switch messageType {
 	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack":
 		aad, err := BuildResponseHeaderAADWithConn(
-			c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+			c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 		)
 		if err != nil {
@@ -1333,7 +1228,7 @@ func (c *GodarkClient) dispatchEncryptedPushInOrder(msg transport.Message) {
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1556,7 +1451,7 @@ func (c *GodarkClient) ensureReady() error {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
-		return newSessionError("Noise XK session not established")
+		return newSessionError("HPKE session not established")
 	}
 	return nil
 }
@@ -1658,11 +1553,19 @@ func resolveUserUUID(explicit string) string {
 	return ""
 }
 
-func resolveNoiseStaticPublicKey(explicit string, env Environment) string {
+func resolveHpkeStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
-	for _, key := range []string{"GODARK_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBLIC_KEY", "GDX_NOISE_STATIC_PUBKEY"} {
+	for _, key := range []string{
+		"GDX_HPKE_STATIC_PUBLIC_KEY",
+		"GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_HPKE_STATIC_PUBLIC_KEY",
+		"VITE_GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBKEY",
+	} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
