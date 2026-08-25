@@ -4,7 +4,6 @@ package wire
 import (
 	"encoding/base64"
 	"encoding/hex"
-	"fmt"
 
 	"google.golang.org/protobuf/proto"
 
@@ -92,7 +91,7 @@ func EncodeEncryptedPush(resp *edgepb.EncryptedEdgeResponse) ([]byte, error) {
 func DecodeBinaryFrame(bytes []byte) (*DecodedBinary, error) {
 	frame := &edgepb.TradingWsBinaryFrame{}
 	if err := proto.Unmarshal(bytes, frame); err != nil {
-		return nil, fmt.Errorf("binary frame: %w", err)
+		return &DecodedBinary{Kind: DecodedIgnored}, nil
 	}
 	switch body := frame.Body.(type) {
 	case *edgepb.TradingWsBinaryFrame_EncryptedPush:

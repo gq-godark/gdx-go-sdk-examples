@@ -274,9 +274,9 @@ const maxBatchLegs = 20
 // BuildMassQuoteRequest serializes a MassQuoteInput (bulk cancel-replace)
 // wrapped in EdgeSequencerRequest. Each leg becomes its own order and carries a
 // unique 16-byte correlation id (the wire requires exactly 16 bytes per leg).
-// postOnly is the batch-level post-only flag: when non-nil and false, a crossing
-// leg takes liquidity up to its limit and rests the remainder instead of being
-// rejected. A nil pointer omits the field on the wire (node defaults to post-only).
+// postOnly is the batch-level post-only flag: nil defaults to true on the wire;
+// false enables the relaxed path where a crossing leg takes liquidity up to its
+// limit and rests the remainder instead of being rejected.
 func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("mass quote requires at least one leg")
@@ -318,12 +318,16 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		}
 		pbLegs = append(pbLegs, pbLeg)
 	}
+	postOnlyVal := true
+	if postOnly != nil {
+		postOnlyVal = *postOnly
+	}
 	mq := &sequencerpb.MassQuoteInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
 		UserUuid:      userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		PostOnly:      postOnly,
+		PostOnly:      &postOnlyVal,
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_MassQuote{MassQuote: mq},
@@ -491,7 +495,7 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 			}
 		}
 	} else {
-		out.Success = true
+		out.Success = false
 	}
 	return out, true, nil
 }

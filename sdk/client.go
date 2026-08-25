@@ -781,10 +781,21 @@ func (c *GodarkClient) setupHpkeSession(ctx context.Context) error {
 
 	reply, err := c.transport.SendHpkeSetup(ctx, frame)
 	if err != nil {
+		c.session.AbortSetup()
 		return newSessionError(err.Error())
 	}
-	if coerceUint64(reply["conn_id"]) != c.connID || reply["established"] != true {
-		return newSessionError("invalid HPKE setup reply")
+	replyConnID := coerceUint64(reply["conn_id"])
+	if replyConnID != c.connID {
+		c.session.AbortSetup()
+		return newSessionError(fmt.Sprintf("HPKE setup conn_id mismatch: expected %d, got %d", c.connID, replyConnID))
+	}
+	if reply["established"] != true {
+		c.session.AbortSetup()
+		return newSessionError("HPKE setup not established")
+	}
+	if err := c.session.Establish(); err != nil {
+		c.session.AbortSetup()
+		return newSessionError(err.Error())
 	}
 	return nil
 }
@@ -1182,6 +1193,17 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 		return nil, err
 	}
 	if !ok {
+		na, isAck, err := ParseNodeResponseAck(pt)
+		if err != nil {
+			return nil, err
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, newOrderError(na.RejectText, code)
+		}
 		return nil, newOrderError("expected batch_modify_ack inside encrypted push", "")
 	}
 	return ack, nil

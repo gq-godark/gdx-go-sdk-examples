@@ -3,6 +3,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
@@ -18,11 +19,14 @@ const GCMTagLen = hpke.TagLen
 //
 // All methods are safe to call from multiple goroutines.
 type CryptoSession struct {
-	mu          sync.Mutex
-	sealed      *hpke.SealedSession
-	connID      uint64
-	established bool
-	sendCounter uint64
+	mu              sync.Mutex
+	sealed          *hpke.SealedSession
+	pendingSealed   *hpke.SealedSession
+	pendingConnID   uint64
+	connID          uint64
+	established     bool
+	sendCounter     uint64
+	seenRecvNonces  map[uint64]struct{}
 }
 
 // IsEstablished reports whether the HPKE session has completed setup.
@@ -64,7 +68,8 @@ func BodyLengthForPlaintext(plaintextLen int) (uint32, error) {
 }
 
 // Setup performs HPKE Base setup against the pinned sequencer public key.
-// Returns the encapped key bytes to send in HpkeSetup.
+// Returns the encapped key bytes to send in HpkeSetup. The session is not
+// established until Establish confirms the peer reply.
 func (s *CryptoSession) Setup(recipientPublic, userUUID []byte, connID uint64) ([]byte, error) {
 	if connID == 0 {
 		return nil, errors.New("HPKE conn_id must be non-zero")
@@ -81,12 +86,35 @@ func (s *CryptoSession) Setup(recipientPublic, userUUID []byte, connID uint64) (
 		return nil, err
 	}
 	s.mu.Lock()
-	s.sealed = sealed
-	s.connID = connID
-	s.established = true
-	s.sendCounter = 1
+	s.pendingSealed = sealed
+	s.pendingConnID = connID
 	s.mu.Unlock()
 	return enc, nil
+}
+
+// Establish commits a pending HPKE setup after the sequencer confirms.
+func (s *CryptoSession) Establish() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingSealed == nil {
+		return errors.New("HPKE setup not pending peer confirmation")
+	}
+	s.sealed = s.pendingSealed
+	s.connID = s.pendingConnID
+	s.pendingSealed = nil
+	s.pendingConnID = 0
+	s.established = true
+	s.sendCounter = 1
+	s.seenRecvNonces = make(map[uint64]struct{})
+	return nil
+}
+
+// AbortSetup discards a pending HPKE setup (timeout, rejection, or mismatch).
+func (s *CryptoSession) AbortSetup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingSealed = nil
+	s.pendingConnID = 0
 }
 
 // GenerateKeypair is retained so older REST call sites fail explicitly.
@@ -127,11 +155,26 @@ func (s *CryptoSession) DecryptPush(nonce uint64, aad, ciphertext []byte) ([]byt
 		s.mu.Unlock()
 		return nil, ErrNotEstablished
 	}
+	if _, seen := s.seenRecvNonces[nonce]; seen {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("replay detected: push nonce %d already seen", nonce)
+	}
 	sealed := s.sealed
 	s.mu.Unlock()
 
 	nonceBytes := hpke.NonceFromU64(nonce)
-	return sealed.OpenS2C(nonceBytes[:], aad, ciphertext)
+	pt, err := sealed.OpenS2C(nonceBytes[:], aad, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.seenRecvNonces == nil {
+		s.seenRecvNonces = make(map[uint64]struct{})
+	}
+	s.seenRecvNonces[nonce] = struct{}{}
+	s.mu.Unlock()
+	return pt, nil
 }
 
 // Reset clears all session state. Call between reconnects or on rekey.
@@ -139,7 +182,10 @@ func (s *CryptoSession) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sealed = nil
+	s.pendingSealed = nil
+	s.pendingConnID = 0
 	s.connID = 0
 	s.established = false
 	s.sendCounter = 1
+	s.seenRecvNonces = nil
 }

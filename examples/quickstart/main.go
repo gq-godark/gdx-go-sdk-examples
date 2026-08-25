@@ -44,21 +44,29 @@ func liveMarkPrice() float64 {
 func main() {
 	envloader.LoadDotenv()
 
-	apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
-	apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
-	passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+	legacyKey := envloader.First("GODARK_API_KEY", "GDX_API_KEY")
 	baseURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")
-	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
-		log.Fatal("Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE in .env or your environment")
+
+	cfg := godark.ClientConfig{
+		Environment: godark.EnvironmentTestnet,
+		BaseURL:     baseURL,
+	}
+	if legacyKey != "" {
+		cfg.APIKey = legacyKey
+		cfg.UserUUID = envloader.First("GODARK_USER_UUID", "GDX_USER_UUID")
+	} else {
+		apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
+		apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
+		passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+		if apiKeyID == "" || apiSecret == "" || passphrase == "" {
+			log.Fatal("Set GODARK_API_KEY_ID/GODARK_API_SECRET/GODARK_PASSPHRASE or legacy GODARK_API_KEY")
+		}
+		cfg.APIKeyID = apiKeyID
+		cfg.APISecret = apiSecret
+		cfg.Passphrase = passphrase
 	}
 
-	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:    apiKeyID,
-		APISecret:   apiSecret,
-		Passphrase:  passphrase,
-		Environment: godark.EnvironmentTestnet,
-		BaseURL:     baseURL, // empty => Testnet preset
-	})
+	client, err := godark.NewClient(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
