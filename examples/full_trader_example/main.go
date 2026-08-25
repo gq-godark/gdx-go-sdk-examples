@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -33,6 +34,15 @@ import (
 )
 
 const symbol = "BTC-USDC-PERP"
+
+func liveMarkPrice() float64 {
+	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f
+		}
+	}
+	return 79000.0
+}
 
 // btcSymbolID is BTC-USDC-PERP's numeric symbol id in position snapshots.
 const btcSymbolID = 1
@@ -111,18 +121,19 @@ func main() {
 	fmt.Println("Setting leverage to 1 via UpdateLeverage...")
 	if levAck, levErr := client.UpdateLeverage(ctx, symbol, 1); levErr != nil {
 		envloader.PrintOrderError("UpdateLeverage rejected", levErr)
-		os.Exit(1)
 	} else {
 		fmt.Printf("UpdateLeverage: success=%v  order_id=%s\n", levAck.Success, levAck.OrderID)
 	}
 
 	// Place a limit BUY.
-	fmt.Println("Placing limit BUY @ 67500...")
+	mark := liveMarkPrice()
+	buyPx := math.Round(mark*0.997*10) / 10
+	fmt.Printf("Placing limit BUY @ %.1f (mark=%.1f)...\n", buyPx, mark)
 	buyAck, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideBuy,
 		OrderType: godark.OrderTypeLimit,
-		Price:     67_500,
+		Price:     buyPx,
 		Quantity:  0.1,
 	})
 	if err != nil {
@@ -135,8 +146,9 @@ func main() {
 	drainOrderUpdates(client, "after BUY")
 
 	// Modify the BUY price.
-	fmt.Println("Modifying order price to 68000...")
-	newPrice := 68_000.0
+	modifyPx := math.Round(mark*0.996*10) / 10
+	fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
+	newPrice := modifyPx
 	if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil); mErr != nil {
 		envloader.PrintOrderError("Modify rejected", mErr)
 	} else {
@@ -147,12 +159,13 @@ func main() {
 	drainOrderUpdates(client, "after MODIFY")
 
 	// Place + immediately cancel a SELL.
-	fmt.Println("Placing limit SELL @ 95000...")
+	sellPx := math.Round(mark*1.03*10) / 10
+	fmt.Printf("Placing limit SELL @ %.1f...\n", sellPx)
 	if sellAck, sErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
-		Price:     95_000,
+		Price:     sellPx,
 		Quantity:  0.05,
 	}); sErr != nil {
 		envloader.PrintOrderError("SELL rejected", sErr)
@@ -409,7 +422,7 @@ func drainBalances(c *godark.GodarkClient) int {
 		select {
 		case b := <-ch:
 			count++
-			fmt.Printf("BAL    shielded_raw=%d\n", b.ShieldedBalanceRaw)
+			fmt.Printf("BAL    balance_raw=%d\n", b.BalanceRaw)
 		default:
 			return count
 		}
