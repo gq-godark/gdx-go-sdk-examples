@@ -15,14 +15,7 @@ import (
 const (
 	// UserUUIDLen is the wire size of a `bytes user_uuid` field (RFC 4122).
 	UserUUIDLen = 16
-	// UserCommitmentLen is the wire size of a `bytes user_commitment` field.
-	UserCommitmentLen = 32
 )
-
-// PlaceholderUserCommitment matches gdx-web's PLACEHOLDER_USER_COMMITMENT.
-// The SDK never computes the real commitment; the edge fills it on the way to
-// the sequencer.
-var PlaceholderUserCommitment = make([]byte, UserCommitmentLen)
 
 // ErrInvalidUserUUIDLen is returned when a wire-decoded UUID is the wrong length.
 var ErrInvalidUserUUIDLen = errors.New("user_uuid must be 16 bytes")

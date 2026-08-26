@@ -1,7 +1,7 @@
 // GoDark Go SDK — minimal GodarkRestClient demo.
 //
 // Auth + account reads + public market-data GETs. Encrypted place/cancel/
-// modify/update-leverage require GodarkClient (WebSocket / Noise XK); see
+// modify/update-leverage require GodarkClient (WebSocket / HPKE); see
 // quickstart and full_trader_example.
 //
 //	go run ./examples/rest_client_example
@@ -71,20 +71,22 @@ func main() {
 
 	me, err := client.GetMe(ctx)
 	if err != nil {
-		log.Fatalf("GetMe: %v", err)
+		fmt.Printf("GetMe skipped: %v\n", err)
+	} else {
+		fmt.Printf("me: id=%s wallet=%s tier=%s\n", me.ID, me.WalletAddress, me.Tier)
 	}
-	fmt.Printf("me: id=%s wallet=%s tier=%s\n", me.ID, me.WalletAddress, me.Tier)
 
 	lev, err := client.GetLeverage(ctx)
 	if err != nil {
-		log.Fatalf("GetLeverage: %v", err)
-	}
-	fmt.Printf("leverage settings: %d entries\n", len(lev.Settings))
-	for i, row := range lev.Settings {
-		if i >= 5 {
-			break
+		fmt.Printf("GetLeverage skipped: %v\n", err)
+	} else {
+		fmt.Printf("leverage settings: %d entries\n", len(lev.Settings))
+		for i, row := range lev.Settings {
+			if i >= 5 {
+				break
+			}
+			fmt.Printf("  symbol_id=%d leverage=%d\n", row.SymbolID, row.Leverage)
 		}
-		fmt.Printf("  symbol_id=%d leverage=%d\n", row.SymbolID, row.Leverage)
 	}
 
 	if bal, err := client.GetMyBalance(ctx); err != nil {
@@ -95,7 +97,7 @@ func main() {
 	}
 
 	fmt.Println("REST reads succeeded.")
-	fmt.Println("Encrypted trading requires GodarkClient over WebSocket (Noise XK).")
+	fmt.Println("Encrypted trading requires GodarkClient over WebSocket (HPKE).")
 }
 
 func firstOrNil(rows []map[string]any) any {

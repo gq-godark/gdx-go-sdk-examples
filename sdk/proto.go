@@ -8,8 +8,10 @@ package godark
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -85,7 +87,7 @@ func correlationIDFromWire(v any) []byte {
 	var text string
 	switch value := v.(type) {
 	case string:
-		text = value
+		text = strings.TrimSpace(value)
 	case float64:
 		text = fmt.Sprintf("%.0f", value)
 	case uint64:
@@ -97,6 +99,14 @@ func correlationIDFromWire(v any) []byte {
 		text = fmt.Sprintf("%d", value)
 	default:
 		return nil
+	}
+	if text == "" {
+		return nil
+	}
+	if len(text) == 32 {
+		if b, err := hex.DecodeString(text); err == nil && len(b) == 16 {
+			return b
+		}
 	}
 	n, ok := new(big.Int).SetString(text, 10)
 	if !ok || n.Sign() <= 0 || n.BitLen() > 128 {
@@ -144,7 +154,7 @@ func BuildPlaceOrderRequest(
 	minFillSize *float64,
 	expiryTime *uint64,
 	correlationID []byte,
-	timestamp uint64,
+	_ uint64,
 ) ([]byte, error) {
 	sideInt, ok := sideToProto[side]
 	if !ok {
@@ -158,17 +168,18 @@ func BuildPlaceOrderRequest(
 	if !ok {
 		return nil, fmt.Errorf("unknown time in force: %q", timeInForce)
 	}
+	if aon && minFillSize == nil {
+		q := quantity
+		minFillSize = &q
+	}
 
 	place := &sequencerpb.PlaceOrderInput{
-		SymbolId:       symbolID,
-		Side:           commonpb.Side(sideInt),
-		OrderType:      commonpb.OrderType(otypeInt),
-		Quantity:       quantity,
-		UserCommitment: nil,
-		TimeInForce:    commonpb.TimeInForce(tifInt),
-		Aon:            aon,
-		Timestamp:      timestamp,
-		UserUuid:       userUUID,
+		SymbolId:    symbolID,
+		Side:        commonpb.Side(sideInt),
+		OrderType:   commonpb.OrderType(otypeInt),
+		Quantity:    quantity,
+		TimeInForce: commonpb.TimeInForce(tifInt),
+		UserUuid:    userUUID,
 	}
 	if price != nil {
 		place.Price = price
@@ -189,13 +200,13 @@ func BuildPlaceOrderRequest(
 	return proto.Marshal(req)
 }
 
-// BuildCancelOrderRequest serializes a CancelMessage wrapped in EdgeSequencerRequest.
+// BuildCancelOrderRequest serializes a CancelOrderInput wrapped in EdgeSequencerRequest.
 func BuildCancelOrderRequest(orderID uint64, userUUID []byte, symbolID uint64, correlationID []byte) ([]byte, error) {
-	cancel := &sequencerpb.CancelMessage{
-		OrderId:        orderID,
-		UserCommitment: make([]byte, 32),
-		SymbolId:       symbolID,
-		CorrelationId:  correlationIDBodyBytes(correlationID),
+	cancel := &sequencerpb.CancelOrderInput{
+		OrderId:       orderID,
+		SymbolId:      symbolID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+		UserUuid:      userUUID,
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Cancel{Cancel: cancel},
@@ -232,11 +243,10 @@ func BuildModifyOrderRequest(
 	correlationID []byte,
 ) ([]byte, error) {
 	modify := &sequencerpb.ModifyOrderInput{
-		OrderId:        orderID,
-		UserCommitment: nil,
-		SymbolId:       symbolID,
-		CorrelationId:  correlationIDBodyBytes(correlationID),
-		UserUuid:       userUUID,
+		OrderId:       orderID,
+		SymbolId:      symbolID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+		UserUuid:      userUUID,
 	}
 	if newPrice != nil {
 		modify.NewPrice = newPrice
@@ -264,9 +274,9 @@ const maxBatchLegs = 20
 // BuildMassQuoteRequest serializes a MassQuoteInput (bulk cancel-replace)
 // wrapped in EdgeSequencerRequest. Each leg becomes its own order and carries a
 // unique 16-byte correlation id (the wire requires exactly 16 bytes per leg).
-// postOnly is the batch-level post-only flag: when non-nil and false, a crossing
-// leg takes liquidity up to its limit and rests the remainder instead of being
-// rejected. A nil pointer omits the field on the wire (node defaults to post-only).
+// postOnly is the batch-level post-only flag: nil defaults to true on the wire;
+// false enables the relaxed path where a crossing leg takes liquidity up to its
+// limit and rests the remainder instead of being rejected.
 func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("mass quote requires at least one leg")
@@ -308,12 +318,16 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		}
 		pbLegs = append(pbLegs, pbLeg)
 	}
+	postOnlyVal := true
+	if postOnly != nil {
+		postOnlyVal = *postOnly
+	}
 	mq := &sequencerpb.MassQuoteInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
 		UserUuid:      userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		PostOnly:      postOnly,
+		PostOnly:      &postOnlyVal,
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_MassQuote{MassQuote: mq},
@@ -438,7 +452,6 @@ func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLen
 // Fill / Signing variants are intentionally not parsed in the trading path -
 // the WS client only consumes acks here.
 type NodeAck struct {
-	NodeID    uint64
 	Sequence  uint64
 	OrderID   uint64
 	Success   bool
@@ -447,7 +460,6 @@ type NodeAck struct {
 	RejectText    string
 	CorrelationID []byte
 	OrderStatus   *OrderStatus
-	NodeHealth    *uint32
 }
 
 // ParseNodeResponseAck decodes a NodeResponse and returns its AckMessage
@@ -464,20 +476,26 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 	}
 	ack := inner.Ack
 	out := &NodeAck{
-		NodeID:        ack.NodeId,
 		Sequence:      ack.Sequence,
 		OrderID:       ack.OrderId,
-		Success:       ack.Success,
-		ErrorCode:     ack.ErrorCode,
 		RejectText:    ack.GetRejectText(),
 		CorrelationID: ack.CorrelationId,
-		NodeHealth:    ack.NodeHealth,
 	}
-	if ack.OrderStatus != nil {
-		if s, ok := orderStatusEnumFromProto(int32(*ack.OrderStatus)); ok {
-			sCopy := s
-			out.OrderStatus = &sCopy
+	if outcome := ack.GetAckOutcome(); outcome != nil {
+		out.Success = outcome.GetKind() == sequencerpb.AckOutcomeKind_ACK_OUTCOME_KIND_APPLIED
+		if code := outcome.GetBusinessErrorCode(); code != 0 {
+			out.ErrorCode = &code
+		} else if code := outcome.GetSystemErrorCode(); code != 0 {
+			out.ErrorCode = &code
 		}
+		if outcome.OrderStatus != nil {
+			if s, ok := orderStatusEnumFromProto(int32(*outcome.OrderStatus)); ok {
+				sCopy := s
+				out.OrderStatus = &sCopy
+			}
+		}
+	} else {
+		out.Success = false
 	}
 	return out, true, nil
 }
@@ -691,35 +709,6 @@ func ParseOrderUpdate(data []byte) (*OrderUpdate, error) {
 	return out, nil
 }
 
-// ParsePositionUpdate decodes a PositionUpdateMessage into PositionUpdate.
-func ParsePositionUpdate(data []byte) (*PositionUpdate, error) {
-	var msg sequencerpb.PositionUpdateMessage
-	if err := proto.Unmarshal(data, &msg); err != nil {
-		return nil, err
-	}
-	side, _ := sideEnumFromProto(int32(msg.Side))
-	if side == "" {
-		side = SideBuy
-	}
-	ut, _ := positionUpdateTypeEnumFromProto(int32(msg.UpdateType))
-	if ut == "" {
-		ut = PositionUpdateTypeSnapshot
-	}
-	return &PositionUpdate{
-		UserUUID:      uuidBytesToString(msg.UserUuid),
-		SymbolID:      int64(msg.SymbolId),
-		Side:          side,
-		UpdateType:    ut,
-		Size:          msg.Size,
-		EntryPrice:    msg.EntryPrice,
-		PreviousSize:  msg.PreviousSize,
-		FillPrice:     stringOr(msg.FillPrice, ""),
-		FillQty:       stringOr(msg.FillQty, ""),
-		CorrelationID: correlationIDToUint64(msg.CorrelationId),
-		Timestamp:     msg.Timestamp,
-	}, nil
-}
-
 func parsePositionsSnapshotSource(v commonpb.PositionsSnapshotSource) PositionsSnapshotSource {
 	switch v {
 	case commonpb.PositionsSnapshotSource_POSITIONS_SNAPSHOT_SOURCE_INITIAL:
@@ -730,18 +719,6 @@ func parsePositionsSnapshotSource(v commonpb.PositionsSnapshotSource) PositionsS
 		return PositionsSnapshotSourceEvent
 	}
 	return PositionsSnapshotSourceUnspecified
-}
-
-func parseSettlementBatchStatus(v sequencerpb.SettlementBatchStatus) SettlementBatchStatus {
-	switch v {
-	case sequencerpb.SettlementBatchStatus_SETTLEMENT_BATCH_STATUS_SUBMITTED:
-		return SettlementBatchStatusSubmitted
-	case sequencerpb.SettlementBatchStatus_SETTLEMENT_BATCH_STATUS_CONFIRMED:
-		return SettlementBatchStatusConfirmed
-	case sequencerpb.SettlementBatchStatus_SETTLEMENT_BATCH_STATUS_FAILED:
-		return SettlementBatchStatusFailed
-	}
-	return SettlementBatchStatusUnspecified
 }
 
 func parsePositionRow(row *sequencerpb.PositionRow) PositionRow {
@@ -828,12 +805,6 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 			return nil, err
 		}
 		return ParseOrderUpdate(b)
-	case *sequencerpb.SequencerToEdgeMessage_PositionUpdate:
-		b, err := proto.Marshal(inner.PositionUpdate)
-		if err != nil {
-			return nil, err
-		}
-		return ParsePositionUpdate(b)
 	case *sequencerpb.SequencerToEdgeMessage_PositionsSnapshot:
 		return ParsePositionsSnapshot(inner.PositionsSnapshot), nil
 	case *sequencerpb.SequencerToEdgeMessage_HealthReport:
@@ -847,19 +818,6 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 			Sequence:       h.Sequence,
 			SchemaVersion:  h.SchemaVersion,
 		}, nil
-	case *sequencerpb.SequencerToEdgeMessage_SettlementUpdate:
-		s := inner.SettlementUpdate
-		affected := make([]string, len(s.AffectedUserUuids))
-		for i, raw := range s.AffectedUserUuids {
-			affected[i] = uuidBytesToString(raw)
-		}
-		return &SettlementUpdate{
-			BatchID:           s.BatchId,
-			Status:            parseSettlementBatchStatus(s.Status),
-			TxSignature:       s.TxSignature,
-			Timestamp:         s.Timestamp,
-			AffectedUserUUIDs: affected,
-		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_FundingRateUpdate:
 		f := inner.FundingRateUpdate
 		return &FundingRateUpdate{
@@ -872,15 +830,18 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
 		b := inner.BalanceUpdate
 		return &BalanceUpdate{
-			UserUUID:           uuidBytesToString(b.UserUuid),
-			ShieldedBalanceRaw: b.ShieldedBalanceRaw,
-			Timestamp:          b.Timestamp,
+			UserUUID:          uuidBytesToString(b.UserUuid),
+			BalanceRaw:        b.BalanceRaw,
+			Timestamp:         b.Timestamp,
+			Balance:           b.Balance,
+			SignedBalance8dp:  b.SignedBalance_8Dp,
+			FreeCollateral8dp: b.FreeCollateral_8Dp,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_LeverageSettings:
 		return ParseLeverageSettings(inner.LeverageSettings), nil
 	default:
-		// New variants (OrderHistoryInsert, OpenInterestUpdate, VolumeUpdate,
-		// future additions) fall through here.
+		// New variants (OrderHistoryInsert, OpenInterestUpdate,
+		// BalanceAndPosition, future additions) fall through here.
 		return &UnknownSequencerPush{OneofField: fmt.Sprintf("%T", msg.Inner)}, nil
 	}
 }

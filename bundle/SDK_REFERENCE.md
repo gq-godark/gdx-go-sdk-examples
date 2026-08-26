@@ -56,7 +56,7 @@ Lifecycle:
 
 ```go
 ctx := context.Background()
-if err := client.Connect(ctx); err != nil { ... }   // login + Noise XK handshake
+if err := client.Connect(ctx); err != nil { ... }   // login + HPKE setup handshake
 defer client.Disconnect()
 
 uid := client.UserUUID()
@@ -65,7 +65,7 @@ uid := client.UserUUID()
 > **Encrypted REST trading is not supported.** Earlier builds shipped a
 > `GodarkRestClient` that placed orders over HTTP; that path is retired.
 > All order flow — place / modify / cancel / mass-quote — now runs over the
-> Noise XK WebSocket `GodarkClient` shown above. The examples in this bundle
+> HPKE WebSocket `GodarkClient` shown above. The examples in this bundle
 > trade exclusively over the WebSocket client.
 
 ### Public market-data feed -- `MarketDataClient`
@@ -161,7 +161,7 @@ if errors.As(err, &oe) {
 Other typed errors you may see:
 
   - `*godark.AuthenticationError` -- login failed (bad API key, expired token)
-  - `*godark.SessionError`        -- Noise XK handshake or rekey failed
+  - `*godark.SessionError`        -- HPKE setup handshake or rekey failed
   - `*godark.ConnectionError`     -- WS or HTTP layer failure
   - `*godark.EncryptionError`     -- crypto path returned an error
   - `*godark.TimeoutError`        -- command exceeded its timeout

@@ -21,7 +21,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
@@ -30,24 +32,41 @@ import (
 
 const symbol = "BTC-USDC-PERP"
 
+func liveMarkPrice() float64 {
+	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f
+		}
+	}
+	return 79000.0
+}
+
 func main() {
 	envloader.LoadDotenv()
 
-	apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
-	apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
-	passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+	legacyKey := envloader.First("GODARK_API_KEY", "GDX_API_KEY")
 	baseURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")
-	if apiKeyID == "" || apiSecret == "" || passphrase == "" {
-		log.Fatal("Set GODARK_API_KEY_ID, GODARK_API_SECRET and GODARK_PASSPHRASE in .env or your environment")
+
+	cfg := godark.ClientConfig{
+		Environment: godark.EnvironmentTestnet,
+		BaseURL:     baseURL,
+	}
+	if legacyKey != "" {
+		cfg.APIKey = legacyKey
+		cfg.UserUUID = envloader.First("GODARK_USER_UUID", "GDX_USER_UUID")
+	} else {
+		apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
+		apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
+		passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+		if apiKeyID == "" || apiSecret == "" || passphrase == "" {
+			log.Fatal("Set GODARK_API_KEY_ID/GODARK_API_SECRET/GODARK_PASSPHRASE or legacy GODARK_API_KEY")
+		}
+		cfg.APIKeyID = apiKeyID
+		cfg.APISecret = apiSecret
+		cfg.Passphrase = passphrase
 	}
 
-	client, err := godark.NewClient(godark.ClientConfig{
-		APIKeyID:    apiKeyID,
-		APISecret:   apiSecret,
-		Passphrase:  passphrase,
-		Environment: godark.EnvironmentTestnet,
-		BaseURL:     baseURL, // empty => Testnet preset
-	})
+	client, err := godark.NewClient(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,11 +86,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	mark := liveMarkPrice()
+	sellPx := math.Round(mark*1.03*10) / 10
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
-		Price:     69515.2,
+		Price:     sellPx,
 		Quantity:  0.01,
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
@@ -79,7 +100,7 @@ func main() {
 		envloader.PrintOrderError("PlaceOrder", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Place OK -- order_id=%s\n", ack.OrderID)
+	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %.1f, mark=%.1f)\n", ack.OrderID, sellPx, mark)
 
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)
