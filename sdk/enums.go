@@ -67,11 +67,15 @@ const (
 type CancelReason string
 
 const (
-	CancelReasonUserRequested CancelReason = "USER_REQUESTED"
-	CancelReasonIOCRemainder  CancelReason = "IOC_REMAINDER"
-	CancelReasonFOKNotFilled  CancelReason = "FOK_NOT_FILLED"
-	CancelReasonExpired       CancelReason = "EXPIRED"
-	CancelReasonSystem        CancelReason = "SYSTEM"
+	CancelReasonUserRequested      CancelReason = "USER_REQUESTED"
+	CancelReasonIOCRemainder       CancelReason = "IOC_REMAINDER"
+	CancelReasonFOKNotFilled       CancelReason = "FOK_NOT_FILLED"
+	CancelReasonExpired            CancelReason = "EXPIRED"
+	CancelReasonSystem             CancelReason = "SYSTEM"
+	CancelReasonADL                CancelReason = "ADL"
+	CancelReasonLiquidatedCanceled CancelReason = "LIQUIDATED_CANCELED"
+	CancelReasonMarginCanceled     CancelReason = "MARGIN_CANCELED"
+	CancelReasonReduceOnly         CancelReason = "REDUCE_ONLY"
 )
 
 type PositionsSnapshotSource string
@@ -174,6 +178,10 @@ var cancelReasonFromProto = map[int32]CancelReason{
 	3: CancelReasonFOKNotFilled,
 	4: CancelReasonExpired,
 	5: CancelReasonSystem,
+	6: CancelReasonADL,
+	7: CancelReasonLiquidatedCanceled,
+	8: CancelReasonMarginCanceled,
+	9: CancelReasonReduceOnly,
 }
 
 // Request / response message-type ints used by the docs-wire envelope.

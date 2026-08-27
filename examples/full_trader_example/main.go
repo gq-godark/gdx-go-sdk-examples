@@ -355,8 +355,18 @@ func drainOrderUpdates(c *godark.GodarkClient, label string) {
 		select {
 		case u := <-ch:
 			count++
-			fmt.Printf("ORDER  %s  id=%s  status=%s  filled=%s  remaining=%s\n",
-				u.UpdateType, u.OrderID, u.Status, u.FilledQty, u.RemainingQty)
+			badges := ""
+			if u.CancelReason != "" {
+				badges += fmt.Sprintf("  cancel_reason=%s", u.CancelReason)
+			}
+			if u.ReduceOnly {
+				badges += "  reduce_only=true"
+			}
+			if u.PostOnly {
+				badges += "  post_only=true"
+			}
+			fmt.Printf("ORDER  %s  id=%s  status=%s  filled=%s  remaining=%s%s\n",
+				u.UpdateType, u.OrderID, u.Status, u.FilledQty, u.RemainingQty, badges)
 		default:
 			if count > 0 {
 				fmt.Printf("  (%d order update(s) %s)\n", count, label)

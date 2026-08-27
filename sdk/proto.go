@@ -699,6 +699,8 @@ func ParseOrderUpdate(data []byte) (*OrderUpdate, error) {
 		CancelReason:  cancelReason,
 		RejectReason:  rejectReason,
 		Msg:           msg.GetMsg(),
+		ReduceOnly:    msg.ReduceOnly,
+		PostOnly:      msg.PostOnly,
 		CorrelationID: correlationIDToUint64(msg.CorrelationId),
 		Timestamp:     msg.Timestamp,
 		Leverage:      int32(msg.Leverage),

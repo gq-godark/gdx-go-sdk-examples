@@ -120,6 +120,8 @@ type OrderUpdate struct {
 	CancelReason  CancelReason
 	RejectReason  string
 	Msg           string
+	ReduceOnly    bool
+	PostOnly      bool
 	CorrelationID uint64
 	Timestamp     uint64
 	// Leverage is the client-selected leverage at order-placement time (1 = 1x).
