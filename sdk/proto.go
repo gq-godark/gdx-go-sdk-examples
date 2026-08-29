@@ -260,6 +260,44 @@ func BuildModifyOrderRequest(
 	return proto.Marshal(req)
 }
 
+// BuildAmendTpslRequest serializes an AmendTpslRequest wrapped in EdgeSequencerRequest.
+func BuildAmendTpslRequest(
+	userUUID []byte,
+	orderID uint64,
+	correlationID []byte,
+	takeProfitPrice *float64,
+	stopLossPrice *float64,
+	symbolID *uint64,
+	positionSide *string,
+) ([]byte, error) {
+	amend := &sequencerpb.AmendTpslRequest{
+		UserUuid:      userUUID,
+		OrderId:       orderID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	if takeProfitPrice != nil {
+		amend.TakeProfitPrice = takeProfitPrice
+	}
+	if stopLossPrice != nil {
+		amend.StopLossPrice = stopLossPrice
+	}
+	if symbolID != nil {
+		amend.SymbolId = symbolID
+	}
+	if positionSide != nil {
+		sideInt, ok := sideToProto[Side(*positionSide)]
+		if !ok {
+			return nil, fmt.Errorf("unknown position_side: %q", *positionSide)
+		}
+		s := commonpb.Side(sideInt)
+		amend.PositionSide = &s
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_AmendTpsl{AmendTpsl: amend},
+	}
+	return proto.Marshal(req)
+}
+
 func newLegCorrelationID() []byte {
 	u := uuid.New()
 	return u[:]
@@ -621,6 +659,70 @@ func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
 	}, nil
 }
 
+
+
+func tpslStatusString(v commonpb.TpslStatus) string {
+	switch v {
+	case commonpb.TpslStatus_TPSL_STATUS_PENDING:
+		return "PENDING"
+	case commonpb.TpslStatus_TPSL_STATUS_ACTIVE:
+		return "ACTIVE"
+	case commonpb.TpslStatus_TPSL_STATUS_TRIGGERED:
+		return "TRIGGERED"
+	case commonpb.TpslStatus_TPSL_STATUS_CANCELLED:
+		return "CANCELLED"
+	default:
+		return ""
+	}
+}
+
+func tpslKindString(v commonpb.TpslKind) string {
+	switch v {
+	case commonpb.TpslKind_TPSL_KIND_ORDER:
+		return "ORDER"
+	case commonpb.TpslKind_TPSL_KIND_POSITION:
+		return "POSITION"
+	default:
+		return ""
+	}
+}
+
+// ParseTpslAck decodes a NodeResponse carrying a TpslAck. ok is false when the
+// inner variant is not tpsl_ack.
+func ParseTpslAck(data []byte) (*TpslAck, bool, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, false, err
+	}
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_TpslAck)
+	if !ok || inner.TpslAck == nil {
+		return nil, false, nil
+	}
+	a := inner.TpslAck
+	ack := &TpslAck{
+		CorrelationID: correlationIDToUint64(a.CorrelationId),
+		ParentOrderID: fmt.Sprintf("%d", a.ParentOrderId),
+	}
+	if a.TakeProfit != nil {
+		ack.TakeProfit = *a.TakeProfit
+	}
+	if a.StopLoss != nil {
+		ack.StopLoss = *a.StopLoss
+	}
+	if a.Status != nil {
+		ack.Status = tpslStatusString(*a.Status)
+	}
+	if a.Kind != nil {
+		ack.Kind = tpslKindString(*a.Kind)
+	}
+	if a.ErrorCode != nil {
+		ack.ErrorCode = a.ErrorCode
+	}
+	if a.RejectText != nil {
+		ack.RejectText = *a.RejectText
+	}
+	return ack, true, nil
+}
 // ParseBatchModifyAck decodes a NodeResponse carrying a BatchModifyAck. Success
 // is true when every leg was modified.
 func ParseBatchModifyAck(data []byte) (*BatchModifyAck, bool, error) {
@@ -824,10 +926,9 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		f := inner.FundingRateUpdate
 		return &FundingRateUpdate{
 			SymbolID:        int64(f.SymbolId),
-			CurrentRate:     f.CurrentRate,
-			PredictedRate:   f.PredictedRate,
-			NextFundingTime: f.NextFundingTime,
+			FundingRate:     f.FundingRate,
 			Timestamp:       f.Timestamp,
+			LastFundingRate: f.LastFundingRate,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
 		b := inner.BalanceUpdate
@@ -845,6 +946,47 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		// New variants (OrderHistoryInsert, OpenInterestUpdate,
 		// BalanceAndPosition, future additions) fall through here.
 		return &UnknownSequencerPush{OneofField: fmt.Sprintf("%T", msg.Inner)}, nil
+	}
+}
+
+// ParseFundingRateSnapshotJSON decodes public WS funding_rate_snapshot rows.
+func ParseFundingRateSnapshotJSON(obj map[string]any) []*FundingRateUpdate {
+	typ, _ := obj["type"].(string)
+	if typ != "funding_rate_snapshot" {
+		return nil
+	}
+	rows, _ := obj["rows"].([]any)
+	out := make([]*FundingRateUpdate, 0, len(rows))
+	for _, row := range rows {
+		m, ok := row.(map[string]any)
+		if !ok {
+			continue
+		}
+		rate, _ := m["funding_rate"].(string)
+		if rate == "" {
+			continue
+		}
+		last, _ := m["last_funding_rate"].(string)
+		out = append(out, &FundingRateUpdate{
+			SymbolID:        fundingSnapshotSymbolID(m["symbol_id"]),
+			FundingRate:     rate,
+			LastFundingRate: last,
+			Timestamp:       uint64(coerceUint64(m["timestamp"])),
+		})
+	}
+	return out
+}
+
+func fundingSnapshotSymbolID(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	default:
+		return 0
 	}
 }
 

@@ -114,10 +114,10 @@ func main() {
 
 	fmt.Printf("WS authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
 
-	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
+	if err := client.Subscribe(ctx, "orders", "positions", "funding_rate"); err != nil {
 		log.Fatalf("Subscribe failed: %v", err)
 	}
-	fmt.Println("Subscribed to order + position updates")
+	fmt.Println("Subscribed to order + position + funding updates")
 
 	// Initial settling window: the sequencer pushes a PositionsSnapshot
 	// immediately after the trading session establishes.
