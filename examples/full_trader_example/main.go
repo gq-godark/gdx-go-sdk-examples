@@ -469,8 +469,8 @@ func drainFunding(c *godark.GodarkClient) int {
 		select {
 		case f := <-ch:
 			count++
-			fmt.Printf("FUND   symbol=%d  current=%s  predicted=%s\n",
-				f.SymbolID, f.CurrentRate, f.PredictedRate)
+			fmt.Printf("FUND   symbol=%d  rate=%s  last=%s  ts=%d\n",
+				f.SymbolID, f.FundingRate, f.LastFundingRate, f.Timestamp)
 		default:
 			return count
 		}
