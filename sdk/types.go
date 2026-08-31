@@ -103,6 +103,18 @@ type BatchModifyAck struct {
 	Sequence string
 	Results  []BatchModifyLegResult
 }
+// TpslAck is the RPC reply for amend / cancel TP-SL (live feed remains TpslUpdate).
+type TpslAck struct {
+	CorrelationID uint64
+	ParentOrderID string
+	TakeProfit    string
+	StopLoss      string
+	Status        string
+	Kind          string
+	ErrorCode     *uint32
+	RejectText    string
+}
+
 
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
@@ -270,10 +282,9 @@ type MarginAlert struct {
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.
 type FundingRateUpdate struct {
 	SymbolID        int64
-	CurrentRate     string
-	PredictedRate   string
-	NextFundingTime uint64
+	FundingRate     string
 	Timestamp       uint64
+	LastFundingRate string
 }
 
 // SettlementUpdate is a push frame describing a settlement batch lifecycle

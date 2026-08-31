@@ -89,6 +89,7 @@ type Handlers struct {
 	OnSessionEstablished func(Message)
 	OnRekeyRequired      func(Message)
 	OnEncryptedPush      func(Message)
+	OnPublicMessage      func(Message)
 	OnDisconnect         func()
 }
 
@@ -850,6 +851,14 @@ func (t *Transport) dispatch(msg Message) {
 			t.subWaiter = nil
 		}
 		t.subMu.Unlock()
+		return
+	}
+
+	switch msgType {
+	case "funding_rate_snapshot", "volume_snapshot", "open_interest_snapshot":
+		if t.handler.OnPublicMessage != nil {
+			t.handler.OnPublicMessage(msg)
+		}
 	}
 }
 
