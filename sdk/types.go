@@ -146,6 +146,28 @@ type PositionUpdate struct {
 	Timestamp     uint64
 }
 
+// AccountMarginSummary is the authoritative account-level margin summary
+// (decimal string amounts).
+type AccountMarginSummary struct {
+	TotalCollateral      string
+	PositionMargin       string
+	ReservedOrderMargin  string
+	FreeCollateral       string
+	AccountEquity        string
+	UnrealizedPnl        string
+	CrossAvailable       string
+	RealizedPnl          string
+}
+
+// AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
+// snapshot or WS push).
+type AccountMarginUpdate struct {
+	UserUUID        string
+	ServerTimestamp uint64
+	Account         *AccountMarginSummary
+	CorrelationID   uint64
+}
+
 // OpenOrderRow is one resting order within an OpenOrdersSnapshot.
 type OpenOrderRow struct {
 	OrderID      string
