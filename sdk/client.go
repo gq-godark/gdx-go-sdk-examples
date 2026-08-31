@@ -305,6 +305,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 
 	c.transport = transport.New(transport.EdgeURL(baseURL), cfg.Transport, transport.Handlers{
 		OnEncryptedPush:      c.handleEncryptedPush,
+		OnPublicMessage:      c.handlePublicMessage,
 		OnSessionEstablished: c.handleSessionEstablished,
 		OnRekeyRequired:      c.handleRekeyRequired,
 		OnDisconnect:         c.handleDisconnect,
@@ -1213,6 +1214,25 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	c.dispatchEncryptedPush(msg)
 }
 
+func (c *GodarkClient) handlePublicMessage(msg transport.Message) {
+	for _, u := range ParseFundingRateSnapshotJSON(msg) {
+		c.dispatchFundingRateUpdate(u)
+	}
+}
+
+func (c *GodarkClient) dispatchFundingRateUpdate(u *FundingRateUpdate) {
+	if u == nil || u.FundingRate == "" {
+		return
+	}
+	nonBlockingSend(c.fundingRateQueue, u)
+	c.cbMu.RLock()
+	cbs := append([]func(*FundingRateUpdate){}, c.fundingCallbacks...)
+	c.cbMu.RUnlock()
+	for _, cb := range cbs {
+		safeCallFunding(cb, u)
+	}
+}
+
 func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
@@ -1225,7 +1245,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	messageType, _ := msg["message_type"].(string)
 
 	switch messageType {
-	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack":
+	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack", "cancel_all_ack", "close_all_ack", "reverse_ack", "tpsl_ack":
 		aad, err := BuildResponseHeaderAADWithConn(
 			c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
@@ -1429,10 +1449,7 @@ func (c *GodarkClient) dispatchSequencerPush(parsed SequencerPush) {
 			safeCallMargin(cb, v)
 		}
 	case *FundingRateUpdate:
-		nonBlockingSend(c.fundingRateQueue, v)
-		for _, cb := range c.fundingCallbacks {
-			safeCallFunding(cb, v)
-		}
+		c.dispatchFundingRateUpdate(v)
 	case *SettlementUpdate:
 		nonBlockingSend(c.settlementQueue, v)
 		for _, cb := range c.settlementCBs {

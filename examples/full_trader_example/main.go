@@ -114,10 +114,10 @@ func main() {
 
 	fmt.Printf("WS authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
 
-	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
+	if err := client.Subscribe(ctx, "orders", "positions", "funding_rate"); err != nil {
 		log.Fatalf("Subscribe failed: %v", err)
 	}
-	fmt.Println("Subscribed to order + position updates")
+	fmt.Println("Subscribed to order + position + funding updates")
 
 	// Initial settling window: the sequencer pushes a PositionsSnapshot
 	// immediately after the trading session establishes.
@@ -469,8 +469,8 @@ func drainFunding(c *godark.GodarkClient) int {
 		select {
 		case f := <-ch:
 			count++
-			fmt.Printf("FUND   symbol=%d  current=%s  predicted=%s\n",
-				f.SymbolID, f.CurrentRate, f.PredictedRate)
+			fmt.Printf("FUND   symbol=%d  rate=%s  last=%s  ts=%d\n",
+				f.SymbolID, f.FundingRate, f.LastFundingRate, f.Timestamp)
 		default:
 			return count
 		}
