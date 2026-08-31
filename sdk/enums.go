@@ -76,8 +76,6 @@ const (
 	CancelReasonLiquidatedCanceled CancelReason = "LIQUIDATED_CANCELED"
 	CancelReasonMarginCanceled     CancelReason = "MARGIN_CANCELED"
 	CancelReasonReduceOnly         CancelReason = "REDUCE_ONLY"
-	CancelReasonStpExpireTaker     CancelReason = "STP_EXPIRE_TAKER"
-	CancelReasonStpCancelResting   CancelReason = "STP_CANCEL_RESTING"
 )
 
 type PositionsSnapshotSource string
@@ -184,8 +182,6 @@ var cancelReasonFromProto = map[int32]CancelReason{
 	7: CancelReasonLiquidatedCanceled,
 	8: CancelReasonMarginCanceled,
 	9: CancelReasonReduceOnly,
-	10: CancelReasonStpExpireTaker,
-	11: CancelReasonStpCancelResting,
 }
 
 // Request / response message-type ints used by the docs-wire envelope.
@@ -218,6 +214,7 @@ var responseMessageTypeToProto = map[string]int32{
 	"positions_snapshot":    5,
 	"balance_and_position":  6,
 	"account_margin_update": 7,
+	"account_update":        7, // devnet alias
 	"mass_quote_ack":        8,
 	"batch_cancel_ack":      9,
 	"batch_modify_ack":      10,
@@ -226,7 +223,6 @@ var responseMessageTypeToProto = map[string]int32{
 	"cancel_all_ack":        13,
 	"close_all_ack":         14,
 	"reverse_ack":           15,
-	"tpsl_ack":              16,
 }
 
 // SideFromProto / OrderTypeFromProto / ... are exported because the proto

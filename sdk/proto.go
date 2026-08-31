@@ -233,6 +233,45 @@ func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, 
 	return proto.Marshal(req)
 }
 
+// BuildGetOpenOrdersRequest serializes a GetOpenOrdersRequest wrapped in
+// EdgeSequencerRequest.
+func BuildGetOpenOrdersRequest(userUUID, correlationID []byte) ([]byte, error) {
+	inner := &sequencerpb.GetOpenOrdersRequest{
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_GetOpenOrders{GetOpenOrders: inner},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildGetPositionsRequest serializes a GetPositionsRequest wrapped in
+// EdgeSequencerRequest.
+func BuildGetPositionsRequest(userUUID, correlationID []byte) ([]byte, error) {
+	inner := &sequencerpb.GetPositionsRequest{
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_GetPositions{GetPositions: inner},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildGetAccountRequest serializes a GetAccountRequest wrapped in
+// EdgeSequencerRequest.
+func BuildGetAccountRequest(userUUID, correlationID []byte) ([]byte, error) {
+	inner := &sequencerpb.GetAccountRequest{
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_GetAccount{GetAccount: inner},
+	}
+	return proto.Marshal(req)
+}
+
 // BuildModifyOrderRequest serializes a ModifyOrderInput wrapped in EdgeSequencerRequest.
 func BuildModifyOrderRequest(
 	orderID uint64,
@@ -256,44 +295,6 @@ func BuildModifyOrderRequest(
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Modify{Modify: modify},
-	}
-	return proto.Marshal(req)
-}
-
-// BuildAmendTpslRequest serializes an AmendTpslRequest wrapped in EdgeSequencerRequest.
-func BuildAmendTpslRequest(
-	userUUID []byte,
-	orderID uint64,
-	correlationID []byte,
-	takeProfitPrice *float64,
-	stopLossPrice *float64,
-	symbolID *uint64,
-	positionSide *string,
-) ([]byte, error) {
-	amend := &sequencerpb.AmendTpslRequest{
-		UserUuid:      userUUID,
-		OrderId:       orderID,
-		CorrelationId: correlationIDBodyBytes(correlationID),
-	}
-	if takeProfitPrice != nil {
-		amend.TakeProfitPrice = takeProfitPrice
-	}
-	if stopLossPrice != nil {
-		amend.StopLossPrice = stopLossPrice
-	}
-	if symbolID != nil {
-		amend.SymbolId = symbolID
-	}
-	if positionSide != nil {
-		sideInt, ok := sideToProto[Side(*positionSide)]
-		if !ok {
-			return nil, fmt.Errorf("unknown position_side: %q", *positionSide)
-		}
-		s := commonpb.Side(sideInt)
-		amend.PositionSide = &s
-	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_AmendTpsl{AmendTpsl: amend},
 	}
 	return proto.Marshal(req)
 }
@@ -523,8 +524,10 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 		out.Success = outcome.GetKind() == sequencerpb.AckOutcomeKind_ACK_OUTCOME_KIND_APPLIED
 		if code := outcome.GetBusinessErrorCode(); code != 0 {
 			out.ErrorCode = &code
+			out.Success = false
 		} else if code := outcome.GetSystemErrorCode(); code != 0 {
 			out.ErrorCode = &code
+			out.Success = false
 		}
 		if outcome.OrderStatus != nil {
 			if s, ok := orderStatusEnumFromProto(int32(*outcome.OrderStatus)); ok {
@@ -659,70 +662,150 @@ func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
 	}, nil
 }
 
-
-
-func tpslStatusString(v commonpb.TpslStatus) string {
-	switch v {
-	case commonpb.TpslStatus_TPSL_STATUS_PENDING:
-		return "PENDING"
-	case commonpb.TpslStatus_TPSL_STATUS_ACTIVE:
-		return "ACTIVE"
-	case commonpb.TpslStatus_TPSL_STATUS_TRIGGERED:
-		return "TRIGGERED"
-	case commonpb.TpslStatus_TPSL_STATUS_CANCELLED:
-		return "CANCELLED"
-	default:
-		return ""
+// ParseAccountMarginUpdate maps a sequencer AccountMarginUpdate proto to the
+// public snapshot type.
+func ParseAccountMarginUpdate(msg *sequencerpb.AccountMarginUpdate) *AccountMarginUpdate {
+	if msg == nil {
+		return &AccountMarginUpdate{}
 	}
+	out := &AccountMarginUpdate{
+		UserUUID:        uuidBytesToString(msg.UserUuid),
+		ServerTimestamp: msg.ServerTimestamp,
+		CorrelationID:   correlationIDToUint64(msg.CorrelationId),
+	}
+	if a := msg.Account; a != nil {
+		out.Account = &AccountMarginSummary{
+			TotalCollateral:     a.TotalCollateral,
+			PositionMargin:      a.PositionMargin,
+			ReservedOrderMargin: a.ReservedOrderMargin,
+			FreeCollateral:      a.FreeCollateral,
+			AccountEquity:       a.AccountEquity,
+			UnrealizedPnl:       a.UnrealizedPnl,
+			CrossAvailable:      a.CrossAvailable,
+			RealizedPnl:         a.RealizedPnl,
+		}
+	}
+	return out
 }
 
-func tpslKindString(v commonpb.TpslKind) string {
-	switch v {
-	case commonpb.TpslKind_TPSL_KIND_ORDER:
-		return "ORDER"
-	case commonpb.TpslKind_TPSL_KIND_POSITION:
-		return "POSITION"
-	default:
-		return ""
-	}
-}
-
-// ParseTpslAck decodes a NodeResponse carrying a TpslAck. ok is false when the
-// inner variant is not tpsl_ack.
-func ParseTpslAck(data []byte) (*TpslAck, bool, error) {
+// ParsePositionsSnapshotFromNodeResponse decodes a NodeResponse and returns its
+// PositionsSnapshot inner variant.
+func ParsePositionsSnapshotFromNodeResponse(data []byte) (*PositionsSnapshot, error) {
 	var resp sequencerpb.NodeResponse
 	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_TpslAck)
-	if !ok || inner.TpslAck == nil {
-		return nil, false, nil
+	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_PositionsSnapshot)
+	if !ok || inner.PositionsSnapshot == nil {
+		return nil, fmt.Errorf("NodeResponse is not positions_snapshot")
 	}
-	a := inner.TpslAck
-	ack := &TpslAck{
-		CorrelationID: correlationIDToUint64(a.CorrelationId),
-		ParentOrderID: fmt.Sprintf("%d", a.ParentOrderId),
-	}
-	if a.TakeProfit != nil {
-		ack.TakeProfit = *a.TakeProfit
-	}
-	if a.StopLoss != nil {
-		ack.StopLoss = *a.StopLoss
-	}
-	if a.Status != nil {
-		ack.Status = tpslStatusString(*a.Status)
-	}
-	if a.Kind != nil {
-		ack.Kind = tpslKindString(*a.Kind)
-	}
-	if a.ErrorCode != nil {
-		ack.ErrorCode = a.ErrorCode
-	}
-	if a.RejectText != nil {
-		ack.RejectText = *a.RejectText
-	}
-	return ack, true, nil
+	return ParsePositionsSnapshot(inner.PositionsSnapshot), nil
 }
+
+// NodeResponseVariant is the parsed union of synchronous NodeResponse replies.
+type NodeResponseVariant struct {
+	Kind            string
+	Ack             *NodeAck
+	OpenOrders      *OpenOrdersSnapshot
+	Positions       *PositionsSnapshot
+	AccountMargin   *AccountMarginUpdate
+	MassQuote       *MassQuoteAck
+	BatchCancel     *BatchCancelAck
+	BatchModify     *BatchModifyAck
+}
+
+// ParseNodeResponseVariant decodes a NodeResponse and returns the appropriate
+// public variant (mirrors python parse_node_response_snapshot).
+func ParseNodeResponseVariant(data []byte) (*NodeResponseVariant, error) {
+	var resp sequencerpb.NodeResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	switch inner := resp.Inner.(type) {
+	case *sequencerpb.NodeResponse_Ack:
+		if inner.Ack == nil {
+			return &NodeResponseVariant{Kind: "ack"}, nil
+		}
+		ack := inner.Ack
+		out := &NodeAck{
+			Sequence:      ack.Sequence,
+			OrderID:       ack.OrderId,
+			RejectText:    ack.GetRejectText(),
+			CorrelationID: ack.CorrelationId,
+		}
+		if outcome := ack.GetAckOutcome(); outcome != nil {
+			out.Success = outcome.GetKind() == sequencerpb.AckOutcomeKind_ACK_OUTCOME_KIND_APPLIED
+			if code := outcome.GetBusinessErrorCode(); code != 0 {
+				out.ErrorCode = &code
+			} else if code := outcome.GetSystemErrorCode(); code != 0 {
+				out.ErrorCode = &code
+			}
+			if outcome.OrderStatus != nil {
+				if s, ok := orderStatusEnumFromProto(int32(*outcome.OrderStatus)); ok {
+					sCopy := s
+					out.OrderStatus = &sCopy
+				}
+			}
+		}
+		return &NodeResponseVariant{Kind: "ack", Ack: out}, nil
+	case *sequencerpb.NodeResponse_OpenOrdersSnapshot:
+		snap, err := ParseOpenOrdersSnapshot(data)
+		if err != nil {
+			return nil, err
+		}
+		return &NodeResponseVariant{Kind: "open_orders_snapshot", OpenOrders: snap}, nil
+	case *sequencerpb.NodeResponse_PositionsSnapshot:
+		if inner.PositionsSnapshot == nil {
+			return &NodeResponseVariant{Kind: "positions_snapshot"}, nil
+		}
+		return &NodeResponseVariant{
+			Kind:      "positions_snapshot",
+			Positions: ParsePositionsSnapshot(inner.PositionsSnapshot),
+		}, nil
+	case *sequencerpb.NodeResponse_AccountMarginUpdate:
+		if inner.AccountMarginUpdate == nil {
+			return &NodeResponseVariant{Kind: "account_margin_update"}, nil
+		}
+		return &NodeResponseVariant{
+			Kind:          "account_margin_update",
+			AccountMargin: ParseAccountMarginUpdate(inner.AccountMarginUpdate),
+		}, nil
+	case *sequencerpb.NodeResponse_MassQuoteAck:
+		ack, ok, err := ParseMassQuoteAck(data)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "mass_quote_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "mass_quote_ack", MassQuote: ack}, nil
+	case *sequencerpb.NodeResponse_BatchCancelAck:
+		ack, ok, err := ParseBatchCancelAck(data)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "batch_cancel_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "batch_cancel_ack", BatchCancel: ack}, nil
+	case *sequencerpb.NodeResponse_BatchModifyAck:
+		ack, ok, err := ParseBatchModifyAck(data)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "batch_modify_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "batch_modify_ack", BatchModify: ack}, nil
+	default:
+		kind := fmt.Sprintf("%T", resp.Inner)
+		if resp.Inner == nil {
+			kind = "unknown"
+		}
+		return &NodeResponseVariant{Kind: kind}, nil
+	}
+}
+
 // ParseBatchModifyAck decodes a NodeResponse carrying a BatchModifyAck. Success
 // is true when every leg was modified.
 func ParseBatchModifyAck(data []byte) (*BatchModifyAck, bool, error) {
@@ -926,9 +1009,10 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		f := inner.FundingRateUpdate
 		return &FundingRateUpdate{
 			SymbolID:        int64(f.SymbolId),
-			FundingRate:     f.FundingRate,
+			CurrentRate:     f.CurrentRate,
+			PredictedRate:   f.PredictedRate,
+			NextFundingTime: f.NextFundingTime,
 			Timestamp:       f.Timestamp,
-			LastFundingRate: f.LastFundingRate,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
 		b := inner.BalanceUpdate
@@ -946,47 +1030,6 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		// New variants (OrderHistoryInsert, OpenInterestUpdate,
 		// BalanceAndPosition, future additions) fall through here.
 		return &UnknownSequencerPush{OneofField: fmt.Sprintf("%T", msg.Inner)}, nil
-	}
-}
-
-// ParseFundingRateSnapshotJSON decodes public WS funding_rate_snapshot rows.
-func ParseFundingRateSnapshotJSON(obj map[string]any) []*FundingRateUpdate {
-	typ, _ := obj["type"].(string)
-	if typ != "funding_rate_snapshot" {
-		return nil
-	}
-	rows, _ := obj["rows"].([]any)
-	out := make([]*FundingRateUpdate, 0, len(rows))
-	for _, row := range rows {
-		m, ok := row.(map[string]any)
-		if !ok {
-			continue
-		}
-		rate, _ := m["funding_rate"].(string)
-		if rate == "" {
-			continue
-		}
-		last, _ := m["last_funding_rate"].(string)
-		out = append(out, &FundingRateUpdate{
-			SymbolID:        fundingSnapshotSymbolID(m["symbol_id"]),
-			FundingRate:     rate,
-			LastFundingRate: last,
-			Timestamp:       uint64(coerceUint64(m["timestamp"])),
-		})
-	}
-	return out
-}
-
-func fundingSnapshotSymbolID(v any) int64 {
-	switch x := v.(type) {
-	case float64:
-		return int64(x)
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	default:
-		return 0
 	}
 }
 
