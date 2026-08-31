@@ -971,7 +971,8 @@ func (c *GodarkRestClient) decryptRestNodeResponse(msg map[string]any, sealed *h
 	if err != nil {
 		return nil, err
 	}
-	return ParseNodeResponseVariant(pt)
+	messageType, _ := msg["message_type"].(string)
+	return ParseNodeResponseVariant(pt, messageType)
 }
 
 func (c *GodarkRestClient) parseMassQuoteREST(raw map[string]any, sealed *hpke.SealedSession) (*MassQuoteAck, error) {

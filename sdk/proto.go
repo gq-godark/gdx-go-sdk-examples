@@ -484,36 +484,128 @@ func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLen
 }
 
 // ---------------------------------------------------------------------------
-// Parsers -- serialized protobuf bytes => public Go types
+// Legacy NodeResponse wire unwrap (pre hotpath-edge-frames REST replies)
 // ---------------------------------------------------------------------------
 
-// NodeAck is the parsed form of a NodeResponse with an `ack` inner variant.
-// Fill / Signing variants are intentionally not parsed in the trading path -
-// the WS client only consumes acks here.
-type NodeAck struct {
-	Sequence  uint64
-	OrderID   uint64
-	Success   bool
-	ErrorCode *uint32
-	// RejectText is AckMessage.reject_text when the sequencer supplied detail.
-	RejectText    string
-	CorrelationID []byte
-	OrderStatus   *OrderStatus
+const wireTypeLengthDelimited = 2
+
+var legacyNodeResponseFieldNum = map[string]uint32{
+	"ack":                   1,
+	"fill":                  2,
+	"open_orders_snapshot":  3,
+	"node_ready":            4,
+	"mass_quote_ack":        5,
+	"batch_cancel_ack":      6,
+	"batch_modify_ack":      7,
+	"positions_snapshot":    8,
+	"account_margin_update": 9,
+	"cancel_all_ack":        10,
+	"close_all_ack":         11,
+	"reverse_ack":           12,
 }
 
-// ParseNodeResponseAck decodes a NodeResponse and returns its AckMessage
-// projected into a NodeAck. Returns ok=false when the inner variant is not
-// an ack.
-func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, false, err
+var legacyNodeResponseFieldName = map[uint32]string{
+	1:  "ack",
+	2:  "fill",
+	3:  "open_orders_snapshot",
+	4:  "node_ready",
+	5:  "mass_quote_ack",
+	6:  "batch_cancel_ack",
+	7:  "batch_modify_ack",
+	8:  "positions_snapshot",
+	9:  "account_margin_update",
+	10: "cancel_all_ack",
+	11: "close_all_ack",
+	12: "reverse_ack",
+}
+
+func readVarint(data []byte, i int) (uint64, int, error) {
+	var shift uint
+	var result uint64
+	for i < len(data) {
+		b := data[i]
+		i++
+		result |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			return result, i, nil
+		}
+		shift += 7
+		if shift >= 64 {
+			return 0, i, fmt.Errorf("varint overflow")
+		}
 	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_Ack)
-	if !ok || inner.Ack == nil {
-		return nil, false, nil
+	return 0, i, fmt.Errorf("truncated varint")
+}
+
+func writeVarint(value uint64) []byte {
+	var out []byte
+	for {
+		b := byte(value & 0x7F)
+		value >>= 7
+		if value != 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if value == 0 {
+			break
+		}
 	}
-	ack := inner.Ack
+	return out
+}
+
+// WrapLegacyNodeResponse wraps inner bytes as a legacy NodeResponse oneof (tests/mocks).
+func WrapLegacyNodeResponse(variant string, inner []byte) []byte {
+	fieldNum, ok := legacyNodeResponseFieldNum[variant]
+	if !ok {
+		panic(fmt.Sprintf("unknown legacy NodeResponse variant: %s", variant))
+	}
+	out := []byte{byte((fieldNum << 3) | wireTypeLengthDelimited)}
+	out = append(out, writeVarint(uint64(len(inner)))...)
+	return append(out, inner...)
+}
+
+func unwrapLegacyNodeResponse(data []byte) (variant string, inner []byte, ok bool) {
+	if len(data) == 0 {
+		return "", nil, false
+	}
+	tag := data[0]
+	wireType := tag & 0x07
+	fieldNum := uint32(tag >> 3)
+	variant, ok = legacyNodeResponseFieldName[fieldNum]
+	if !ok || wireType != wireTypeLengthDelimited {
+		return "", nil, false
+	}
+	length, i, err := readVarint(data, 1)
+	if err != nil {
+		return "", nil, false
+	}
+	end := i + int(length)
+	if end != len(data) {
+		return "", nil, false
+	}
+	return variant, data[i:end], true
+}
+
+func normalizeExpectedSnapshotVariant(messageType string) string {
+	switch strings.ReplaceAll(messageType, "-", "_") {
+	case "account_margin":
+		return "account_margin_update"
+	default:
+		return strings.ReplaceAll(messageType, "-", "_")
+	}
+}
+
+func resolveRestPayload(data []byte, expected string) (variant string, payload []byte) {
+	if v, inner, ok := unwrapLegacyNodeResponse(data); ok {
+		return v, inner
+	}
+	if expected != "" {
+		return expected, data
+	}
+	return "ack", data
+}
+
+func nodeAckFromProto(ack *sequencerpb.AckMessage) *NodeAck {
 	out := &NodeAck{
 		Sequence:      ack.Sequence,
 		OrderID:       ack.OrderId,
@@ -538,7 +630,38 @@ func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
 	} else {
 		out.Success = false
 	}
-	return out, true, nil
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Parsers -- serialized protobuf bytes => public Go types
+// ---------------------------------------------------------------------------
+
+// NodeAck is the parsed form of a NodeResponse with an `ack` inner variant.
+// Fill / Signing variants are intentionally not parsed in the trading path -
+// the WS client only consumes acks here.
+type NodeAck struct {
+	Sequence  uint64
+	OrderID   uint64
+	Success   bool
+	ErrorCode *uint32
+	// RejectText is AckMessage.reject_text when the sequencer supplied detail.
+	RejectText    string
+	CorrelationID []byte
+	OrderStatus   *OrderStatus
+}
+
+// ParseNodeResponseAck decodes REST/WS ack plaintext (direct AckMessage or legacy wrapper).
+func ParseNodeResponseAck(data []byte) (*NodeAck, bool, error) {
+	variant, payload := resolveRestPayload(data, "ack")
+	if variant != "ack" {
+		return nil, false, nil
+	}
+	var ack sequencerpb.AckMessage
+	if err := proto.Unmarshal(payload, &ack); err != nil {
+		return nil, false, err
+	}
+	return nodeAckFromProto(&ack), true, nil
 }
 
 func massQuoteLegStatusString(s sequencerpb.MassQuoteLegStatus) string {
@@ -563,19 +686,16 @@ func uint64OrEmpty(v uint64) string {
 	return fmt.Sprintf("%d", v)
 }
 
-// ParseMassQuoteAck decodes a NodeResponse carrying a MassQuoteAck. ok is false
-// when the inner variant is not a mass_quote_ack. Success is true when no leg
-// failed.
+// ParseMassQuoteAck decodes a MassQuoteAck (legacy NodeResponse wrapper or direct message).
 func ParseMassQuoteAck(data []byte) (*MassQuoteAck, bool, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, false, err
-	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_MassQuoteAck)
-	if !ok || inner.MassQuoteAck == nil {
+	variant, payload := resolveRestPayload(data, "mass_quote_ack")
+	if variant != "mass_quote_ack" {
 		return nil, false, nil
 	}
-	a := inner.MassQuoteAck
+	var a sequencerpb.MassQuoteAck
+	if err := proto.Unmarshal(payload, &a); err != nil {
+		return nil, false, err
+	}
 	results := make([]MassQuoteLegResult, 0, len(a.Results))
 	success := len(a.Results) > 0
 	for _, r := range a.Results {
@@ -599,18 +719,16 @@ func ParseMassQuoteAck(data []byte) (*MassQuoteAck, bool, error) {
 	}, true, nil
 }
 
-// ParseBatchCancelAck decodes a NodeResponse carrying a BatchCancelAck. Success
-// is true when every id was cancelled.
+// ParseBatchCancelAck decodes a BatchCancelAck (legacy wrapper or direct message).
 func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, false, err
-	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_BatchCancelAck)
-	if !ok || inner.BatchCancelAck == nil {
+	variant, payload := resolveRestPayload(data, "batch_cancel_ack")
+	if variant != "batch_cancel_ack" {
 		return nil, false, nil
 	}
-	a := inner.BatchCancelAck
+	var a sequencerpb.BatchCancelAck
+	if err := proto.Unmarshal(payload, &a); err != nil {
+		return nil, false, err
+	}
 	results := make([]BatchCancelLegResult, 0, len(a.Results))
 	success := len(a.Results) > 0
 	for _, r := range a.Results {
@@ -630,17 +748,16 @@ func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
 	}, true, nil
 }
 
-// ParseOpenOrdersSnapshot decodes a NodeResponse carrying an OpenOrdersSnapshot.
+// ParseOpenOrdersSnapshot decodes an OpenOrdersSnapshot (legacy wrapper or direct).
 func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
+	variant, payload := resolveRestPayload(data, "open_orders_snapshot")
+	if variant != "open_orders_snapshot" {
+		return nil, fmt.Errorf("expected open_orders_snapshot, got %s", variant)
+	}
+	var s sequencerpb.OpenOrdersSnapshot
+	if err := proto.Unmarshal(payload, &s); err != nil {
 		return nil, err
 	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_OpenOrdersSnapshot)
-	if !ok || inner.OpenOrdersSnapshot == nil {
-		return nil, fmt.Errorf("NodeResponse is not open_orders_snapshot")
-	}
-	s := inner.OpenOrdersSnapshot
 	rows := make([]OpenOrderRow, 0, len(s.Rows))
 	for _, r := range s.Rows {
 		if r == nil {
@@ -688,18 +805,17 @@ func ParseAccountMarginUpdate(msg *sequencerpb.AccountMarginUpdate) *AccountMarg
 	return out
 }
 
-// ParsePositionsSnapshotFromNodeResponse decodes a NodeResponse and returns its
-// PositionsSnapshot inner variant.
+// ParsePositionsSnapshotFromNodeResponse decodes positions snapshot REST plaintext.
 func ParsePositionsSnapshotFromNodeResponse(data []byte) (*PositionsSnapshot, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
+	variant, payload := resolveRestPayload(data, "positions_snapshot")
+	if variant != "positions_snapshot" {
+		return nil, fmt.Errorf("expected positions_snapshot, got %s", variant)
+	}
+	var s sequencerpb.PositionsSnapshot
+	if err := proto.Unmarshal(payload, &s); err != nil {
 		return nil, err
 	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_PositionsSnapshot)
-	if !ok || inner.PositionsSnapshot == nil {
-		return nil, fmt.Errorf("NodeResponse is not positions_snapshot")
-	}
-	return ParsePositionsSnapshot(inner.PositionsSnapshot), nil
+	return ParsePositionsSnapshot(&s), nil
 }
 
 // NodeResponseVariant is the parsed union of synchronous NodeResponse replies.
@@ -714,63 +830,45 @@ type NodeResponseVariant struct {
 	BatchModify     *BatchModifyAck
 }
 
-// ParseNodeResponseVariant decodes a NodeResponse and returns the appropriate
-// public variant (mirrors python parse_node_response_snapshot).
-func ParseNodeResponseVariant(data []byte) (*NodeResponseVariant, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, err
+// ParseNodeResponseVariant decodes REST snapshot/ack plaintext into a public variant.
+func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponseVariant, error) {
+	expected := ""
+	if len(messageType) > 0 {
+		expected = normalizeExpectedSnapshotVariant(messageType[0])
 	}
-	switch inner := resp.Inner.(type) {
-	case *sequencerpb.NodeResponse_Ack:
-		if inner.Ack == nil {
-			return &NodeResponseVariant{Kind: "ack"}, nil
+	variant, payload := resolveRestPayload(data, expected)
+	switch variant {
+	case "ack":
+		var ack sequencerpb.AckMessage
+		if err := proto.Unmarshal(payload, &ack); err != nil {
+			return nil, err
 		}
-		ack := inner.Ack
-		out := &NodeAck{
-			Sequence:      ack.Sequence,
-			OrderID:       ack.OrderId,
-			RejectText:    ack.GetRejectText(),
-			CorrelationID: ack.CorrelationId,
-		}
-		if outcome := ack.GetAckOutcome(); outcome != nil {
-			out.Success = outcome.GetKind() == sequencerpb.AckOutcomeKind_ACK_OUTCOME_KIND_APPLIED
-			if code := outcome.GetBusinessErrorCode(); code != 0 {
-				out.ErrorCode = &code
-			} else if code := outcome.GetSystemErrorCode(); code != 0 {
-				out.ErrorCode = &code
-			}
-			if outcome.OrderStatus != nil {
-				if s, ok := orderStatusEnumFromProto(int32(*outcome.OrderStatus)); ok {
-					sCopy := s
-					out.OrderStatus = &sCopy
-				}
-			}
-		}
-		return &NodeResponseVariant{Kind: "ack", Ack: out}, nil
-	case *sequencerpb.NodeResponse_OpenOrdersSnapshot:
+		return &NodeResponseVariant{Kind: "ack", Ack: nodeAckFromProto(&ack)}, nil
+	case "open_orders_snapshot":
 		snap, err := ParseOpenOrdersSnapshot(data)
 		if err != nil {
 			return nil, err
 		}
 		return &NodeResponseVariant{Kind: "open_orders_snapshot", OpenOrders: snap}, nil
-	case *sequencerpb.NodeResponse_PositionsSnapshot:
-		if inner.PositionsSnapshot == nil {
-			return &NodeResponseVariant{Kind: "positions_snapshot"}, nil
+	case "positions_snapshot":
+		var s sequencerpb.PositionsSnapshot
+		if err := proto.Unmarshal(payload, &s); err != nil {
+			return nil, err
 		}
 		return &NodeResponseVariant{
 			Kind:      "positions_snapshot",
-			Positions: ParsePositionsSnapshot(inner.PositionsSnapshot),
+			Positions: ParsePositionsSnapshot(&s),
 		}, nil
-	case *sequencerpb.NodeResponse_AccountMarginUpdate:
-		if inner.AccountMarginUpdate == nil {
-			return &NodeResponseVariant{Kind: "account_margin_update"}, nil
+	case "account_margin_update":
+		var s sequencerpb.AccountMarginUpdate
+		if err := proto.Unmarshal(payload, &s); err != nil {
+			return nil, err
 		}
 		return &NodeResponseVariant{
 			Kind:          "account_margin_update",
-			AccountMargin: ParseAccountMarginUpdate(inner.AccountMarginUpdate),
+			AccountMargin: ParseAccountMarginUpdate(&s),
 		}, nil
-	case *sequencerpb.NodeResponse_MassQuoteAck:
+	case "mass_quote_ack":
 		ack, ok, err := ParseMassQuoteAck(data)
 		if err != nil {
 			return nil, err
@@ -779,7 +877,7 @@ func ParseNodeResponseVariant(data []byte) (*NodeResponseVariant, error) {
 			return &NodeResponseVariant{Kind: "mass_quote_ack"}, nil
 		}
 		return &NodeResponseVariant{Kind: "mass_quote_ack", MassQuote: ack}, nil
-	case *sequencerpb.NodeResponse_BatchCancelAck:
+	case "batch_cancel_ack":
 		ack, ok, err := ParseBatchCancelAck(data)
 		if err != nil {
 			return nil, err
@@ -788,7 +886,7 @@ func ParseNodeResponseVariant(data []byte) (*NodeResponseVariant, error) {
 			return &NodeResponseVariant{Kind: "batch_cancel_ack"}, nil
 		}
 		return &NodeResponseVariant{Kind: "batch_cancel_ack", BatchCancel: ack}, nil
-	case *sequencerpb.NodeResponse_BatchModifyAck:
+	case "batch_modify_ack":
 		ack, ok, err := ParseBatchModifyAck(data)
 		if err != nil {
 			return nil, err
@@ -798,26 +896,20 @@ func ParseNodeResponseVariant(data []byte) (*NodeResponseVariant, error) {
 		}
 		return &NodeResponseVariant{Kind: "batch_modify_ack", BatchModify: ack}, nil
 	default:
-		kind := fmt.Sprintf("%T", resp.Inner)
-		if resp.Inner == nil {
-			kind = "unknown"
-		}
-		return &NodeResponseVariant{Kind: kind}, nil
+		return &NodeResponseVariant{Kind: variant}, nil
 	}
 }
 
-// ParseBatchModifyAck decodes a NodeResponse carrying a BatchModifyAck. Success
-// is true when every leg was modified.
+// ParseBatchModifyAck decodes a BatchModifyAck (legacy wrapper or direct message).
 func ParseBatchModifyAck(data []byte) (*BatchModifyAck, bool, error) {
-	var resp sequencerpb.NodeResponse
-	if err := proto.Unmarshal(data, &resp); err != nil {
-		return nil, false, err
-	}
-	inner, ok := resp.Inner.(*sequencerpb.NodeResponse_BatchModifyAck)
-	if !ok || inner.BatchModifyAck == nil {
+	variant, payload := resolveRestPayload(data, "batch_modify_ack")
+	if variant != "batch_modify_ack" {
 		return nil, false, nil
 	}
-	a := inner.BatchModifyAck
+	var a sequencerpb.BatchModifyAck
+	if err := proto.Unmarshal(payload, &a); err != nil {
+		return nil, false, err
+	}
 	results := make([]BatchModifyLegResult, 0, len(a.Results))
 	success := len(a.Results) > 0
 	for _, r := range a.Results {
@@ -1009,9 +1101,9 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		f := inner.FundingRateUpdate
 		return &FundingRateUpdate{
 			SymbolID:        int64(f.SymbolId),
-			CurrentRate:     f.CurrentRate,
-			PredictedRate:   f.PredictedRate,
-			NextFundingTime: f.NextFundingTime,
+			CurrentRate:     f.FundingRate,
+			PredictedRate:   f.LastFundingRate,
+			NextFundingTime: 0,
 			Timestamp:       f.Timestamp,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
