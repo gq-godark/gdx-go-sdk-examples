@@ -1,0 +1,47 @@
+name: Notify examples of SDK change
+
+# Layer 2 dispatcher in the auto-publish chain.
+# Fires a repository_dispatch event into gdx-go-sdk-examples so its
+# auto-bump-sdk-pin.yml workflow can refresh its vendored SDK reference
+# (go.mod replace directive + UPSTREAM_REF marker) and open a rolling PR.
+# Merging that PR fires the existing release.yml in the examples repo,
+# which builds and tags a new ZIP under Releases.
+#
+# Only fires for the main branch (where SDK ships from); pushes to
+# feature branches are ignored intentionally so we don't fan out
+# unreleased work to the examples repo.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch gdx-sdk-changed to examples repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App token scoped to gdx-go-sdk-examples
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GDX_APP_ID }}
+          private-key: ${{ secrets.GDX_APP_PRIVATE_KEY }}
+          owner: gq-godark
+          repositories: gdx-go-sdk-examples
+          permission-contents: write
+
+      - name: Trigger gdx-go-sdk-examples auto-bump
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SDK_SHA: ${{ github.sha }}
+          SDK_BRANCH: ${{ github.ref_name }}
+        run: |
+          gh api repos/gq-godark/gdx-go-sdk-examples/dispatches \
+            -f event_type=gdx-sdk-changed \
+            -f "client_payload[sdk_sha]=${SDK_SHA}" \
+            -f "client_payload[sdk_branch]=${SDK_BRANCH}" \
+            -f "client_payload[source_repo]=gdx-go-sdk"

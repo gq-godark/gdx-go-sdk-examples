@@ -14,13 +14,13 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
+	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 	"github.com/gq-godark/gdx-go-sdk/internal/session"
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
 	"github.com/gq-godark/gdx-go-sdk/internal/wire"
-	edgepb "github.com/gq-godark/gdx-go-sdk/proto/gdx/edge/v1"
 	commonpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/common/v1"
+	edgepb "github.com/gq-godark/gdx-go-sdk/proto/gdx/edge/v1"
 )
 
 // Default testnet WebSocket origin. The client appends `/ws/v1`.
@@ -34,11 +34,10 @@ const defaultEdgeBaseURL = "wss://api.godark-dex.com"
 const defaultDevnetEdgeBaseURL = "ws://18.143.165.149:13300"
 
 // Sequencer HPKE static public key for public testnet (64 hex).
-// HPKE pins are environment-specific; set explicitly for production testnet.
-const testnetHpkeStaticPublicKeyHex = ""
+const testnetHpkeStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
 
 // Sequencer HPKE static public key for public devnet (64 hex).
-const devnetHpkeStaticPublicKeyHex = ""
+const devnetHpkeStaticPublicKeyHex = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
 
 // Environment names a deployment target. It selects the default edge URL and,
 // when known, a baked-in sequencer HPKE public key pin.
@@ -49,14 +48,15 @@ type Environment string
 
 const (
 	// EnvironmentTestnet is the public testnet (default zero value). It uses
-	// the public testnet edge URL; set NoiseStaticPublicKeyHex or
-	// GDX_HPKE_STATIC_PUBLIC_KEY for encrypted trading.
+	// the public testnet edge URL and a baked-in sequencer HPKE pin.
+	// Explicit NoiseStaticPublicKeyHex / GDX_HPKE_STATIC_PUBLIC_KEY still override.
 	EnvironmentTestnet Environment = "testnet"
 	// EnvironmentDevnet targets the public devnet edge
-	// (ws://18.143.165.149:13300). Set HPKE static key via config or env.
+	// (ws://18.143.165.149:13300) with a baked-in sequencer HPKE pin.
+	// Explicit config / env still override.
 	EnvironmentDevnet Environment = "devnet"
-	// EnvironmentLocalnet targets ws://127.0.0.1:4000. Set
-	// NoiseStaticPublicKeyHex or GODARK_HPKE_STATIC_PUBLIC_KEY.
+	// EnvironmentLocalnet targets ws://127.0.0.1:4000. No baked HPKE pin —
+	// set NoiseStaticPublicKeyHex or GDX_HPKE_STATIC_PUBLIC_KEY.
 	EnvironmentLocalnet Environment = "localnet"
 )
 
@@ -208,30 +208,30 @@ type GodarkClient struct {
 	connected      bool
 
 	// per-stream queues + callbacks
-	orderQueue        chan *OrderUpdate
-	positionQueue     chan *PositionUpdate
-	posSnapshotQueue  chan *PositionsSnapshot
-	systemHealthQueue chan *SystemHealthUpdate
-	balanceQueue      chan *BalanceUpdate
-	marginAlertQueue  chan *MarginAlert
-	fundingRateQueue  chan *FundingRateUpdate
-	settlementQueue          chan *SettlementUpdate
-	leverageSettingsQueue    chan *LeverageSettings
-	openOrdersSnapshotQueue  chan *OpenOrdersSnapshot
+	orderQueue              chan *OrderUpdate
+	positionQueue           chan *PositionUpdate
+	posSnapshotQueue        chan *PositionsSnapshot
+	systemHealthQueue       chan *SystemHealthUpdate
+	balanceQueue            chan *BalanceUpdate
+	marginAlertQueue        chan *MarginAlert
+	fundingRateQueue        chan *FundingRateUpdate
+	settlementQueue         chan *SettlementUpdate
+	leverageSettingsQueue   chan *LeverageSettings
+	openOrdersSnapshotQueue chan *OpenOrdersSnapshot
 
 	cbMu                        sync.RWMutex
 	orderCallbacks              []func(*OrderUpdate)
 	positionCallbacks           []func(*PositionUpdate)
 	snapshotCallbacks           []func(*PositionsSnapshot)
 	openOrdersSnapshotCallbacks []func(*OpenOrdersSnapshot)
-	healthCallbacks   []func(*SystemHealthUpdate)
-	balanceCallbacks  []func(*BalanceUpdate)
-	marginCallbacks   []func(*MarginAlert)
-	fundingCallbacks  []func(*FundingRateUpdate)
-	settlementCBs            []func(*SettlementUpdate)
-	leverageSettingsCallbacks []func(*LeverageSettings)
-	errorCallbacks           []func(error)
-	disconnectCB      []func()
+	healthCallbacks             []func(*SystemHealthUpdate)
+	balanceCallbacks            []func(*BalanceUpdate)
+	marginCallbacks             []func(*MarginAlert)
+	fundingCallbacks            []func(*FundingRateUpdate)
+	settlementCBs               []func(*SettlementUpdate)
+	leverageSettingsCallbacks   []func(*LeverageSettings)
+	errorCallbacks              []func(error)
+	disconnectCB                []func()
 
 	// session-setup waiter
 	sessionMu               sync.Mutex
@@ -254,6 +254,12 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	}
 
 	baseURL := resolveEdgeBaseURL(cfg.BaseURL, cfg.Environment)
+	// When BaseURL is explicit (e.g. GODARK_EDGE_URL=devnet), bake the HPKE pin
+	// from that host so EnvironmentTestnet + devnet URL does not pick the wrong key.
+	pinEnv := cfg.Environment
+	if strings.TrimSpace(cfg.BaseURL) != "" {
+		pinEnv = inferEnvironmentFromRestURL(cfg.BaseURL)
+	}
 	fallbackUUID := resolveUserUUID(cfg.UserUUID)
 
 	symbolMap := cfg.SymbolMap
@@ -288,7 +294,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		symbolMap:               symbolMap,
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
-	noiseStaticKey:          resolveHpkeStaticPublicKey(cfg.NoiseStaticPublicKeyHex, cfg.Environment),
+		noiseStaticKey:          resolveHpkeStaticPublicKey(cfg.NoiseStaticPublicKeyHex, pinEnv),
 		session:                 &session.CryptoSession{},
 		pendingEncryptedByNonce: make(map[uint64]transport.Message),
 		orderQueue:              make(chan *OrderUpdate, bufSize),
@@ -299,12 +305,13 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		marginAlertQueue:        make(chan *MarginAlert, bufSize),
 		fundingRateQueue:        make(chan *FundingRateUpdate, bufSize),
 		settlementQueue:         make(chan *SettlementUpdate, bufSize),
-		leverageSettingsQueue: make(chan *LeverageSettings, bufSize),
+		leverageSettingsQueue:   make(chan *LeverageSettings, bufSize),
 		openOrdersSnapshotQueue: make(chan *OpenOrdersSnapshot, bufSize),
 	}
 
 	c.transport = transport.New(transport.EdgeURL(baseURL), cfg.Transport, transport.Handlers{
 		OnEncryptedPush:      c.handleEncryptedPush,
+		OnPublicMessage:      c.handlePublicMessage,
 		OnSessionEstablished: c.handleSessionEstablished,
 		OnRekeyRequired:      c.handleRekeyRequired,
 		OnDisconnect:         c.handleDisconnect,
@@ -1213,6 +1220,25 @@ func (c *GodarkClient) handleEncryptedPush(msg transport.Message) {
 	c.dispatchEncryptedPush(msg)
 }
 
+func (c *GodarkClient) handlePublicMessage(msg transport.Message) {
+	for _, u := range ParseFundingRateSnapshotJSON(msg) {
+		c.dispatchFundingRateUpdate(u)
+	}
+}
+
+func (c *GodarkClient) dispatchFundingRateUpdate(u *FundingRateUpdate) {
+	if u == nil || u.FundingRate == "" {
+		return
+	}
+	nonBlockingSend(c.fundingRateQueue, u)
+	c.cbMu.RLock()
+	cbs := append([]func(*FundingRateUpdate){}, c.fundingCallbacks...)
+	c.cbMu.RUnlock()
+	for _, cb := range cbs {
+		safeCallFunding(cb, u)
+	}
+}
+
 func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	ct, err := base64.StdEncoding.DecodeString(ctB64)
@@ -1225,7 +1251,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	messageType, _ := msg["message_type"].(string)
 
 	switch messageType {
-	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack":
+	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack", "cancel_all_ack", "close_all_ack", "reverse_ack", "tpsl_ack":
 		aad, err := BuildResponseHeaderAADWithConn(
 			c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
@@ -1429,10 +1455,7 @@ func (c *GodarkClient) dispatchSequencerPush(parsed SequencerPush) {
 			safeCallMargin(cb, v)
 		}
 	case *FundingRateUpdate:
-		nonBlockingSend(c.fundingRateQueue, v)
-		for _, cb := range c.fundingCallbacks {
-			safeCallFunding(cb, v)
-		}
+		c.dispatchFundingRateUpdate(v)
 	case *SettlementUpdate:
 		nonBlockingSend(c.settlementQueue, v)
 		for _, cb := range c.settlementCBs {

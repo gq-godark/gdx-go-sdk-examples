@@ -221,6 +221,15 @@ func (t *Transport) PostLeverageEncrypted(ctx context.Context, bearer string, bo
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/leverage", bearer, body, nil)
 }
 
+// PostEncrypted issues an authenticated encrypted POST to an arbitrary
+// `/api/v1/...` path (e.g. openOrders snapshot RPCs, massQuote).
+func (t *Transport) PostEncrypted(ctx context.Context, bearer, path string, body map[string]any) (map[string]any, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return t.doJSON(ctx, http.MethodPost, path, bearer, body, nil)
+}
+
 // DeleteOrderEncrypted issues `DELETE /api/v1/orders/{order_id}` with an
 // encrypted body.
 func (t *Transport) DeleteOrderEncrypted(ctx context.Context, bearer, orderID string, body map[string]any) (map[string]any, error) {

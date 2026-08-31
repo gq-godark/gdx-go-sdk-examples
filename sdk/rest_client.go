@@ -12,15 +12,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gdxcrypto "github.com/gq-godark/gdx-go-sdk/internal/crypto"
+	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
 	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 	"github.com/gq-godark/gdx-go-sdk/internal/rest"
-	"github.com/gq-godark/gdx-go-sdk/internal/session"
 )
 
 const defaultRestBaseURL = "https://api.godark-dex.com"
+
+// REST-local HPKE sequencer pins (Track A). Do not fill client.go
+// testnetHpkeStaticPublicKeyHex / devnetHpkeStaticPublicKeyHex here — those
+// are reserved for the separate WS pin PR.
+const (
+	restTestnetHpkeStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
+	restDevnetHpkeStaticPublicKeyHex  = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
+)
 
 // RestClientConfig is the constructor input for NewRestClient. Either APIKey
 // (legacy single opaque key) OR APIKeyID + APISecret (key-pair) must be set.
@@ -40,6 +49,17 @@ type RestClientConfig struct {
 	// local edges do this). Also read from `GODARK_USER_UUID` / `GDX_USER_UUID`.
 	UserUUID string
 
+	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key for
+	// one-shot REST encryption. Preference: this field → env vars (same list
+	// as resolveHpkeStaticPublicKey) → REST-local baked pin for Environment
+	// (or URL-inferred environment). Localnet has no baked pin.
+	HpkeStaticPublicKeyHex string
+
+	// Environment selects the deployment for HPKE pin baking when
+	// HpkeStaticPublicKeyHex and env vars are unset. If empty, inferred from
+	// the resolved BaseURL via inferEnvironmentFromRestURL.
+	Environment Environment
+
 	// SymbolMap overrides the embedded default symbol map.
 	SymbolMap map[string]int64
 
@@ -48,8 +68,9 @@ type RestClientConfig struct {
 	HTTPClient *http.Client
 }
 
-// GodarkRestClient exposes REST account and market endpoints. Encrypted
-// trading requires the HPKE WebSocket session and is intentionally refused.
+// GodarkRestClient exposes REST account, market, and encrypted trading
+// endpoints. Each encrypted request uses one-shot HPKE (encapped_key +
+// request_id); there is no persistent REST session.
 type GodarkRestClient struct {
 	legacyToken string
 	apiKeyID    string
@@ -58,18 +79,20 @@ type GodarkRestClient struct {
 	baseURL     string
 	symbolMap   map[string]int64
 	http        *rest.Transport
-	session     *session.CryptoSession
+	hpkePinHex  string
 	fallback    string
 
 	mu             sync.RWMutex
 	bearer         string
 	userUUID       string
+	tokenScope     string
 	walletAddr     string
 	localCOIDIndex map[string]string
+	nextRequestID  atomic.Uint64
 }
 
 // NewRestClient validates the config and returns an unconnected client.
-// Call Connect to obtain a bearer token. Encrypted trading remains WebSocket-only.
+// Call Connect to obtain a bearer token before encrypted trading RPCs.
 func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 	creds, err := resolveRestCredentials(RestClientConfig{
 		APIKey:     cfg.APIKey,
@@ -81,11 +104,17 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		return nil, err
 	}
 	base := resolveRestBaseURL(cfg.BaseURL)
+	env := cfg.Environment
+	if strings.TrimSpace(string(env)) == "" {
+		env = inferEnvironmentFromRestURL(base)
+	} else {
+		env = env.normalize()
+	}
 	symMap := cfg.SymbolMap
 	if symMap == nil {
 		symMap = DefaultSymbolMap()
 	}
-	return &GodarkRestClient{
+	c := &GodarkRestClient{
 		legacyToken:    creds.legacyToken,
 		apiKeyID:       creds.apiKeyID,
 		apiSecret:      creds.apiSecret,
@@ -93,10 +122,12 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		baseURL:        base,
 		symbolMap:      symMap,
 		http:           rest.New(base, cfg.HTTPClient),
-		session:        &session.CryptoSession{},
+		hpkePinHex:     resolveRestHpkePin(cfg.HpkeStaticPublicKeyHex, env),
 		fallback:       resolveUserUUID(cfg.UserUUID),
 		localCOIDIndex: make(map[string]string),
-	}, nil
+	}
+	c.nextRequestID.Store(1)
+	return c, nil
 }
 
 type restCredentials struct {
@@ -133,9 +164,9 @@ func resolveRestCredentials(cfg RestClientConfig) (restCredentials, error) {
 	return restCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
 }
 
-// IsSessionEstablished is always false: REST cannot establish an HPKE session.
+// IsSessionEstablished is always false: REST uses one-shot HPKE per request.
 func (c *GodarkRestClient) IsSessionEstablished() bool {
-	return c.session.IsEstablished()
+	return false
 }
 
 // BaseURL returns the resolved REST origin.
@@ -156,8 +187,16 @@ func (c *GodarkRestClient) BearerToken() string {
 	return c.bearer
 }
 
-// Connect authenticates REST requests. It does not create an encrypted trading
-// session because HPKE setup is a WebSocket binary flow.
+// TokenScope returns the OAuth scope string from the last auth/token response.
+func (c *GodarkRestClient) TokenScope() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tokenScope
+}
+
+// Connect authenticates REST requests via POST /api/v1/auth/token. User identity
+// is resolved from user_uuid in the auth response, constructor/env fallback, or
+// the JWT sub claim.
 func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	var (
 		authData map[string]any
@@ -181,19 +220,27 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	}
 
 	uid, _ := authData["user_uuid"].(string)
-	if uid == "" {
+	if strings.TrimSpace(uid) == "" {
 		uid = c.fallback
 	}
 	if uid == "" {
+		if parsed, ok := userUUIDFromAccessTokenJWT(bearer); ok {
+			uid = parsed
+		}
+	}
+	if uid == "" {
 		return newAuthenticationError(
-			"REST auth succeeded but user_uuid missing in response and no fallback " +
+			"REST auth succeeded but user_uuid missing in response, JWT sub, and no fallback " +
 				"provided via constructor or GODARK_USER_UUID / GDX_USER_UUID env vars",
 		)
 	}
 
+	scope, _ := authData["scope"].(string)
+
 	c.mu.Lock()
 	c.bearer = bearer
 	c.userUUID = uid
+	c.tokenScope = scope
 	c.mu.Unlock()
 
 	return nil
@@ -211,10 +258,10 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	c.bearer = ""
 	c.userUUID = ""
+	c.tokenScope = ""
 	c.walletAddr = ""
 	c.localCOIDIndex = make(map[string]string)
 	c.mu.Unlock()
-	c.session.Reset()
 	return nil
 }
 
@@ -517,6 +564,105 @@ func (c *GodarkRestClient) GetVolume(ctx context.Context) (map[string]any, error
 	return c.http.GetVolume(ctx)
 }
 
+// GetOpenOrders returns live open orders via encrypted POST /api/v1/openOrders.
+func (c *GodarkRestClient) GetOpenOrders(ctx context.Context) (*OpenOrdersSnapshot, error) {
+	variant, err := c.snapshotRPC(ctx, "get_open_orders", BuildGetOpenOrdersRequest, "/api/v1/openOrders")
+	if err != nil {
+		return nil, err
+	}
+	if variant.Kind != "open_orders_snapshot" || variant.OpenOrders == nil {
+		return nil, newOrderError(fmt.Sprintf("expected open_orders_snapshot, got %s", variant.Kind), "")
+	}
+	return variant.OpenOrders, nil
+}
+
+// GetPositions returns live positions via encrypted POST /api/v1/positions.
+func (c *GodarkRestClient) GetPositions(ctx context.Context) (*PositionsSnapshot, error) {
+	variant, err := c.snapshotRPC(ctx, "get_positions", BuildGetPositionsRequest, "/api/v1/positions")
+	if err != nil {
+		return nil, err
+	}
+	if variant.Kind != "positions_snapshot" || variant.Positions == nil {
+		return nil, newOrderError(fmt.Sprintf("expected positions_snapshot, got %s", variant.Kind), "")
+	}
+	return variant.Positions, nil
+}
+
+// GetAccount returns live account margin via encrypted POST /api/v1/account.
+func (c *GodarkRestClient) GetAccount(ctx context.Context) (*AccountMarginUpdate, error) {
+	variant, err := c.snapshotRPC(ctx, "get_account", BuildGetAccountRequest, "/api/v1/account")
+	if err != nil {
+		return nil, err
+	}
+	if (variant.Kind != "account_margin_update" && variant.Kind != "account_update") || variant.AccountMargin == nil {
+		return nil, newOrderError(fmt.Sprintf("expected account_margin_update, got %s", variant.Kind), "")
+	}
+	return variant.AccountMargin, nil
+}
+
+// MassQuote performs bulk cancel-replace via encrypted POST /api/v1/orders/massQuote.
+func (c *GodarkRestClient) MassQuote(ctx context.Context, symbol string, legs []MassQuoteLegInput, postOnly *bool) (*MassQuoteAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
+	if err != nil {
+		return nil, err
+	}
+	sealed, raw, err := c.sendEncryptedEnvelope(ctx, "mass_quote", uint64(symbolID), plaintext, corrID, restEncRoute{kind: "post_path", postPath: "/api/v1/orders/massQuote"}, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseMassQuoteREST(raw, sealed)
+}
+
+// BatchCancel cancels up to 20 resting orders via encrypted POST /api/v1/orders.
+func (c *GodarkRestClient) BatchCancel(ctx context.Context, symbol string, orderIDs []uint64) (*BatchCancelAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	sealed, raw, err := c.sendEncryptedEnvelope(ctx, "batch_cancel", uint64(symbolID), plaintext, corrID, restEncRoute{kind: "post_orders"}, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseBatchCancelREST(raw, sealed)
+}
+
+// BatchModify amends up to 20 resting orders via encrypted POST /api/v1/orders.
+func (c *GodarkRestClient) BatchModify(ctx context.Context, symbol string, legs []BatchModifyLegInput) (*BatchModifyAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	if err != nil {
+		return nil, err
+	}
+	sealed, raw, err := c.sendEncryptedEnvelope(ctx, "batch_modify", uint64(symbolID), plaintext, corrID, restEncRoute{kind: "post_orders"}, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseBatchModifyREST(raw, sealed)
+}
+
 // UpdateLeverage sends an encrypted leverage update via `POST /api/v1/leverage`.
 // The JSON header must include `leverage` so the edge can update its DB cache
 // and fan out WS pushes on success.
@@ -539,42 +685,11 @@ func (c *GodarkRestClient) UpdateLeverage(ctx context.Context, symbol string, le
 		return nil, err
 	}
 
-	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
-	nonceCounter := c.session.NextNonce()
-
-	aad, err := BuildOrderHeaderAAD(c.userUUIDBytes(), uint64(symbolID), "update_leverage", uint64(nonceCounter), bodyLength, corrID)
+	sealed, raw, err := c.sendEncryptedEnvelope(ctx, "update_leverage", uint64(symbolID), plaintext, corrID, restEncRoute{kind: "post_leverage"}, "", &lev)
 	if err != nil {
 		return nil, err
 	}
-	actualNonce, ciphertext, err := c.session.EncryptOrder(aad, plaintext)
-	if err != nil {
-		return nil, newEncryptionError(fmt.Sprintf("encrypt leverage update: %v", err))
-	}
-	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
-
-	corrIDStr := hex.EncodeToString(corrID)
-	headerObj := map[string]any{
-		"symbol_id":      symbolID,
-		"request_type":   "update_leverage",
-		"nonce":          actualNonce,
-		"body_length":    bodyLength,
-		"correlation_id": corrIDStr,
-		"leverage":       lev,
-	}
-	payload := map[string]any{
-		"header":     headerObj,
-		"ciphertext": bodyB64,
-	}
-
-	c.mu.RLock()
-	bearer := c.bearer
-	c.mu.RUnlock()
-
-	raw, err := c.http.PostLeverageEncrypted(ctx, bearer, payload)
-	if err != nil {
-		return nil, err
-	}
-	return c.parseAck(raw)
+	return c.parseAck(raw, sealed)
 }
 
 // AwaitTerminalStatus polls GetOrder until the order reaches one of
@@ -612,31 +727,93 @@ func (c *GodarkRestClient) AwaitTerminalStatus(ctx context.Context, orderID stri
 // Internals
 // -----------------------------------------------------------------------
 
-func (c *GodarkRestClient) sendEncrypted(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte, clientOrderID string, httpMethod, pathOrderID string) (*OrderAck, error) {
+type restEncRoute struct {
+	kind     string // post_orders | post_leverage | post_path | delete | patch
+	postPath string
+	orderID  string
+}
+
+func correlationIDHeaderHex(correlationID []byte) string {
+	if len(correlationID) != 16 {
+		if len(correlationID) == 0 {
+			return ""
+		}
+		return hex.EncodeToString(correlationID)
+	}
+	for _, b := range correlationID {
+		if b != 0 {
+			return hex.EncodeToString(correlationID)
+		}
+	}
+	return ""
+}
+
+func (c *GodarkRestClient) pinnedRecipient() ([]byte, error) {
+	c.mu.RLock()
+	pin := c.hpkePinHex
+	c.mu.RUnlock()
+	if strings.TrimSpace(pin) == "" {
+		return nil, newSessionError("HPKE static public key unset; set HpkeStaticPublicKeyHex or GDX_HPKE_STATIC_PUBLIC_KEY")
+	}
+	return hpke.ParsePinnedStaticPublicKey(pin)
+}
+
+func (c *GodarkRestClient) setupRESTSession(userUUID []byte) (uint64, []byte, *hpke.SealedSession, error) {
+	recipient, err := c.pinnedRecipient()
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	requestID := c.nextRequestID.Add(1) - 1
+	info := hpke.InfoForRESTRequest(userUUID, requestID)
+	encapped, sealed, err := hpke.SetupSession(recipient, info)
+	if err != nil {
+		return 0, nil, nil, newEncryptionError(fmt.Sprintf("HPKE setup: %v", err))
+	}
+	return requestID, encapped, sealed, nil
+}
+
+func (c *GodarkRestClient) sendEncryptedEnvelope(
+	ctx context.Context,
+	requestType string,
+	symbolID uint64,
+	plaintext, correlationID []byte,
+	route restEncRoute,
+	clientOrderID string,
+	headerLeverage *int,
+) (*hpke.SealedSession, map[string]any, error) {
+	userUUID := c.userUUIDBytes()
+	requestID, encapped, sealed, err := c.setupRESTSession(userUUID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	const nonce = uint64(0)
 	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
-	nonceCounter := c.session.NextNonce()
-
-	aad, err := BuildOrderHeaderAAD(c.userUUIDBytes(), symbolID, requestType, uint64(nonceCounter), bodyLength, correlationID)
+	aad, err := BuildOrderHeaderAAD(userUUID, symbolID, requestType, nonce, bodyLength, correlationID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	actualNonce, ciphertext, err := c.session.EncryptOrder(aad, plaintext)
+	nonceBytes := hpke.NonceFromU64(nonce)
+	ciphertext, err := sealed.SealC2S(nonceBytes[:], aad, plaintext)
 	if err != nil {
-		return nil, newEncryptionError(fmt.Sprintf("encrypt order: %v", err))
+		return nil, nil, newEncryptionError(fmt.Sprintf("encrypt request: %v", err))
 	}
-	bodyB64 := base64.StdEncoding.EncodeToString(ciphertext)
 
-	corrIDStr := hex.EncodeToString(correlationID)
 	headerObj := map[string]any{
 		"symbol_id":      symbolID,
 		"request_type":   requestType,
-		"nonce":          actualNonce,
+		"nonce":          nonce,
 		"body_length":    bodyLength,
-		"correlation_id": corrIDStr,
+		"correlation_id": correlationIDHeaderHex(correlationID),
+	}
+	if headerLeverage != nil {
+		headerObj["leverage"] = *headerLeverage
 	}
 	payload := map[string]any{
-		"header":     headerObj,
-		"ciphertext": bodyB64,
+		"header":         headerObj,
+		"encrypted_body": base64.StdEncoding.EncodeToString(ciphertext),
+		"encapped_key":   base64.StdEncoding.EncodeToString(encapped),
+		"request_id":     requestID,
 	}
 	if clientOrderID != "" {
 		payload["client_order_id"] = clientOrderID
@@ -647,26 +824,96 @@ func (c *GodarkRestClient) sendEncrypted(ctx context.Context, requestType string
 	c.mu.RUnlock()
 
 	var raw map[string]any
+	switch route.kind {
+	case "post_orders":
+		raw, err = c.http.PostOrdersEncrypted(ctx, bearer, payload)
+	case "post_leverage":
+		raw, err = c.http.PostLeverageEncrypted(ctx, bearer, payload)
+	case "post_path":
+		if route.postPath == "" {
+			return nil, nil, errors.New("post_path route requires postPath")
+		}
+		raw, err = c.http.PostEncrypted(ctx, bearer, route.postPath, payload)
+	case "delete":
+		if route.orderID == "" {
+			return nil, nil, errors.New("delete route requires orderID")
+		}
+		raw, err = c.http.DeleteOrderEncrypted(ctx, bearer, route.orderID, payload)
+	case "patch":
+		if route.orderID == "" {
+			return nil, nil, errors.New("patch route requires orderID")
+		}
+		raw, err = c.http.PatchOrderEncrypted(ctx, bearer, route.orderID, payload)
+	default:
+		return nil, nil, fmt.Errorf("unsupported encrypted route: %q", route.kind)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return sealed, raw, nil
+}
+
+func (c *GodarkRestClient) sendEncrypted(ctx context.Context, requestType string, symbolID uint64, plaintext, correlationID []byte, clientOrderID string, httpMethod, pathOrderID string) (*OrderAck, error) {
+	route := restEncRoute{kind: "post_orders"}
 	switch httpMethod {
 	case "POST":
-		raw, err = c.http.PostOrdersEncrypted(ctx, bearer, payload)
+		route.kind = "post_orders"
 	case "DELETE":
-		raw, err = c.http.DeleteOrderEncrypted(ctx, bearer, pathOrderID, payload)
+		route.kind = "delete"
+		route.orderID = pathOrderID
 	case "PATCH":
-		raw, err = c.http.PatchOrderEncrypted(ctx, bearer, pathOrderID, payload)
+		route.kind = "patch"
+		route.orderID = pathOrderID
 	default:
 		return nil, fmt.Errorf("unsupported HTTP method: %q", httpMethod)
 	}
+	sealed, raw, err := c.sendEncryptedEnvelope(ctx, requestType, symbolID, plaintext, correlationID, route, clientOrderID, nil)
 	if err != nil {
 		return nil, err
 	}
-	return c.parseAck(raw)
+	return c.parseAck(raw, sealed)
 }
 
-func (c *GodarkRestClient) parseAck(raw map[string]any) (*OrderAck, error) {
-	// Encrypted ack path: same shape as WS encrypted_push frames.
+func (c *GodarkRestClient) snapshotRPC(
+	ctx context.Context,
+	requestType string,
+	build func([]byte, []byte) ([]byte, error),
+	path string,
+) (*NodeResponseVariant, error) {
+	corrID := newCorrelationID()
+	plaintext, err := build(c.userUUIDBytes(), corrID)
+	if err != nil {
+		return nil, err
+	}
+	headerSymbolID, ok := c.symbolMap["BTC-USDC-PERP"]
+	if !ok {
+		for _, id := range c.symbolMap {
+			headerSymbolID = id
+			break
+		}
+		if headerSymbolID == 0 {
+			headerSymbolID = 1
+		}
+	}
+	sealed, raw, err := c.sendEncryptedEnvelope(
+		ctx, requestType, uint64(headerSymbolID), plaintext, corrID,
+		restEncRoute{kind: "post_path", postPath: path}, "", nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !hasEncrypted(raw) {
+		return nil, newOrderError(fmt.Sprintf("expected encrypted snapshot reply for %s", requestType), "")
+	}
+	return c.decryptRestNodeResponse(raw, sealed)
+}
+
+func (c *GodarkRestClient) parseAck(raw map[string]any, sealed *hpke.SealedSession) (*OrderAck, error) {
 	if hasEncrypted(raw) {
-		return c.decryptRestAck(raw)
+		if sealed == nil {
+			return nil, newEncryptionError("encrypted REST ack requires one-shot HPKE session")
+		}
+		return c.decryptRestAck(raw, sealed)
 	}
 	if v, ok := raw["success"].(bool); ok && !v {
 		ec, _ := raw["error_code"].(string)
@@ -683,7 +930,7 @@ func (c *GodarkRestClient) parseAck(raw map[string]any) (*OrderAck, error) {
 	}, nil
 }
 
-func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error) {
+func (c *GodarkRestClient) decryptRestPlaintext(msg map[string]any, sealed *hpke.SealedSession) ([]byte, error) {
 	ctB64, _ := msg["encrypted_body"].(string)
 	if ctB64 == "" {
 		ctB64, _ = msg["ciphertext"].(string)
@@ -692,22 +939,31 @@ func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error)
 	if err != nil {
 		return nil, newEncryptionError(fmt.Sprintf("decode ack: %v", err))
 	}
-	nonce := coerceUint32(msg["nonce"])
+	nonce := coerceUint64(msg["nonce"])
 	fencingEpoch := coerceUint64(msg["fencing_epoch"])
 	messageType, _ := msg["message_type"].(string)
 	if messageType == "" {
 		messageType = "ack"
 	}
 	aad, err := BuildResponseHeaderAAD(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), uint64(nonce), fencingEpoch,
+		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]),
 	)
 	if err != nil {
 		return nil, err
 	}
-	pt, err := c.session.DecryptPush(uint64(nonce), aad, ct)
+	nonceBytes := hpke.NonceFromU64(nonce)
+	pt, err := sealed.OpenS2C(nonceBytes[:], aad, ct)
 	if err != nil {
-		return nil, newEncryptionError(fmt.Sprintf("decrypt ack: %v", err))
+		return nil, newEncryptionError(fmt.Sprintf("decrypt REST reply: %v", err))
+	}
+	return pt, nil
+}
+
+func (c *GodarkRestClient) decryptRestAck(msg map[string]any, sealed *hpke.SealedSession) (*OrderAck, error) {
+	pt, err := c.decryptRestPlaintext(msg, sealed)
+	if err != nil {
+		return nil, err
 	}
 	ack, isAck, err := ParseNodeResponseAck(pt)
 	if err != nil {
@@ -728,6 +984,93 @@ func (c *GodarkRestClient) decryptRestAck(msg map[string]any) (*OrderAck, error)
 		Success:  true,
 		Sequence: strconv.FormatUint(ack.Sequence, 10),
 	}, nil
+}
+
+func (c *GodarkRestClient) decryptRestNodeResponse(msg map[string]any, sealed *hpke.SealedSession) (*NodeResponseVariant, error) {
+	pt, err := c.decryptRestPlaintext(msg, sealed)
+	if err != nil {
+		return nil, err
+	}
+	messageType, _ := msg["message_type"].(string)
+	return ParseNodeResponseVariant(pt, messageType)
+}
+
+func (c *GodarkRestClient) parseMassQuoteREST(raw map[string]any, sealed *hpke.SealedSession) (*MassQuoteAck, error) {
+	pt, err := c.decryptRestPlaintext(raw, sealed)
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseMassQuoteAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		na, isAck, err := ParseNodeResponseAck(pt)
+		if err != nil {
+			return nil, err
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, MakeOrderErrorFromJSON(na.RejectText, code)
+		}
+		return nil, newOrderError("expected mass_quote_ack inside encrypted REST body", "")
+	}
+	return ack, nil
+}
+
+func (c *GodarkRestClient) parseBatchCancelREST(raw map[string]any, sealed *hpke.SealedSession) (*BatchCancelAck, error) {
+	pt, err := c.decryptRestPlaintext(raw, sealed)
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchCancelAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		na, isAck, err := ParseNodeResponseAck(pt)
+		if err != nil {
+			return nil, err
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, MakeOrderErrorFromJSON(na.RejectText, code)
+		}
+		return nil, newOrderError("expected batch_cancel_ack inside encrypted REST body", "")
+	}
+	return ack, nil
+}
+
+func (c *GodarkRestClient) parseBatchModifyREST(raw map[string]any, sealed *hpke.SealedSession) (*BatchModifyAck, error) {
+	pt, err := c.decryptRestPlaintext(raw, sealed)
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseBatchModifyAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		na, isAck, err := ParseNodeResponseAck(pt)
+		if err != nil {
+			return nil, err
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, MakeOrderErrorFromJSON(na.RejectText, code)
+		}
+		return nil, newOrderError("expected batch_modify_ack inside encrypted REST body", "")
+	}
+	return ack, nil
 }
 
 func hasEncrypted(raw map[string]any) bool {
@@ -765,6 +1108,7 @@ func (c *GodarkRestClient) ensureReady() error {
 	c.mu.RLock()
 	bearer := c.bearer
 	uid := c.userUUID
+	hpkePin := c.hpkePinHex
 	c.mu.RUnlock()
 	if bearer == "" {
 		return newConnectionError("not connected: call Connect first")
@@ -772,8 +1116,8 @@ func (c *GodarkRestClient) ensureReady() error {
 	if uid == "" {
 		return newConnectionError("not authenticated")
 	}
-	if !c.session.IsEstablished() {
-		return newSessionError("encrypted REST trading is not supported; use GodarkClient over WebSocket with HPKE")
+	if strings.TrimSpace(hpkePin) == "" {
+		return newSessionError("HPKE static public key unset; set HpkeStaticPublicKeyHex or GDX_HPKE_STATIC_PUBLIC_KEY")
 	}
 	return nil
 }
@@ -802,6 +1146,64 @@ func (c *GodarkRestClient) resolveSymbol(symbol string) (int64, error) {
 		return 0, fmt.Errorf("unknown symbol %q (known: %v)", symbol, known)
 	}
 	return id, nil
+}
+
+// inferEnvironmentFromRestURL maps a REST origin to an Environment for pin baking.
+// Localhost / 127.0.0.1 → localnet (no baked pin); hosts containing "devnet" or
+// the public devnet IP → devnet; godark-dex.com (and unknown hosts) → testnet.
+func inferEnvironmentFromRestURL(base string) Environment {
+	host := strings.TrimSpace(strings.ToLower(base))
+	for _, prefix := range []string{"https://", "http://", "wss://", "ws://"} {
+		if strings.HasPrefix(host, prefix) {
+			host = host[len(prefix):]
+			break
+		}
+	}
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	if host == "127.0.0.1" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return EnvironmentLocalnet
+	}
+	if strings.Contains(host, "devnet") || host == "18.143.165.149" {
+		return EnvironmentDevnet
+	}
+	if strings.Contains(host, "godark-dex.com") {
+		return EnvironmentTestnet
+	}
+	return EnvironmentTestnet
+}
+
+// resolveRestHpkePin resolves the REST HPKE pin: explicit → env vars → REST-local
+// baked testnet/devnet constants. Localnet returns "" (env/explicit required).
+func resolveRestHpkePin(explicit string, env Environment) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	for _, key := range []string{
+		"GDX_HPKE_STATIC_PUBLIC_KEY",
+		"GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_HPKE_STATIC_PUBLIC_KEY",
+		"VITE_GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBKEY",
+	} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	switch env.normalize() {
+	case EnvironmentTestnet:
+		return restTestnetHpkeStaticPublicKeyHex
+	case EnvironmentDevnet:
+		return restDevnetHpkeStaticPublicKeyHex
+	default:
+		return ""
+	}
 }
 
 func resolveRestBaseURL(explicit string) string {
