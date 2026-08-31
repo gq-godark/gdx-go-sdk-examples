@@ -279,6 +279,28 @@ type MarginAlert struct {
 	Recovered        bool
 }
 
+// AccountMarginSummary is the authoritative account-level margin summary
+// (decimal string amounts).
+type AccountMarginSummary struct {
+	TotalCollateral      string
+	PositionMargin       string
+	ReservedOrderMargin  string
+	FreeCollateral       string
+	AccountEquity        string
+	UnrealizedPnl        string
+	CrossAvailable       string
+	RealizedPnl          string
+}
+
+// AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
+// snapshot or WS push).
+type AccountMarginUpdate struct {
+	UserUUID        string
+	ServerTimestamp uint64
+	Account         *AccountMarginSummary
+	CorrelationID   uint64
+}
+
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.
 type FundingRateUpdate struct {
 	SymbolID        int64
