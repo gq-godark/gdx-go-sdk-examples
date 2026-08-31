@@ -23,6 +23,14 @@ import (
 
 const defaultRestBaseURL = "https://api.godark-dex.com"
 
+// REST-local HPKE sequencer pins (Track A). Do not fill client.go
+// testnetHpkeStaticPublicKeyHex / devnetHpkeStaticPublicKeyHex here — those
+// are reserved for the separate WS pin PR.
+const (
+	restTestnetHpkeStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
+	restDevnetHpkeStaticPublicKeyHex  = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e2896912d91222678ab54cdd45"
+)
+
 // RestClientConfig is the constructor input for NewRestClient. Either APIKey
 // (legacy single opaque key) OR APIKeyID + APISecret (key-pair) must be set.
 type RestClientConfig struct {
@@ -42,9 +50,15 @@ type RestClientConfig struct {
 	UserUUID string
 
 	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key for
-	// one-shot REST encryption. Preference: this field → env vars (see
-	// resolveHpkeStaticPublicKey) → baked-in Environment preset when set.
+	// one-shot REST encryption. Preference: this field → env vars (same list
+	// as resolveHpkeStaticPublicKey) → REST-local baked pin for Environment
+	// (or URL-inferred environment). Localnet has no baked pin.
 	HpkeStaticPublicKeyHex string
+
+	// Environment selects the deployment for HPKE pin baking when
+	// HpkeStaticPublicKeyHex and env vars are unset. If empty, inferred from
+	// the resolved BaseURL via inferEnvironmentFromRestURL.
+	Environment Environment
 
 	// SymbolMap overrides the embedded default symbol map.
 	SymbolMap map[string]int64
@@ -90,6 +104,12 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		return nil, err
 	}
 	base := resolveRestBaseURL(cfg.BaseURL)
+	env := cfg.Environment
+	if strings.TrimSpace(string(env)) == "" {
+		env = inferEnvironmentFromRestURL(base)
+	} else {
+		env = env.normalize()
+	}
 	symMap := cfg.SymbolMap
 	if symMap == nil {
 		symMap = DefaultSymbolMap()
@@ -102,7 +122,7 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		baseURL:        base,
 		symbolMap:      symMap,
 		http:           rest.New(base, cfg.HTTPClient),
-		hpkePinHex:     resolveHpkeStaticPublicKey(cfg.HpkeStaticPublicKeyHex, EnvironmentTestnet),
+		hpkePinHex:     resolveRestHpkePin(cfg.HpkeStaticPublicKeyHex, env),
 		fallback:       resolveUserUUID(cfg.UserUUID),
 		localCOIDIndex: make(map[string]string),
 	}
@@ -708,9 +728,9 @@ func (c *GodarkRestClient) AwaitTerminalStatus(ctx context.Context, orderID stri
 // -----------------------------------------------------------------------
 
 type restEncRoute struct {
-	kind      string // post_orders | post_leverage | post_path | delete | patch
-	postPath  string
-	orderID   string
+	kind     string // post_orders | post_leverage | post_path | delete | patch
+	postPath string
+	orderID  string
 }
 
 func correlationIDHeaderHex(correlationID []byte) string {
@@ -1126,6 +1146,64 @@ func (c *GodarkRestClient) resolveSymbol(symbol string) (int64, error) {
 		return 0, fmt.Errorf("unknown symbol %q (known: %v)", symbol, known)
 	}
 	return id, nil
+}
+
+// inferEnvironmentFromRestURL maps a REST origin to an Environment for pin baking.
+// Localhost / 127.0.0.1 → localnet (no baked pin); hosts containing "devnet" or
+// the public devnet IP → devnet; godark-dex.com (and unknown hosts) → testnet.
+func inferEnvironmentFromRestURL(base string) Environment {
+	host := strings.TrimSpace(strings.ToLower(base))
+	for _, prefix := range []string{"https://", "http://", "wss://", "ws://"} {
+		if strings.HasPrefix(host, prefix) {
+			host = host[len(prefix):]
+			break
+		}
+	}
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	if host == "127.0.0.1" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return EnvironmentLocalnet
+	}
+	if strings.Contains(host, "devnet") || host == "18.143.165.149" {
+		return EnvironmentDevnet
+	}
+	if strings.Contains(host, "godark-dex.com") {
+		return EnvironmentTestnet
+	}
+	return EnvironmentTestnet
+}
+
+// resolveRestHpkePin resolves the REST HPKE pin: explicit → env vars → REST-local
+// baked testnet/devnet constants. Localnet returns "" (env/explicit required).
+func resolveRestHpkePin(explicit string, env Environment) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	for _, key := range []string{
+		"GDX_HPKE_STATIC_PUBLIC_KEY",
+		"GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_HPKE_STATIC_PUBLIC_KEY",
+		"VITE_GDX_HPKE_STATIC_PUBKEY",
+		"GODARK_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBLIC_KEY",
+		"GDX_NOISE_STATIC_PUBKEY",
+	} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	switch env.normalize() {
+	case EnvironmentTestnet:
+		return restTestnetHpkeStaticPublicKeyHex
+	case EnvironmentDevnet:
+		return restDevnetHpkeStaticPublicKeyHex
+	default:
+		return ""
+	}
 }
 
 func resolveRestBaseURL(explicit string) string {
