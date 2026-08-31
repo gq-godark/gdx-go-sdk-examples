@@ -1101,10 +1101,9 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 		f := inner.FundingRateUpdate
 		return &FundingRateUpdate{
 			SymbolID:        int64(f.SymbolId),
-			CurrentRate:     f.FundingRate,
-			PredictedRate:   f.LastFundingRate,
-			NextFundingTime: 0,
+			FundingRate:     f.FundingRate,
 			Timestamp:       f.Timestamp,
+			LastFundingRate: f.LastFundingRate,
 		}, nil
 	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
 		b := inner.BalanceUpdate
@@ -1128,3 +1127,44 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 // _ keeps math/big import used (correlation_id helpers are exported via
 // correlationIDBigInt for callers that need the full u128 view).
 var _ = big.NewInt
+
+// ParseFundingRateSnapshotJSON decodes public WS funding_rate_snapshot rows.
+func ParseFundingRateSnapshotJSON(obj map[string]any) []*FundingRateUpdate {
+	typ, _ := obj["type"].(string)
+	if typ != "funding_rate_snapshot" {
+		return nil
+	}
+	rows, _ := obj["rows"].([]any)
+	out := make([]*FundingRateUpdate, 0, len(rows))
+	for _, row := range rows {
+		m, ok := row.(map[string]any)
+		if !ok {
+			continue
+		}
+		rate, _ := m["funding_rate"].(string)
+		if rate == "" {
+			continue
+		}
+		last, _ := m["last_funding_rate"].(string)
+		out = append(out, &FundingRateUpdate{
+			SymbolID:        fundingSnapshotSymbolID(m["symbol_id"]),
+			FundingRate:     rate,
+			LastFundingRate: last,
+			Timestamp:       uint64(coerceUint64(m["timestamp"])),
+		})
+	}
+	return out
+}
+
+func fundingSnapshotSymbolID(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	default:
+		return 0
+	}
+}
