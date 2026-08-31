@@ -594,7 +594,7 @@ func (c *GodarkRestClient) GetAccount(ctx context.Context) (*AccountMarginUpdate
 	if err != nil {
 		return nil, err
 	}
-	if variant.Kind != "account_margin_update" || variant.AccountMargin == nil {
+	if (variant.Kind != "account_margin_update" && variant.Kind != "account_update") || variant.AccountMargin == nil {
 		return nil, newOrderError(fmt.Sprintf("expected account_margin_update, got %s", variant.Kind), "")
 	}
 	return variant.AccountMargin, nil

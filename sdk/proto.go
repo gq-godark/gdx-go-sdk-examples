@@ -36,7 +36,7 @@ func (*BalanceUpdate) isSequencerPush()        {}
 func (*MarginAlert) isSequencerPush()          {}
 func (*FundingRateUpdate) isSequencerPush()    {}
 func (*SettlementUpdate) isSequencerPush()     {}
-func (*LeverageSettings) isSequencerPush()    {}
+func (*LeverageSettings) isSequencerPush()     {}
 func (*UnknownSequencerPush) isSequencerPush() {}
 
 // ---------------------------------------------------------------------------
@@ -588,7 +588,7 @@ func unwrapLegacyNodeResponse(data []byte) (variant string, inner []byte, ok boo
 
 func normalizeExpectedSnapshotVariant(messageType string) string {
 	switch strings.ReplaceAll(messageType, "-", "_") {
-	case "account_margin":
+	case "account_margin", "account_update":
 		return "account_margin_update"
 	default:
 		return strings.ReplaceAll(messageType, "-", "_")
@@ -820,14 +820,14 @@ func ParsePositionsSnapshotFromNodeResponse(data []byte) (*PositionsSnapshot, er
 
 // NodeResponseVariant is the parsed union of synchronous NodeResponse replies.
 type NodeResponseVariant struct {
-	Kind            string
-	Ack             *NodeAck
-	OpenOrders      *OpenOrdersSnapshot
-	Positions       *PositionsSnapshot
-	AccountMargin   *AccountMarginUpdate
-	MassQuote       *MassQuoteAck
-	BatchCancel     *BatchCancelAck
-	BatchModify     *BatchModifyAck
+	Kind          string
+	Ack           *NodeAck
+	OpenOrders    *OpenOrdersSnapshot
+	Positions     *PositionsSnapshot
+	AccountMargin *AccountMarginUpdate
+	MassQuote     *MassQuoteAck
+	BatchCancel   *BatchCancelAck
+	BatchModify   *BatchModifyAck
 }
 
 // ParseNodeResponseVariant decodes REST snapshot/ack plaintext into a public variant.
@@ -859,7 +859,7 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 			Kind:      "positions_snapshot",
 			Positions: ParsePositionsSnapshot(&s),
 		}, nil
-	case "account_margin_update":
+	case "account_margin_update", "account_update":
 		var s sequencerpb.AccountMarginUpdate
 		if err := proto.Unmarshal(payload, &s); err != nil {
 			return nil, err
