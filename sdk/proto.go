@@ -733,23 +733,7 @@ func normalizeExpectedSnapshotVariant(messageType string) string {
 	}
 }
 
-func isDirectHotpathCountAck(expected string) bool {
-	switch expected {
-	case "cancel_all_ack", "close_all_ack", "reverse_ack":
-		return true
-	default:
-		return false
-	}
-}
-
 func resolveRestPayload(data []byte, expected string) (variant string, payload []byte) {
-	// Hotpath count acks are usually direct protobuf; field 3 collides with legacy snapshot wrap.
-	if isDirectHotpathCountAck(expected) {
-		if v, inner, ok := unwrapLegacyNodeResponse(data); ok && v == expected {
-			return v, inner
-		}
-		return expected, data
-	}
 	if v, inner, ok := unwrapLegacyNodeResponse(data); ok {
 		return v, inner
 	}
@@ -905,9 +889,25 @@ func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
 // ParseOpenOrdersSnapshot decodes an OpenOrdersSnapshot (legacy wrapper or direct).
 func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
 	variant, payload := resolveRestPayload(data, "open_orders_snapshot")
-	if variant != "open_orders_snapshot" {
-		return nil, fmt.Errorf("expected open_orders_snapshot, got %s", variant)
+	expected := "open_orders_snapshot"
+	if variant == expected {
+		return unmarshalOpenOrdersSnapshot(payload)
 	}
+	if variant == "ack" {
+		var ack sequencerpb.AckMessage
+		if err := proto.Unmarshal(payload, &ack); err == nil {
+			return nil, fmt.Errorf("expected open_orders_snapshot, got ack")
+		}
+	}
+	if variant != expected {
+		if snap, err := unmarshalOpenOrdersSnapshot(data); err == nil {
+			return snap, nil
+		}
+	}
+	return nil, fmt.Errorf("expected open_orders_snapshot, got %s", variant)
+}
+
+func unmarshalOpenOrdersSnapshot(payload []byte) (*OpenOrdersSnapshot, error) {
 	var s sequencerpb.OpenOrdersSnapshot
 	if err := proto.Unmarshal(payload, &s); err != nil {
 		return nil, err
@@ -992,6 +992,16 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 		expected = normalizeExpectedSnapshotVariant(messageType[0])
 	}
 	variant, payload := resolveRestPayload(data, expected)
+	result, err := decodeNodeResponseVariant(data, variant, payload)
+	if err != nil && expected != "" && variant != expected {
+		if retry, retryErr := decodeNodeResponseVariant(data, expected, data); retryErr == nil {
+			return retry, nil
+		}
+	}
+	return result, err
+}
+
+func decodeNodeResponseVariant(data []byte, variant string, payload []byte) (*NodeResponseVariant, error) {
 	switch variant {
 	case "ack":
 		var ack sequencerpb.AckMessage
@@ -1000,7 +1010,7 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 		}
 		return &NodeResponseVariant{Kind: "ack", Ack: nodeAckFromProto(&ack)}, nil
 	case "open_orders_snapshot":
-		snap, err := ParseOpenOrdersSnapshot(data)
+		snap, err := unmarshalOpenOrdersSnapshot(payload)
 		if err != nil {
 			return nil, err
 		}
@@ -1142,6 +1152,41 @@ func countAckFromReverse(ack *sequencerpb.ReverseAck) *CountAck {
 // ParseCountAck decodes cancel_all_ack / close_all_ack / reverse_ack plaintext.
 func ParseCountAck(data []byte, expected string) (*CountAck, bool, error) {
 	variant, payload := resolveRestPayload(data, expected)
+	if variant == "ack" {
+		var ack sequencerpb.AckMessage
+		if err := proto.Unmarshal(payload, &ack); err == nil {
+			na := nodeAckFromProto(&ack)
+			if !na.Success {
+				return nil, false, fmt.Errorf("expected %s, got ack failure", expected)
+			}
+			return nil, false, nil
+		}
+	}
+	ack, ok, err := decodeCountAckVariant(variant, payload)
+	if (err != nil || !ok) && expected != "" && variant != expected {
+		if retry, retryOk, retryErr := decodeCountAckVariant(expected, data); retryErr == nil && retryOk {
+			return retry, retryOk, nil
+		}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		if expected != "" {
+			na, isAck, err := ParseNodeResponseAck(data)
+			if err != nil {
+				return nil, false, err
+			}
+			if isAck && !na.Success {
+				return nil, false, fmt.Errorf("expected %s, got ack failure", expected)
+			}
+		}
+		return nil, false, nil
+	}
+	return ack, ok, nil
+}
+
+func decodeCountAckVariant(variant string, payload []byte) (*CountAck, bool, error) {
 	switch variant {
 	case "cancel_all_ack":
 		var ack sequencerpb.CancelAllAck
@@ -1162,15 +1207,6 @@ func ParseCountAck(data []byte, expected string) (*CountAck, bool, error) {
 		}
 		return countAckFromReverse(&ack), true, nil
 	default:
-		if expected != "" {
-			na, isAck, err := ParseNodeResponseAck(data)
-			if err != nil {
-				return nil, false, err
-			}
-			if isAck && !na.Success {
-				return nil, false, fmt.Errorf("expected %s, got ack failure", expected)
-			}
-		}
 		return nil, false, nil
 	}
 }
