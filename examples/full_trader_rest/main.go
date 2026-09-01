@@ -102,10 +102,11 @@ func main() {
 	}
 
 	price := livePrice()
+	limitPrice := price - 5000
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
 		PlaceOrderRequest: godark.PlaceOrderRequest{
 			Symbol: "BTC-USDC-PERP", Side: "BUY", OrderType: "LIMIT",
-			Quantity: 0.001, Price: price,
+			Quantity: 0.01, Price: limitPrice,
 		},
 		ClientOrderID: "sdk-go-rest-demo",
 	})
@@ -116,8 +117,8 @@ func main() {
 
 	time.Sleep(500 * time.Millisecond)
 
-	newPrice := price - 64
-	mod, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP", &newPrice, nil)
+	newPrice := limitPrice - 64
+	mod, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP", &newPrice, nil, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

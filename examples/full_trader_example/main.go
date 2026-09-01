@@ -52,6 +52,8 @@ const btcSymbolID = 1
 // "not seen yet" (fall back to GDX_BASE).
 var lastBtcMark float64
 
+var leverageCount int
+
 func main() {
 	envloader.LoadDotenv()
 
@@ -103,6 +105,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("WS config error: %v", err)
 	}
+
+	client.OnLeverageSettings(func(ls *godark.LeverageSettings) {
+		leverageCount++
+		parts := make([]string, 0, 5)
+		for i, row := range ls.Settings {
+			if i >= 5 {
+				break
+			}
+			parts = append(parts, fmt.Sprintf("%d=%dx", row.SymbolID, row.Leverage))
+		}
+		suffix := ""
+		if len(ls.Settings) > 5 {
+			suffix = "..."
+		}
+		fmt.Printf("LEVERAGE settings=[%s%s]\n", strings.Join(parts, ", "), suffix)
+	})
 
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("WS connect failed: %v", err)
@@ -157,7 +175,7 @@ func main() {
 	modifyPx := math.Round(mark*0.996*10) / 10
 	fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
 	newPrice := modifyPx
-	if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil); mErr != nil {
+	if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
 		envloader.PrintOrderError("Modify rejected", mErr)
 	} else {
 		fmt.Printf("Modified: order_id=%s\n", mAck.OrderID)
@@ -175,6 +193,7 @@ func main() {
 		OrderType: godark.OrderTypeLimit,
 		Price:     sellPx,
 		Quantity:  0.05,
+		Options:   godark.PlaceOrderOptions{PostOnly: true},
 	}); sErr != nil {
 		envloader.PrintOrderError("SELL rejected", sErr)
 	} else {
@@ -237,20 +256,14 @@ func main() {
 	drainOrderUpdates(client, "after MASS QUOTE")
 
 	if len(restingIDs) > 0 {
-		fmt.Printf("Batch-cancelling %d ladder orders (cleanup)...\n", len(restingIDs))
-		if bc, bcErr := client.BatchCancel(ctx, symbol, restingIDs); bcErr != nil {
-			envloader.PrintOrderError("Batch cancel rejected", bcErr)
+		fmt.Println("cancel_all_orders (cleanup ladder)...")
+		if ca, caErr := client.CancelAllOrders(ctx, symbol); caErr != nil {
+			envloader.PrintOrderError("cancel_all rejected", caErr)
 		} else {
-			for _, r := range bc.Results {
-				errStr := "<nil>"
-				if r.ErrorCode != nil {
-					errStr = fmt.Sprintf("%d", *r.ErrorCode)
-				}
-				fmt.Printf("  cancel id=%s: cancelled=%v  err=%s\n", r.OrderID, r.Cancelled, errStr)
-			}
+			fmt.Printf("  cancel_all: count=%d ids=%v\n", ca.Count, ca.OrderIDs)
 		}
 		time.Sleep(500 * time.Millisecond)
-		drainOrderUpdates(client, "after BATCH CANCEL")
+		drainOrderUpdates(client, "after CANCEL ALL")
 	}
 
 	// Demonstrate the batch-level post_only flag on a crossing leg. Price a BUY
@@ -335,8 +348,8 @@ func main() {
 
 	fmt.Println(sep)
 	fmt.Println("  Session complete")
-	fmt.Printf("  Pushes: snapshots=%d  health=%d  balance=%d  margin=%d  funding=%d  settle=%d\n",
-		snapCount, healthCount, balanceCount, marginCount, fundingCount, settleCount)
+	fmt.Printf("  Pushes: snapshots=%d  health=%d  balance=%d  margin=%d  funding=%d  settle=%d  leverage=%d\n",
+		snapCount, healthCount, balanceCount, marginCount, fundingCount, settleCount, leverageCount)
 	fmt.Println(sep)
 }
 

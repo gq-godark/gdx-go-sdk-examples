@@ -196,7 +196,7 @@ func (t *Transport) AuthTokenLegacy(ctx context.Context, token string) (map[stri
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token", "", map[string]any{"token": token}, nil)
 }
 
-// SessionSetup is deprecated: ECDH REST session setup is retired (Noise XK is
+// SessionSetup is deprecated: ECDH REST session setup is retired (HPKE is
 // WS-only). GodarkRestClient never calls this; kept for transport unit tests.
 func (t *Transport) SessionSetup(ctx context.Context, bearer, clientECDHPubKey string) (map[string]any, error) {
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/session/setup", bearer, map[string]any{

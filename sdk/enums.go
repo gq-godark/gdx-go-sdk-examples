@@ -14,11 +14,11 @@ const (
 type OrderType string
 
 const (
-	OrderTypeMarket   OrderType = "MARKET"
-	OrderTypeLimit    OrderType = "LIMIT"
-	OrderTypePegToMid OrderType = "PEG_TO_MID"
-	OrderTypePegToBid OrderType = "PEG_TO_BID"
-	OrderTypePegToAsk OrderType = "PEG_TO_ASK"
+	OrderTypeMarket    OrderType = "MARKET"
+	OrderTypeLimit     OrderType = "LIMIT"
+	OrderTypePeg       OrderType = "PEG"
+	OrderTypeStopMarket OrderType = "STOP_MARKET"
+	OrderTypeStopLimit  OrderType = "STOP_LIMIT"
 )
 
 type TimeInForce string
@@ -98,6 +98,22 @@ const (
 	SettlementBatchStatusFailed      SettlementBatchStatus = "FAILED"
 )
 
+type StpMode string
+
+const (
+	StpModeUnspecified      StpMode = "UNSPECIFIED"
+	StpModeCancelResting    StpMode = "CANCEL_RESTING"
+	StpModeCancelAggressor  StpMode = "CANCEL_AGGRESSOR"
+	StpModeCancelBoth       StpMode = "CANCEL_BOTH"
+)
+
+var stpModeToProto = map[StpMode]int32{
+	StpModeUnspecified:     0,
+	StpModeCancelResting:   1,
+	StpModeCancelAggressor: 2,
+	StpModeCancelBoth:      3,
+}
+
 // Proto int <-> enum tables.
 // The wire codes match python's mapping (which is the canonical reference).
 //
@@ -119,17 +135,17 @@ var sideToProto = map[Side]int32{
 var orderTypeFromProto = map[int32]OrderType{
 	1: OrderTypeMarket,
 	2: OrderTypeLimit,
-	3: OrderTypePegToMid,
-	4: OrderTypePegToBid,
-	5: OrderTypePegToAsk,
+	3: OrderTypePeg,
+	4: OrderTypeStopMarket,
+	5: OrderTypeStopLimit,
 }
 
 var orderTypeToProto = map[OrderType]int32{
-	OrderTypeMarket:   1,
-	OrderTypeLimit:    2,
-	OrderTypePegToMid: 3,
-	OrderTypePegToBid: 4,
-	OrderTypePegToAsk: 5,
+	OrderTypeMarket:     1,
+	OrderTypeLimit:      2,
+	OrderTypePeg:        3,
+	OrderTypeStopMarket: 4,
+	OrderTypeStopLimit:  5,
 }
 
 var timeInForceFromProto = map[int32]TimeInForce{

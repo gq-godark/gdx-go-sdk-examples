@@ -220,13 +220,14 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	}
 
 	uid, _ := authData["user_uuid"].(string)
-	if strings.TrimSpace(uid) == "" {
-		uid = c.fallback
-	}
+	uid = strings.TrimSpace(uid)
 	if uid == "" {
 		if parsed, ok := userUUIDFromAccessTokenJWT(bearer); ok {
 			uid = parsed
 		}
+	}
+	if uid == "" {
+		uid = strings.TrimSpace(c.fallback)
 	}
 	if uid == "" {
 		return newAuthenticationError(
@@ -313,6 +314,7 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		req.MinFillSize,
 		req.ExpiryTime,
 		corrID,
+		req.Options,
 		uint64(time.Now().UnixNano()),
 	)
 	if err != nil {
@@ -390,12 +392,12 @@ func (c *GodarkRestClient) CancelOrderByClientID(ctx context.Context, clientOrde
 }
 
 // ModifyOrder sends an encrypted modify via `PATCH /api/v1/orders/{id}`.
-func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity *float64) (*OrderAck, error) {
+func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
-	if newPrice == nil && newQuantity == nil {
-		return nil, errors.New("ModifyOrder: at least one of newPrice / newQuantity required")
+	if newPrice == nil && newQuantity == nil && newTriggerPrice == nil {
+		return nil, errors.New("ModifyOrder: at least one of newPrice / newQuantity / newTriggerPrice required")
 	}
 	if symbol == "" {
 		symbol = "BTC-USDC-PERP"
@@ -409,7 +411,7 @@ func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, corrID)
+	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1168,7 +1170,7 @@ func inferEnvironmentFromRestURL(base string) Environment {
 	if host == "127.0.0.1" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return EnvironmentLocalnet
 	}
-	if strings.Contains(host, "devnet") || host == "18.143.165.149" {
+	if strings.Contains(host, "devnet") {
 		return EnvironmentDevnet
 	}
 	if strings.Contains(host, "godark-dex.com") {
@@ -1188,9 +1190,6 @@ func resolveRestHpkePin(explicit string, env Environment) string {
 		"GDX_HPKE_STATIC_PUBKEY",
 		"GODARK_HPKE_STATIC_PUBLIC_KEY",
 		"VITE_GDX_HPKE_STATIC_PUBKEY",
-		"GODARK_NOISE_STATIC_PUBLIC_KEY",
-		"GDX_NOISE_STATIC_PUBLIC_KEY",
-		"GDX_NOISE_STATIC_PUBKEY",
 	} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
