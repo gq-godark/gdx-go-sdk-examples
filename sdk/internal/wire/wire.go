@@ -155,6 +155,14 @@ func responseMessageTypeString(mt int32) string {
 		return "tpsl_update"
 	case 12:
 		return "leverage_settings"
+	case 13:
+		return "cancel_all_ack"
+	case 14:
+		return "close_all_ack"
+	case 15:
+		return "reverse_ack"
+	case 16:
+		return "tpsl_ack"
 	default:
 		return "unknown"
 	}

@@ -94,6 +94,7 @@ func main() {
 		OrderType: godark.OrderTypeLimit,
 		Price:     sellPx,
 		Quantity:  0.01,
+		Options:   godark.PlaceOrderOptions{PostOnly: true},
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
 	if err != nil {
@@ -105,12 +106,12 @@ func main() {
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)
 
-	cancelAck, err := client.CancelOrder(ctx, ack.OrderID, symbol)
+	cancelAck, err := client.CancelAllOrders(ctx, symbol)
 	if err != nil {
-		envloader.PrintOrderError("CancelOrder", err)
+		envloader.PrintOrderError("CancelAllOrders", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Cancel OK -- order_id=%s\n", cancelAck.OrderID)
+	fmt.Printf("cancel_all OK -- count=%d ids=%v\n", cancelAck.Count, cancelAck.OrderIDs)
 
 	fmt.Println("Disconnected")
 }

@@ -89,6 +89,7 @@ type Handlers struct {
 	OnSessionEstablished func(Message)
 	OnRekeyRequired      func(Message)
 	OnEncryptedPush      func(Message)
+	OnPublicMessage      func(Message)
 	OnDisconnect         func()
 }
 
@@ -797,7 +798,7 @@ func (t *Transport) dispatch(msg Message) {
 			t.handler.OnSessionEstablished(msg)
 		}
 		return
-	case "noise_handshake_reply":
+	case "hpke_setup_reply":
 		if t.handler.OnSessionEstablished != nil {
 			t.handler.OnSessionEstablished(msg)
 		}
@@ -850,6 +851,14 @@ func (t *Transport) dispatch(msg Message) {
 			t.subWaiter = nil
 		}
 		t.subMu.Unlock()
+		return
+	}
+
+	switch msgType {
+	case "funding_rate_snapshot", "volume_snapshot", "open_interest_snapshot":
+		if t.handler.OnPublicMessage != nil {
+			t.handler.OnPublicMessage(msg)
+		}
 	}
 }
 
@@ -971,19 +980,19 @@ func normalizeInboundMessage(msg Message) Message {
 		}
 		return Message{"type": "auth_result", "success": false, "error": "invalid auth response"}
 
-	case op == "noise.handshake" || op == "noise_handshake":
+	case op == "hpke.setup" || op == "hpke_setup":
 		if code != 0 {
 			errText := message
 			if errText == "" {
-				errText = "noise handshake failed"
+				errText = "HPKE setup failed"
 			}
 			return Message{"type": "error", "message": errText}
 		}
 		if data == nil {
-			return Message{"type": "error", "message": "invalid noise handshake response"}
+			return Message{"type": "error", "message": "invalid HPKE setup response"}
 		}
 		return Message{
-			"type":        "noise_handshake_reply",
+			"type":        "hpke_setup_reply",
 			"conn_id":     data["conn_id"],
 			"message":     data["message"],
 			"established": data["established"],

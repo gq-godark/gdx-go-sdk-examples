@@ -14,11 +14,11 @@ const (
 type OrderType string
 
 const (
-	OrderTypeMarket   OrderType = "MARKET"
-	OrderTypeLimit    OrderType = "LIMIT"
-	OrderTypePegToMid OrderType = "PEG_TO_MID"
-	OrderTypePegToBid OrderType = "PEG_TO_BID"
-	OrderTypePegToAsk OrderType = "PEG_TO_ASK"
+	OrderTypeMarket    OrderType = "MARKET"
+	OrderTypeLimit     OrderType = "LIMIT"
+	OrderTypePeg       OrderType = "PEG"
+	OrderTypeStopMarket OrderType = "STOP_MARKET"
+	OrderTypeStopLimit  OrderType = "STOP_LIMIT"
 )
 
 type TimeInForce string
@@ -67,11 +67,17 @@ const (
 type CancelReason string
 
 const (
-	CancelReasonUserRequested CancelReason = "USER_REQUESTED"
-	CancelReasonIOCRemainder  CancelReason = "IOC_REMAINDER"
-	CancelReasonFOKNotFilled  CancelReason = "FOK_NOT_FILLED"
-	CancelReasonExpired       CancelReason = "EXPIRED"
-	CancelReasonSystem        CancelReason = "SYSTEM"
+	CancelReasonUserRequested      CancelReason = "USER_REQUESTED"
+	CancelReasonIOCRemainder       CancelReason = "IOC_REMAINDER"
+	CancelReasonFOKNotFilled       CancelReason = "FOK_NOT_FILLED"
+	CancelReasonExpired            CancelReason = "EXPIRED"
+	CancelReasonSystem             CancelReason = "SYSTEM"
+	CancelReasonADL                CancelReason = "ADL"
+	CancelReasonLiquidatedCanceled CancelReason = "LIQUIDATED_CANCELED"
+	CancelReasonMarginCanceled     CancelReason = "MARGIN_CANCELED"
+	CancelReasonReduceOnly         CancelReason = "REDUCE_ONLY"
+	CancelReasonStpExpireTaker     CancelReason = "STP_EXPIRE_TAKER"
+	CancelReasonStpCancelResting   CancelReason = "STP_CANCEL_RESTING"
 )
 
 type PositionsSnapshotSource string
@@ -91,6 +97,22 @@ const (
 	SettlementBatchStatusConfirmed   SettlementBatchStatus = "CONFIRMED"
 	SettlementBatchStatusFailed      SettlementBatchStatus = "FAILED"
 )
+
+type StpMode string
+
+const (
+	StpModeUnspecified      StpMode = "UNSPECIFIED"
+	StpModeCancelResting    StpMode = "CANCEL_RESTING"
+	StpModeCancelAggressor  StpMode = "CANCEL_AGGRESSOR"
+	StpModeCancelBoth       StpMode = "CANCEL_BOTH"
+)
+
+var stpModeToProto = map[StpMode]int32{
+	StpModeUnspecified:     0,
+	StpModeCancelResting:   1,
+	StpModeCancelAggressor: 2,
+	StpModeCancelBoth:      3,
+}
 
 // Proto int <-> enum tables.
 // The wire codes match python's mapping (which is the canonical reference).
@@ -113,17 +135,17 @@ var sideToProto = map[Side]int32{
 var orderTypeFromProto = map[int32]OrderType{
 	1: OrderTypeMarket,
 	2: OrderTypeLimit,
-	3: OrderTypePegToMid,
-	4: OrderTypePegToBid,
-	5: OrderTypePegToAsk,
+	3: OrderTypePeg,
+	4: OrderTypeStopMarket,
+	5: OrderTypeStopLimit,
 }
 
 var orderTypeToProto = map[OrderType]int32{
-	OrderTypeMarket:   1,
-	OrderTypeLimit:    2,
-	OrderTypePegToMid: 3,
-	OrderTypePegToBid: 4,
-	OrderTypePegToAsk: 5,
+	OrderTypeMarket:     1,
+	OrderTypeLimit:      2,
+	OrderTypePeg:        3,
+	OrderTypeStopMarket: 4,
+	OrderTypeStopLimit:  5,
 }
 
 var timeInForceFromProto = map[int32]TimeInForce{
@@ -174,6 +196,12 @@ var cancelReasonFromProto = map[int32]CancelReason{
 	3: CancelReasonFOKNotFilled,
 	4: CancelReasonExpired,
 	5: CancelReasonSystem,
+	6: CancelReasonADL,
+	7: CancelReasonLiquidatedCanceled,
+	8: CancelReasonMarginCanceled,
+	9: CancelReasonReduceOnly,
+	10: CancelReasonStpExpireTaker,
+	11: CancelReasonStpCancelResting,
 }
 
 // Request / response message-type ints used by the docs-wire envelope.
@@ -206,6 +234,7 @@ var responseMessageTypeToProto = map[string]int32{
 	"positions_snapshot":    5,
 	"balance_and_position":  6,
 	"account_margin_update": 7,
+	"account_update":        7, // devnet alias
 	"mass_quote_ack":        8,
 	"batch_cancel_ack":      9,
 	"batch_modify_ack":      10,
@@ -214,6 +243,7 @@ var responseMessageTypeToProto = map[string]int32{
 	"cancel_all_ack":        13,
 	"close_all_ack":         14,
 	"reverse_ack":           15,
+	"tpsl_ack":              16,
 }
 
 // SideFromProto / OrderTypeFromProto / ... are exported because the proto

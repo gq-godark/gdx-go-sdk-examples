@@ -196,7 +196,7 @@ func (t *Transport) AuthTokenLegacy(ctx context.Context, token string) (map[stri
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/auth/token", "", map[string]any{"token": token}, nil)
 }
 
-// SessionSetup is deprecated: ECDH REST session setup is retired (Noise XK is
+// SessionSetup is deprecated: ECDH REST session setup is retired (HPKE is
 // WS-only). GodarkRestClient never calls this; kept for transport unit tests.
 func (t *Transport) SessionSetup(ctx context.Context, bearer, clientECDHPubKey string) (map[string]any, error) {
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/session/setup", bearer, map[string]any{
@@ -219,6 +219,15 @@ func (t *Transport) GetLeverage(ctx context.Context, bearer string) (map[string]
 // encrypted update-leverage body.
 func (t *Transport) PostLeverageEncrypted(ctx context.Context, bearer string, body map[string]any) (map[string]any, error) {
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/leverage", bearer, body, nil)
+}
+
+// PostEncrypted issues an authenticated encrypted POST to an arbitrary
+// `/api/v1/...` path (e.g. openOrders snapshot RPCs, massQuote).
+func (t *Transport) PostEncrypted(ctx context.Context, bearer, path string, body map[string]any) (map[string]any, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return t.doJSON(ctx, http.MethodPost, path, bearer, body, nil)
 }
 
 // DeleteOrderEncrypted issues `DELETE /api/v1/orders/{order_id}` with an

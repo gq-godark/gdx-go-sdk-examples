@@ -20,6 +20,31 @@ type LeverageSettings struct {
 	ServerTimestamp uint64
 }
 
+// PlaceOrderOptions carries optional place-order flags mirrored from
+// gdx-web / sequencer PlaceOrderInput.
+type PlaceOrderOptions struct {
+	ReduceOnly bool
+	PostOnly   bool
+	StpMode    StpMode
+	// PegOffsetBps is signed bps vs Pyth mark for PEG orders.
+	PegOffsetBps *int32
+	// TriggerPrice is the mark trigger for STOP_MARKET / STOP_LIMIT orders.
+	TriggerPrice *float64
+	// TakeProfitPrice attaches TP at placement (optional; may also use AmendTpsl).
+	TakeProfitPrice *float64
+	// StopLossPrice attaches SL at placement (optional; may also use AmendTpsl).
+	StopLossPrice *float64
+}
+
+// CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.
+type CountAck struct {
+	Sequence   string
+	Count      uint32
+	OrderIDs   []string
+	ErrorCode  *uint32
+	RejectText string
+}
+
 // OrderAck is the response to a Place / Cancel / Modify command.
 type OrderAck struct {
 	OrderID  string
@@ -103,6 +128,18 @@ type BatchModifyAck struct {
 	Sequence string
 	Results  []BatchModifyLegResult
 }
+// TpslAck is the RPC reply for amend / cancel TP-SL (live feed remains TpslUpdate).
+type TpslAck struct {
+	CorrelationID uint64
+	ParentOrderID string
+	TakeProfit    string
+	StopLoss      string
+	Status        string
+	Kind          string
+	ErrorCode     *uint32
+	RejectText    string
+}
+
 
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
@@ -120,6 +157,8 @@ type OrderUpdate struct {
 	CancelReason  CancelReason
 	RejectReason  string
 	Msg           string
+	ReduceOnly    bool
+	PostOnly      bool
 	CorrelationID uint64
 	Timestamp     uint64
 	// Leverage is the client-selected leverage at order-placement time (1 = 1x).
@@ -142,6 +181,28 @@ type PositionUpdate struct {
 	FillQty       string
 	CorrelationID uint64
 	Timestamp     uint64
+}
+
+// AccountMarginSummary is the authoritative account-level margin summary
+// (decimal string amounts).
+type AccountMarginSummary struct {
+	TotalCollateral      string
+	PositionMargin       string
+	ReservedOrderMargin  string
+	FreeCollateral       string
+	AccountEquity        string
+	UnrealizedPnl        string
+	CrossAvailable       string
+	RealizedPnl          string
+}
+
+// AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
+// snapshot or WS push).
+type AccountMarginUpdate struct {
+	UserUUID        string
+	ServerTimestamp uint64
+	Account         *AccountMarginSummary
+	CorrelationID   uint64
 }
 
 // OpenOrderRow is one resting order within an OpenOrdersSnapshot.
@@ -264,14 +325,12 @@ type MarginAlert struct {
 	StateVersion     uint64
 	Recovered        bool
 }
-
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.
 type FundingRateUpdate struct {
 	SymbolID        int64
-	CurrentRate     string
-	PredictedRate   string
-	NextFundingTime uint64
+	FundingRate     string
 	Timestamp       uint64
+	LastFundingRate string
 }
 
 // SettlementUpdate is a push frame describing a settlement batch lifecycle

@@ -32,7 +32,7 @@ package name" rule).
 ## Constructors
 
 Trading runs over the encrypted WebSocket `GodarkClient`, which uses
-**Noise XK** (pin the sequencer static public key — see Configuration in
+**HPKE** (pin the sequencer static public key — see Configuration in
 `README.md` / `.env.example`). A read-only `MarketDataClient` is also
 available for public market data. (Encrypted REST trading is not
 supported — see the note below.)
@@ -44,7 +44,7 @@ client, err := godark.NewClient(godark.ClientConfig{
     APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
     APISecret:  os.Getenv("GODARK_API_SECRET"),
     Passphrase: os.Getenv("GODARK_PASSPHRASE"),
-    // NoiseStaticPublicKeyHex: os.Getenv("GDX_NOISE_STATIC_PUBLIC_KEY"),
+    // HpkeStaticPublicKeyHex: os.Getenv("GDX_HPKE_STATIC_PUBLIC_KEY"),
     // BaseURL defaults to wss://api.godark-dex.com; override via
     // GODARK_EDGE_URL/GDX_EDGE_URL env vars or this field.
     BaseURL: os.Getenv("GODARK_EDGE_URL"),

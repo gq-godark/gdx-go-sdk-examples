@@ -21,9 +21,9 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | `sdk/order_error_code.go`             | Canonical 34-entry numeric -> symbolic reject reason map |
 | `sdk/proto.go`                        | Hand-written wrappers around generated proto (AAD builders, parsers, encoders) |
 | `sdk/symbols.go` + `sdk/shared/symbols.json` | Embedded symbol-id table |
-| `sdk/internal/noise/noise.go`         | Noise_XK_25519_AESGCM_SHA256 initiator |
+| `sdk/internal/hpke`         | HPKE initiator |
 | `sdk/internal/bound/bound.go`         | SHA-256-bound AEAD framing helpers |
-| `sdk/internal/crypto/crypto.go`       | X25519 + AES-GCM primitives used by Noise |
+| `sdk/internal/crypto/crypto.go`       | X25519 + AES-GCM primitives used by HPKE |
 | `sdk/internal/session/session.go`     | Post-handshake `CryptoSession` (encrypt/decrypt) |
 | `sdk/internal/identity/identity.go`   | UUID <-> 16-byte wire helpers |
 | `sdk/internal/transport/transport.go` | WS transport + docs-wire envelope normalisation |
@@ -44,9 +44,9 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
   - **Envelope**: docs-wire `{id, op, args}` out; `{id, op, code, data?,
     message?}` in. The transport normalises both legacy and docs envelopes
     transparently.
-  - **Crypto**: after login the client runs `Noise_XK_25519_AESGCM_SHA256`
-    (`noise.handshake`). Pin the sequencer static key via
-    `ClientConfig.NoiseStaticPublicKeyHex` or `GDX_NOISE_STATIC_PUBLIC_KEY`.
+  - **Crypto**: after login the client runs `HPKE`
+    (HPKE setup). Pin the sequencer static key via
+    `ClientConfig.HpkeStaticPublicKeyHex` or `GDX_HPKE_STATIC_PUBLIC_KEY`.
     Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
     The legacy ECDH `session.setup` handshake is retired; all encrypted
     order flow now uses the HPKE WebSocket client. Encrypted REST
