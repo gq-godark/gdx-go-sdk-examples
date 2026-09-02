@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -154,6 +155,7 @@ func BuildPlaceOrderRequest(
 	minFillSize *float64,
 	expiryTime *uint64,
 	correlationID []byte,
+	options PlaceOrderOptions,
 	_ uint64,
 ) ([]byte, error) {
 	sideInt, ok := sideToProto[side]
@@ -168,6 +170,10 @@ func BuildPlaceOrderRequest(
 	if !ok {
 		return nil, fmt.Errorf("unknown time in force: %q", timeInForce)
 	}
+	stpInt, ok := stpModeToProto[options.StpMode]
+	if !ok && options.StpMode != "" {
+		return nil, fmt.Errorf("unknown stp mode: %q", options.StpMode)
+	}
 	if aon && minFillSize == nil {
 		q := quantity
 		minFillSize = &q
@@ -180,6 +186,9 @@ func BuildPlaceOrderRequest(
 		Quantity:    quantity,
 		TimeInForce: commonpb.TimeInForce(tifInt),
 		UserUuid:    userUUID,
+		StpMode:     commonpb.StpMode(stpInt),
+		ReduceOnly:  options.ReduceOnly,
+		PostOnly:    options.PostOnly,
 	}
 	if price != nil {
 		place.Price = price
@@ -193,9 +202,134 @@ func BuildPlaceOrderRequest(
 	if correlationID != nil {
 		place.CorrelationId = correlationIDBodyBytes(correlationID)
 	}
+	if options.PegOffsetBps != nil {
+		place.PegOffsetBps = options.PegOffsetBps
+	}
+	if options.TriggerPrice != nil {
+		place.TriggerPrice = options.TriggerPrice
+	}
+	if options.TakeProfitPrice != nil {
+		place.TakeProfitPrice = options.TakeProfitPrice
+	}
+	if options.StopLossPrice != nil {
+		place.StopLossPrice = options.StopLossPrice
+	}
 
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Place{Place: place},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildCancelAll serializes a CancelAllInput wrapped in EdgeSequencerRequest.
+// symbolID nil cancels every market for the user.
+func BuildCancelAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
+	cancelAll := &sequencerpb.CancelAllInput{
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	if symbolID != nil {
+		cancelAll.SymbolId = symbolID
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_CancelAll{CancelAll: cancelAll},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildCloseAll serializes a CloseAllInput wrapped in EdgeSequencerRequest.
+// symbolID nil closes every market for the user.
+func BuildCloseAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
+	closeAll := &sequencerpb.CloseAllInput{
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	if symbolID != nil {
+		closeAll.SymbolId = symbolID
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_CloseAll{CloseAll: closeAll},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildReverse serializes a ReverseInput wrapped in EdgeSequencerRequest.
+func BuildReverse(symbolID uint64, userUUID, correlationID []byte) ([]byte, error) {
+	reverse := &sequencerpb.ReverseInput{
+		SymbolId:      symbolID,
+		UserUuid:      userUUID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_Reverse{Reverse: reverse},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildAmendTpsl serializes an AmendTpslRequest wrapped in EdgeSequencerRequest.
+func BuildAmendTpsl(
+	userUUID []byte,
+	orderID uint64,
+	correlationID []byte,
+	takeProfitPrice *float64,
+	stopLossPrice *float64,
+	symbolID *uint64,
+	positionSide *Side,
+) ([]byte, error) {
+	amend := &sequencerpb.AmendTpslRequest{
+		UserUuid:      userUUID,
+		OrderId:       orderID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	if takeProfitPrice != nil {
+		amend.TakeProfitPrice = takeProfitPrice
+	}
+	if stopLossPrice != nil {
+		amend.StopLossPrice = stopLossPrice
+	}
+	if symbolID != nil {
+		amend.SymbolId = symbolID
+	}
+	if positionSide != nil {
+		s, ok := sideToProto[*positionSide]
+		if !ok {
+			return nil, fmt.Errorf("unknown side: %s", *positionSide)
+		}
+		ps := commonpb.Side(s)
+		amend.PositionSide = &ps
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_AmendTpsl{AmendTpsl: amend},
+	}
+	return proto.Marshal(req)
+}
+
+// BuildCancelTpsl serializes a CancelTpslRequest wrapped in EdgeSequencerRequest.
+func BuildCancelTpsl(
+	userUUID []byte,
+	orderID uint64,
+	correlationID []byte,
+	symbolID *uint64,
+	positionSide *Side,
+) ([]byte, error) {
+	cancel := &sequencerpb.CancelTpslRequest{
+		UserUuid:      userUUID,
+		OrderId:       orderID,
+		CorrelationId: correlationIDBodyBytes(correlationID),
+	}
+	if symbolID != nil {
+		cancel.SymbolId = symbolID
+	}
+	if positionSide != nil {
+		s, ok := sideToProto[*positionSide]
+		if !ok {
+			return nil, fmt.Errorf("unknown side: %s", *positionSide)
+		}
+		ps := commonpb.Side(s)
+		cancel.PositionSide = &ps
+	}
+	req := &sequencerpb.EdgeSequencerRequest{
+		Inner: &sequencerpb.EdgeSequencerRequest_CancelTpsl{CancelTpsl: cancel},
 	}
 	return proto.Marshal(req)
 }
@@ -279,6 +413,7 @@ func BuildModifyOrderRequest(
 	symbolID uint64,
 	newPrice *float64,
 	newQuantity *float64,
+	newTriggerPrice *float64,
 	correlationID []byte,
 ) ([]byte, error) {
 	modify := &sequencerpb.ModifyOrderInput{
@@ -292,6 +427,9 @@ func BuildModifyOrderRequest(
 	}
 	if newQuantity != nil {
 		modify.NewQuantity = newQuantity
+	}
+	if newTriggerPrice != nil {
+		modify.NewTriggerPrice = newTriggerPrice
 	}
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Modify{Modify: modify},
@@ -441,7 +579,7 @@ func BuildOrderHeaderAAD(userUUID []byte, symbolID uint64, requestType string, n
 	return BuildOrderHeaderAADWithConn(userUUID, symbolID, requestType, nonce, bodyLength, correlationID, 0)
 }
 
-// BuildOrderHeaderAADWithConn includes the Noise-bound WebSocket conn_id.
+// BuildOrderHeaderAADWithConn includes the HPKE-bound WebSocket conn_id.
 func BuildOrderHeaderAADWithConn(userUUID []byte, symbolID uint64, requestType string, nonce uint64, bodyLength uint32, correlationID []byte, connID uint64) ([]byte, error) {
 	reqInt, ok := requestTypeToProto[requestType]
 	if !ok {
@@ -464,7 +602,7 @@ func BuildResponseHeaderAAD(userUUID []byte, messageType string, bodyLength uint
 	return BuildResponseHeaderAADWithConn(userUUID, messageType, bodyLength, nonce, fencingEpoch, correlationID, sessionSeq, 0)
 }
 
-// BuildResponseHeaderAADWithConn includes the Noise-bound WebSocket conn_id.
+// BuildResponseHeaderAADWithConn includes the HPKE-bound WebSocket conn_id.
 func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLength uint32, nonce uint64, fencingEpoch uint64, correlationID []byte, sessionSeq uint64, connID uint64) ([]byte, error) {
 	msgInt, ok := responseMessageTypeToProto[messageType]
 	if !ok {
@@ -751,9 +889,25 @@ func ParseBatchCancelAck(data []byte) (*BatchCancelAck, bool, error) {
 // ParseOpenOrdersSnapshot decodes an OpenOrdersSnapshot (legacy wrapper or direct).
 func ParseOpenOrdersSnapshot(data []byte) (*OpenOrdersSnapshot, error) {
 	variant, payload := resolveRestPayload(data, "open_orders_snapshot")
-	if variant != "open_orders_snapshot" {
-		return nil, fmt.Errorf("expected open_orders_snapshot, got %s", variant)
+	expected := "open_orders_snapshot"
+	if variant == expected {
+		return unmarshalOpenOrdersSnapshot(payload)
 	}
+	if variant == "ack" {
+		var ack sequencerpb.AckMessage
+		if err := proto.Unmarshal(payload, &ack); err == nil {
+			return nil, fmt.Errorf("expected open_orders_snapshot, got ack")
+		}
+	}
+	if variant != expected {
+		if snap, err := unmarshalOpenOrdersSnapshot(data); err == nil {
+			return snap, nil
+		}
+	}
+	return nil, fmt.Errorf("expected open_orders_snapshot, got %s", variant)
+}
+
+func unmarshalOpenOrdersSnapshot(payload []byte) (*OpenOrdersSnapshot, error) {
 	var s sequencerpb.OpenOrdersSnapshot
 	if err := proto.Unmarshal(payload, &s); err != nil {
 		return nil, err
@@ -828,6 +982,7 @@ type NodeResponseVariant struct {
 	MassQuote     *MassQuoteAck
 	BatchCancel   *BatchCancelAck
 	BatchModify   *BatchModifyAck
+	CountAck      *CountAck
 }
 
 // ParseNodeResponseVariant decodes REST snapshot/ack plaintext into a public variant.
@@ -837,6 +992,16 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 		expected = normalizeExpectedSnapshotVariant(messageType[0])
 	}
 	variant, payload := resolveRestPayload(data, expected)
+	result, err := decodeNodeResponseVariant(data, variant, payload)
+	if err != nil && expected != "" && variant != expected {
+		if retry, retryErr := decodeNodeResponseVariant(data, expected, data); retryErr == nil {
+			return retry, nil
+		}
+	}
+	return result, err
+}
+
+func decodeNodeResponseVariant(data []byte, variant string, payload []byte) (*NodeResponseVariant, error) {
 	switch variant {
 	case "ack":
 		var ack sequencerpb.AckMessage
@@ -845,7 +1010,7 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 		}
 		return &NodeResponseVariant{Kind: "ack", Ack: nodeAckFromProto(&ack)}, nil
 	case "open_orders_snapshot":
-		snap, err := ParseOpenOrdersSnapshot(data)
+		snap, err := unmarshalOpenOrdersSnapshot(payload)
 		if err != nil {
 			return nil, err
 		}
@@ -895,9 +1060,196 @@ func ParseNodeResponseVariant(data []byte, messageType ...string) (*NodeResponse
 			return &NodeResponseVariant{Kind: "batch_modify_ack"}, nil
 		}
 		return &NodeResponseVariant{Kind: "batch_modify_ack", BatchModify: ack}, nil
+	case "cancel_all_ack":
+		ack, ok, err := ParseCountAck(data, "cancel_all_ack")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "cancel_all_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "cancel_all_ack", CountAck: ack}, nil
+	case "close_all_ack":
+		ack, ok, err := ParseCountAck(data, "close_all_ack")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "close_all_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "close_all_ack", CountAck: ack}, nil
+	case "reverse_ack":
+		ack, ok, err := ParseCountAck(data, "reverse_ack")
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return &NodeResponseVariant{Kind: "reverse_ack"}, nil
+		}
+		return &NodeResponseVariant{Kind: "reverse_ack", CountAck: ack}, nil
 	default:
 		return &NodeResponseVariant{Kind: variant}, nil
 	}
+}
+
+func countAckFromCancelAll(ack *sequencerpb.CancelAllAck) *CountAck {
+	orderIDs := make([]string, 0, len(ack.GetCancelledOrderIds()))
+	for _, id := range ack.GetCancelledOrderIds() {
+		orderIDs = append(orderIDs, fmt.Sprintf("%d", id))
+	}
+	out := &CountAck{
+		Sequence: fmt.Sprintf("%d", ack.GetSequence()),
+		Count:    ack.GetCancelled(),
+		OrderIDs: orderIDs,
+	}
+	if ack.ErrorCode != nil {
+		out.ErrorCode = ack.ErrorCode
+	}
+	if ack.RejectText != nil {
+		out.RejectText = *ack.RejectText
+	}
+	return out
+}
+
+func countAckFromCloseAll(ack *sequencerpb.CloseAllAck) *CountAck {
+	orderIDs := make([]string, 0, len(ack.GetCloseOrderIds()))
+	for _, id := range ack.GetCloseOrderIds() {
+		orderIDs = append(orderIDs, fmt.Sprintf("%d", id))
+	}
+	out := &CountAck{
+		Sequence: fmt.Sprintf("%d", ack.GetSequence()),
+		Count:    ack.GetClosed(),
+		OrderIDs: orderIDs,
+	}
+	if ack.ErrorCode != nil {
+		out.ErrorCode = ack.ErrorCode
+	}
+	if ack.RejectText != nil {
+		out.RejectText = *ack.RejectText
+	}
+	return out
+}
+
+func countAckFromReverse(ack *sequencerpb.ReverseAck) *CountAck {
+	orderIDs := make([]string, 0, len(ack.GetReverseOrderIds()))
+	for _, id := range ack.GetReverseOrderIds() {
+		orderIDs = append(orderIDs, fmt.Sprintf("%d", id))
+	}
+	out := &CountAck{
+		Sequence: fmt.Sprintf("%d", ack.GetSequence()),
+		Count:    ack.GetReversed(),
+		OrderIDs: orderIDs,
+	}
+	if ack.ErrorCode != nil {
+		out.ErrorCode = ack.ErrorCode
+	}
+	if ack.RejectText != nil {
+		out.RejectText = *ack.RejectText
+	}
+	return out
+}
+
+// ParseCountAck decodes cancel_all_ack / close_all_ack / reverse_ack plaintext.
+func ParseCountAck(data []byte, expected string) (*CountAck, bool, error) {
+	variant, payload := resolveRestPayload(data, expected)
+	if variant == "ack" {
+		var ack sequencerpb.AckMessage
+		if err := proto.Unmarshal(payload, &ack); err == nil {
+			na := nodeAckFromProto(&ack)
+			if !na.Success {
+				return nil, false, fmt.Errorf("expected %s, got ack failure", expected)
+			}
+			return nil, false, nil
+		}
+	}
+	ack, ok, err := decodeCountAckVariant(variant, payload)
+	if (err != nil || !ok) && expected != "" && variant != expected {
+		if retry, retryOk, retryErr := decodeCountAckVariant(expected, data); retryErr == nil && retryOk {
+			return retry, retryOk, nil
+		}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		if expected != "" {
+			na, isAck, err := ParseNodeResponseAck(data)
+			if err != nil {
+				return nil, false, err
+			}
+			if isAck && !na.Success {
+				return nil, false, fmt.Errorf("expected %s, got ack failure", expected)
+			}
+		}
+		return nil, false, nil
+	}
+	return ack, ok, nil
+}
+
+func decodeCountAckVariant(variant string, payload []byte) (*CountAck, bool, error) {
+	switch variant {
+	case "cancel_all_ack":
+		var ack sequencerpb.CancelAllAck
+		if err := proto.Unmarshal(payload, &ack); err != nil {
+			return nil, false, err
+		}
+		return countAckFromCancelAll(&ack), true, nil
+	case "close_all_ack":
+		var ack sequencerpb.CloseAllAck
+		if err := proto.Unmarshal(payload, &ack); err != nil {
+			return nil, false, err
+		}
+		return countAckFromCloseAll(&ack), true, nil
+	case "reverse_ack":
+		var ack sequencerpb.ReverseAck
+		if err := proto.Unmarshal(payload, &ack); err != nil {
+			return nil, false, err
+		}
+		return countAckFromReverse(&ack), true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func tpslAckFromProto(ack *sequencerpb.TpslAck) *TpslAck {
+	out := &TpslAck{
+		ParentOrderID: strconv.FormatUint(ack.ParentOrderId, 10),
+	}
+	if ack.TakeProfit != nil {
+		out.TakeProfit = *ack.TakeProfit
+	}
+	if ack.StopLoss != nil {
+		out.StopLoss = *ack.StopLoss
+	}
+	if ack.ErrorCode != nil {
+		out.ErrorCode = ack.ErrorCode
+	}
+	if ack.RejectText != nil {
+		out.RejectText = *ack.RejectText
+	}
+	return out
+}
+
+// ParseTpslAck decodes a tpsl_ack plaintext body.
+func ParseTpslAck(data []byte) (*TpslAck, bool, error) {
+	variant, payload := resolveRestPayload(data, "tpsl_ack")
+	if variant != "tpsl_ack" {
+		if variant != "" {
+			na, isAck, err := ParseNodeResponseAck(data)
+			if err != nil {
+				return nil, false, err
+			}
+			if isAck && !na.Success {
+				return nil, false, fmt.Errorf("expected tpsl_ack, got ack failure")
+			}
+		}
+		return nil, false, nil
+	}
+	var ack sequencerpb.TpslAck
+	if err := proto.Unmarshal(payload, &ack); err != nil {
+		return nil, false, err
+	}
+	return tpslAckFromProto(&ack), true, nil
 }
 
 // ParseBatchModifyAck decodes a BatchModifyAck (legacy wrapper or direct message).

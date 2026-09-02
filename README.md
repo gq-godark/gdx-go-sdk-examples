@@ -46,7 +46,7 @@ and `GODARK_PASSPHRASE`. Public testnet needs only those three for hosted
 testnet; localnet/devnet also require `GDX_HPKE_STATIC_PUBLIC_KEY`.
 
 Optional overrides: `GODARK_EDGE_URL`, `GDX_HPKE_STATIC_PUBLIC_KEY` (legacy
-`GDX_NOISE_*` names still accepted).
+HPKE env vars).
 
 ## Localnet (`gdx up`)
 

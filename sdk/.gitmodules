@@ -1,4 +1,0 @@
-[submodule "gdx-proto"]
-	path = gdx-proto
-	url = https://github.com/gq-godark/gdx-proto.git
-	branch = dev

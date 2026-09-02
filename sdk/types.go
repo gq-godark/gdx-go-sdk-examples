@@ -20,6 +20,31 @@ type LeverageSettings struct {
 	ServerTimestamp uint64
 }
 
+// PlaceOrderOptions carries optional place-order flags mirrored from
+// gdx-web / sequencer PlaceOrderInput.
+type PlaceOrderOptions struct {
+	ReduceOnly bool
+	PostOnly   bool
+	StpMode    StpMode
+	// PegOffsetBps is signed bps vs Pyth mark for PEG orders.
+	PegOffsetBps *int32
+	// TriggerPrice is the mark trigger for STOP_MARKET / STOP_LIMIT orders.
+	TriggerPrice *float64
+	// TakeProfitPrice attaches TP at placement (optional; may also use AmendTpsl).
+	TakeProfitPrice *float64
+	// StopLossPrice attaches SL at placement (optional; may also use AmendTpsl).
+	StopLossPrice *float64
+}
+
+// CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.
+type CountAck struct {
+	Sequence   string
+	Count      uint32
+	OrderIDs   []string
+	ErrorCode  *uint32
+	RejectText string
+}
+
 // OrderAck is the response to a Place / Cancel / Modify command.
 type OrderAck struct {
 	OrderID  string

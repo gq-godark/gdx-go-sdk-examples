@@ -31,7 +31,7 @@ import (
 const defaultEdgeBaseURL = "wss://api.godark-dex.com"
 
 // Default devnet WebSocket origin. The client appends `/ws/v1`.
-const defaultDevnetEdgeBaseURL = "ws://18.143.165.149:13300"
+const defaultDevnetEdgeBaseURL = "wss://api.devnet.godark-dex.com"
 
 // Sequencer HPKE static public key for public testnet (64 hex).
 const testnetHpkeStaticPublicKeyHex = "a9fdd7f26c0de36d82811e9fe1df2509960cd5b25eef037355e209b9222bea7d"
@@ -42,21 +42,21 @@ const devnetHpkeStaticPublicKeyHex = "a6807e2f6cd04b54cc19be2fd4faea2a1239f1e289
 // Environment names a deployment target. It selects the default edge URL and,
 // when known, a baked-in sequencer HPKE public key pin.
 //
-// Explicit BaseURL / NoiseStaticPublicKeyHex and the corresponding
+// Explicit BaseURL / HpkeStaticPublicKeyHex and the corresponding
 // environment variables still win over these presets.
 type Environment string
 
 const (
 	// EnvironmentTestnet is the public testnet (default zero value). It uses
 	// the public testnet edge URL and a baked-in sequencer HPKE pin.
-	// Explicit NoiseStaticPublicKeyHex / GDX_HPKE_STATIC_PUBLIC_KEY still override.
+	// Explicit HpkeStaticPublicKeyHex / GDX_HPKE_STATIC_PUBLIC_KEY still override.
 	EnvironmentTestnet Environment = "testnet"
 	// EnvironmentDevnet targets the public devnet edge
-	// (ws://18.143.165.149:13300) with a baked-in sequencer HPKE pin.
+	// (wss://api.devnet.godark-dex.com) with a baked-in sequencer HPKE pin.
 	// Explicit config / env still override.
 	EnvironmentDevnet Environment = "devnet"
 	// EnvironmentLocalnet targets ws://127.0.0.1:4000. No baked HPKE pin —
-	// set NoiseStaticPublicKeyHex or GDX_HPKE_STATIC_PUBLIC_KEY.
+	// set HpkeStaticPublicKeyHex or GDX_HPKE_STATIC_PUBLIC_KEY.
 	EnvironmentLocalnet Environment = "localnet"
 )
 
@@ -72,9 +72,9 @@ func (e Environment) EdgeBaseURL() string {
 	}
 }
 
-// NoiseStaticPublicKeyHex returns the baked-in sequencer HPKE static
+// HpkeStaticPublicKeyHex returns the baked-in sequencer HPKE static
 // public key (64 hex chars) when known for this environment; otherwise "".
-func (e Environment) NoiseStaticPublicKeyHex() string {
+func (e Environment) HpkeStaticPublicKeyHex() string {
 	switch e.normalize() {
 	case EnvironmentTestnet:
 		return testnetHpkeStaticPublicKeyHex
@@ -114,7 +114,7 @@ type ClientConfig struct {
 	Passphrase string
 
 	// Environment selects a named deployment. Defaults to EnvironmentTestnet
-	// (zero value), which supplies the public testnet edge URL and Noise XK
+	// (zero value), which supplies the public testnet edge URL and HPKE
 	// pin when those are not set explicitly or via environment variables.
 	Environment Environment
 
@@ -129,10 +129,9 @@ type ClientConfig struct {
 	// GDX_USER_UUID env vars.
 	UserUUID string
 
-	// NoiseStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key.
-	// Preference: this field → GODARK_HPKE_STATIC_PUBLIC_KEY (then GDX_*,
-	// legacy GODARK_NOISE_*) → baked-in pin from Environment when set.
-	NoiseStaticPublicKeyHex string
+	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key.
+	// Preference: this field → HPKE env vars → baked-in pin from Environment when set.
+	HpkeStaticPublicKeyHex string
 
 	// SymbolMap overrides the embedded default symbol map. Useful when
 	// running against a non-prod edge with a custom symbol set.
@@ -170,6 +169,21 @@ const (
 	PlaceOrderConfirmationBook PlaceOrderConfirmation = "book"
 )
 
+// inflightAckType maps encrypted command request_type values to the ack
+// message_type each command must resolve on. Batched / multi-item commands
+// get their own ack type so an async generic "ack" pushed mid-flight does
+// not resolve them early.
+var inflightAckType = map[string]string{
+	"mass_quote":   "mass_quote_ack",
+	"batch_cancel": "batch_cancel_ack",
+	"batch_modify": "batch_modify_ack",
+	"amend_tpsl":   "tpsl_ack",
+	"cancel_tpsl":  "tpsl_ack",
+	"cancel_all":   "cancel_all_ack",
+	"close_all":    "close_all_ack",
+	"reverse":      "reverse_ack",
+}
+
 type placeOutcomeResult struct {
 	update *OrderUpdate
 	err    error
@@ -200,7 +214,7 @@ type GodarkClient struct {
 	mu             sync.RWMutex
 	userUUID       string
 	connID         uint64
-	noiseStaticKey string
+	hpkeStaticKey string
 	accountID      string
 	loginSessionID string
 	tokenExpiresAt string
@@ -294,7 +308,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		symbolMap:               symbolMap,
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
-		noiseStaticKey:          resolveHpkeStaticPublicKey(cfg.NoiseStaticPublicKeyHex, pinEnv),
+		hpkeStaticKey:           resolveHpkeStaticPublicKey(cfg.HpkeStaticPublicKeyHex, pinEnv),
 		session:                 &session.CryptoSession{},
 		pendingEncryptedByNonce: make(map[uint64]transport.Message),
 		orderQueue:              make(chan *OrderUpdate, bufSize),
@@ -462,6 +476,8 @@ type PlaceOrderRequest struct {
 	AON         bool
 	MinFillSize *float64
 	ExpiryTime  *uint64
+	// Options carries optional reduce-only / post-only / STP flags.
+	Options PlaceOrderOptions
 	// Confirmation selects the completion boundary. Empty defaults to Book.
 	// Ack returns on the sequencer fast ack; Book waits for a definitive
 	// order update and returns OrderError on REJECTED.
@@ -514,6 +530,7 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		req.MinFillSize,
 		req.ExpiryTime,
 		corrID,
+		req.Options,
 		uint64(time.Now().UnixNano()),
 	)
 	if err != nil {
@@ -572,13 +589,13 @@ func (c *GodarkClient) CancelOrder(ctx context.Context, orderID string, symbol s
 }
 
 // ModifyOrder sends an encrypted modify command and waits for its ack.
-// Either newPrice or newQuantity (or both) must be non-nil.
-func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity *float64) (*OrderAck, error) {
+// At least one of newPrice, newQuantity, or newTriggerPrice must be non-nil.
+func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
-	if newPrice == nil && newQuantity == nil {
-		return nil, errors.New("ModifyOrder: at least one of newPrice / newQuantity required")
+	if newPrice == nil && newQuantity == nil && newTriggerPrice == nil {
+		return nil, errors.New("ModifyOrder: at least one of newPrice / newQuantity / newTriggerPrice required")
 	}
 	if symbol == "" {
 		symbol = "BTC-USDC-PERP"
@@ -592,11 +609,163 @@ func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, 
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, corrID)
+	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
 	if err != nil {
 		return nil, err
 	}
 	return c.sendEncryptedOrder(ctx, "modify", uint64(symbolID), plaintext, corrID)
+}
+
+// CancelAllOrders cancels all open orders. When symbol is empty, cancels every market.
+func (c *GodarkClient) CancelAllOrders(ctx context.Context, symbol string) (*CountAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	var headerSymbolID uint64
+	var bodySymbolID *uint64
+	if symbol != "" {
+		sid, err := c.resolveSymbol(symbol)
+		if err != nil {
+			return nil, err
+		}
+		usid := uint64(sid)
+		headerSymbolID = usid
+		bodySymbolID = &usid
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildCancelAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "cancel_all", headerSymbolID, plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseCountAckResponse(resp, "cancel_all_ack")
+}
+
+// CloseAll closes all positions at market (reduce-only IOC). Scoped to symbol when set.
+func (c *GodarkClient) CloseAll(ctx context.Context, symbol string) (*CountAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	var headerSymbolID uint64
+	var bodySymbolID *uint64
+	if symbol != "" {
+		sid, err := c.resolveSymbol(symbol)
+		if err != nil {
+			return nil, err
+		}
+		usid := uint64(sid)
+		headerSymbolID = usid
+		bodySymbolID = &usid
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildCloseAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "close_all", headerSymbolID, plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseCountAckResponse(resp, "close_all_ack")
+}
+
+// ReversePosition reverses the open position on symbol (flatten + open opposite side).
+func (c *GodarkClient) ReversePosition(ctx context.Context, symbol string) (*CountAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	if symbol == "" {
+		return nil, errors.New("ReversePosition: symbol is required")
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	plaintext, err := BuildReverse(uint64(symbolID), c.userUUIDBytes(), corrID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "reverse", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseCountAckResponse(resp, "reverse_ack")
+}
+
+// AmendTpsl amends or attaches TP/SL on a resting order or open position.
+func (c *GodarkClient) AmendTpsl(
+	ctx context.Context,
+	symbol string,
+	orderID uint64,
+	takeProfitPrice *float64,
+	stopLossPrice *float64,
+	positionSide *Side,
+) (*TpslAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	if orderID == 0 && positionSide == nil {
+		return nil, errors.New("positionSide is required when orderID is 0")
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	var bodySymbolID *uint64
+	if orderID == 0 {
+		sid := uint64(symbolID)
+		bodySymbolID = &sid
+	}
+	plaintext, err := BuildAmendTpsl(
+		c.userUUIDBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide,
+	)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "amend_tpsl", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseTpslAckResponse(resp)
+}
+
+// CancelTpsl cancels TP/SL without cancelling the parent entry or flattening the position.
+func (c *GodarkClient) CancelTpsl(
+	ctx context.Context,
+	symbol string,
+	orderID uint64,
+	positionSide *Side,
+) (*TpslAck, error) {
+	if err := c.ensureReady(); err != nil {
+		return nil, err
+	}
+	if orderID == 0 && positionSide == nil {
+		return nil, errors.New("positionSide is required when orderID is 0")
+	}
+	symbolID, err := c.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	corrID := newCorrelationID()
+	var bodySymbolID *uint64
+	if orderID == 0 {
+		sid := uint64(symbolID)
+		bodySymbolID = &sid
+	}
+	plaintext, err := BuildCancelTpsl(c.userUUIDBytes(), orderID, corrID, bodySymbolID, positionSide)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendEncryptedCommand(ctx, "cancel_tpsl", uint64(symbolID), plaintext, corrID)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseTpslAckResponse(resp)
 }
 
 // -----------------------------------------------------------------------
@@ -769,10 +938,10 @@ func (c *GodarkClient) OnDisconnect(cb func()) {
 // -----------------------------------------------------------------------
 
 func (c *GodarkClient) setupHpkeSession(ctx context.Context) error {
-	if c.noiseStaticKey == "" {
-		return newSessionError("HPKE static public key unset — set NoiseStaticPublicKeyHex, GDX_HPKE_STATIC_PUBLIC_KEY, or GODARK_HPKE_STATIC_PUBLIC_KEY")
+	if c.hpkeStaticKey == "" {
+		return newSessionError("HPKE static public key unset — set HpkeStaticPublicKeyHex, GDX_HPKE_STATIC_PUBLIC_KEY, or GODARK_HPKE_STATIC_PUBLIC_KEY")
 	}
-	remoteStatic, err := hpke.ParsePinnedStaticPublicKey(c.noiseStaticKey)
+	remoteStatic, err := hpke.ParsePinnedStaticPublicKey(c.hpkeStaticKey)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
@@ -1106,7 +1275,7 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 	return ack, nil
 }
 
-// UpdateLeverage sets per-symbol account leverage over Noise XK WebSocket.
+// UpdateLeverage sets per-symbol account leverage over the encrypted WebSocket session.
 // Place/mass-quote inherit this setting server-side. Always uses the legacy
 // encrypted_order frame (docs-wire has no update_leverage op).
 func (c *GodarkClient) UpdateLeverage(ctx context.Context, symbol string, leverage int) (*OrderAck, error) {
@@ -1212,6 +1381,66 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 			return nil, newOrderError(na.RejectText, code)
 		}
 		return nil, newOrderError("expected batch_modify_ack inside encrypted push", "")
+	}
+	return ack, nil
+}
+
+func (c *GodarkClient) parseCountAckResponse(msg transport.Message, messageType string) (*CountAck, error) {
+	pt, err := c.decryptCommandPlaintext(msg, messageType)
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseCountAck(pt, messageType)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		na, isAck, parseErr := ParseNodeResponseAck(pt)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, newOrderError(na.RejectText, code)
+		}
+		return nil, newOrderError(fmt.Sprintf("expected %s inside encrypted push", messageType), "")
+	}
+	if ack.ErrorCode != nil {
+		code := int32(*ack.ErrorCode)
+		return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
+	}
+	return ack, nil
+}
+
+func (c *GodarkClient) parseTpslAckResponse(msg transport.Message) (*TpslAck, error) {
+	pt, err := c.decryptCommandPlaintext(msg, "tpsl_ack")
+	if err != nil {
+		return nil, err
+	}
+	ack, ok, err := ParseTpslAck(pt)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		na, isAck, parseErr := ParseNodeResponseAck(pt)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if isAck && !na.Success {
+			code := ""
+			if na.ErrorCode != nil {
+				code = strconv.FormatUint(uint64(*na.ErrorCode), 10)
+			}
+			return nil, newOrderError(na.RejectText, code)
+		}
+		return nil, newOrderError("expected tpsl_ack inside encrypted push", "")
+	}
+	if ack.ErrorCode != nil {
+		code := int32(*ack.ErrorCode)
+		return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
 	}
 	return ack, nil
 }
@@ -1598,6 +1827,7 @@ func resolveUserUUID(explicit string) string {
 	return ""
 }
 
+
 func resolveHpkeStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
@@ -1607,15 +1837,12 @@ func resolveHpkeStaticPublicKey(explicit string, env Environment) string {
 		"GDX_HPKE_STATIC_PUBKEY",
 		"GODARK_HPKE_STATIC_PUBLIC_KEY",
 		"VITE_GDX_HPKE_STATIC_PUBKEY",
-		"GODARK_NOISE_STATIC_PUBLIC_KEY",
-		"GDX_NOISE_STATIC_PUBLIC_KEY",
-		"GDX_NOISE_STATIC_PUBKEY",
 	} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
 	}
-	return env.NoiseStaticPublicKeyHex()
+	return env.HpkeStaticPublicKeyHex()
 }
 
 func newCorrelationID() []byte {
