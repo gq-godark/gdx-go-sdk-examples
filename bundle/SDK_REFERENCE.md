@@ -139,11 +139,15 @@ client.OnSettlementUpdate(func(s *godark.SettlementUpdate) { ... })
 
 client.OnError(func(err error)          { ... }) // non-fatal session errors
 client.OnDisconnect(func()              { ... }) // WS closed (any reason)
+client.OnReconnect(func()               { ... }) // automatic reconnect succeeded
 ```
 
 Subscribe to channels with `client.Subscribe(ctx, "orders", "positions")`.
-The same subscriptions are replayed after a `Disconnect` + `Connect`
-cycle (the SDK does not auto-reconnect).
+The SDK replays those subscriptions after an automatic reconnect.
+
+Default transport heartbeat settings: ping every `30s`, absolute stale timeout
+`120s`, missed-heartbeat limit `2` consecutive intervals without inbound traffic.
+Stale disconnects surface through `OnError` before the socket closes.
 
 ## Error handling
 

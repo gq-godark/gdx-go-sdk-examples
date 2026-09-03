@@ -80,10 +80,11 @@ func main() {
 		Environment: godark.EnvironmentTestnet,
 		BaseURL:     envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL"), // empty => Testnet preset
 		Transport: godark.TransportConfig{
-			Headers:           headers,
-			HeartbeatInterval: 30 * time.Second,
-			StaleTimeout:      60 * time.Second,
-			CommandTimeout:    10 * time.Second,
+			Headers:              headers,
+			HeartbeatInterval:    30 * time.Second,
+			StaleTimeout:         120 * time.Second,
+			MissedHeartbeatLimit: 2,
+			CommandTimeout:       10 * time.Second,
 		},
 	}
 	if legacyKey != "" {
