@@ -126,8 +126,11 @@ The GitHub App (`godark-ci`) used for cross-repo access only requires
   - Push streams expose buffered Go channels (default 256) and per-stream
     callback registration; both surfaces fire concurrently with command
     issuance.
-  - The SDK does **not** auto-reconnect. `OnDisconnect` callbacks fire when
-    the WS closes; the caller decides whether to `Connect` again.
+  - The SDK auto-reconnects after unexpected WebSocket disconnects by default
+    (re-auth, HPKE setup, subscription replay). Set `DisableAutoReconnect: true`
+    on `ClientConfig` or `MarketDataConfig` to keep caller-managed reconnect.
+    `OnError` reports stale heartbeat disconnects; `OnReconnect` fires after a
+    successful automatic reconnect. Manual `Disconnect()` does not reconnect.
 
 ## License
 
