@@ -51,6 +51,17 @@ type MarketDataConfig struct {
 	// HeartbeatInterval is the JSON-ping period. Default 30s.
 	HeartbeatInterval time.Duration
 
+	// StaleTimeout is the absolute cap without inbound traffic. Default 120s.
+	StaleTimeout time.Duration
+
+	// MissedHeartbeatLimit closes after this many consecutive heartbeat
+	// intervals without inbound traffic. Default 2.
+	MissedHeartbeatLimit int
+
+	// DisableAutoReconnect suppresses automatic reconnect after unexpected
+	// disconnects. Default false (auto-reconnect enabled).
+	DisableAutoReconnect bool
+
 	// MaxMessageSize bounds the per-frame size. Default 1 MiB.
 	MaxMessageSize int64
 
@@ -177,9 +188,8 @@ func SubscriptionCallbackKey(msg map[string]any) string {
 
 // MarketDataClient is the public market-data WebSocket client.
 //
-// It does NOT auto-reconnect; OnDisconnect is delivered when the WS closes
-// and the caller decides whether to reopen. This matches the trading
-// client's contract.
+// It auto-reconnects after unexpected disconnects unless DisableAutoReconnect
+// is set or Disconnect() was called intentionally.
 type MarketDataClient struct {
 	url      string
 	docsWire bool
@@ -206,6 +216,21 @@ type MarketDataClient struct {
 
 	disconnectMu sync.RWMutex
 	disconnectCB []func()
+	errorMu      sync.RWMutex
+	errorCB      []func(error)
+	reconnectMu  sync.RWMutex
+	reconnectCB  []func()
+
+	// liveness
+	livenessMu                sync.Mutex
+	lastInbound               time.Time
+	inboundSinceLastHeartbeat bool
+	missedCount               int
+
+	disableAutoReconnect bool
+	intentionalClose     bool
+	reconnectLoopMu      sync.Mutex
+	reconnectInProgress  bool
 
 	loopCtx    context.Context
 	loopCancel context.CancelFunc
@@ -231,16 +256,23 @@ func NewMarketDataClient(cfg MarketDataConfig) *MarketDataClient {
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = 30 * time.Second
 	}
+	if cfg.StaleTimeout == 0 {
+		cfg.StaleTimeout = 120 * time.Second
+	}
+	if cfg.MissedHeartbeatLimit == 0 {
+		cfg.MissedHeartbeatLimit = 2
+	}
 	if cfg.MaxMessageSize == 0 {
 		cfg.MaxMessageSize = 1 << 20
 	}
 
 	return &MarketDataClient{
-		url:         resolved,
-		docsWire:    isDocsWireURL(resolved),
-		cfg:         cfg,
-		bufSize:     bufSize,
-		callbacks:   make(map[string][]func(MarketDataMessage)),
+		url:                  resolved,
+		docsWire:             isDocsWireURL(resolved),
+		cfg:                  cfg,
+		bufSize:              bufSize,
+		disableAutoReconnect: cfg.DisableAutoReconnect,
+		callbacks:            make(map[string][]func(MarketDataMessage)),
 		orderbookCh: make(chan MarketDataMessage, bufSize),
 		tradesCh:    make(chan MarketDataMessage, bufSize),
 		rawCh:       make(chan MarketDataMessage, bufSize),
@@ -265,7 +297,22 @@ func (m *MarketDataClient) Connect(ctx context.Context) error {
 		m.mu.Unlock()
 		return errors.New("market data client is closed")
 	}
+	m.intentionalClose = false
 	m.mu.Unlock()
+	return m.connectInternal(ctx)
+}
+
+func (m *MarketDataClient) connectInternal(ctx context.Context) error {
+	if m.loopCancel != nil {
+		m.loopCancel()
+	}
+	m.connMu.Lock()
+	if m.conn != nil {
+		_ = m.conn.Close(websocket.StatusNormalClosure, "reconnect")
+		m.conn = nil
+	}
+	m.connMu.Unlock()
+	m.wg.Wait()
 
 	parsed, err := url.Parse(m.url)
 	if err != nil {
@@ -290,6 +337,12 @@ func (m *MarketDataClient) Connect(ctx context.Context) error {
 	m.connMu.Lock()
 	m.conn = conn
 	m.connMu.Unlock()
+
+	m.livenessMu.Lock()
+	m.lastInbound = time.Now()
+	m.inboundSinceLastHeartbeat = true
+	m.missedCount = 0
+	m.livenessMu.Unlock()
 
 	m.loopCtx, m.loopCancel = context.WithCancel(context.Background())
 	m.wg.Add(2)
@@ -325,6 +378,7 @@ func (m *MarketDataClient) Disconnect() {
 		return
 	}
 	m.closed = true
+	m.intentionalClose = true
 	m.mu.Unlock()
 
 	if m.loopCancel != nil {
@@ -413,6 +467,21 @@ func (m *MarketDataClient) OnDisconnect(cb func()) {
 	m.disconnectMu.Lock()
 	m.disconnectCB = append(m.disconnectCB, cb)
 	m.disconnectMu.Unlock()
+}
+
+// OnError registers a callback for non-fatal connection errors such as stale
+// heartbeat disconnects.
+func (m *MarketDataClient) OnError(cb func(error)) {
+	m.errorMu.Lock()
+	m.errorCB = append(m.errorCB, cb)
+	m.errorMu.Unlock()
+}
+
+// OnReconnect registers a callback fired after a successful automatic reconnect.
+func (m *MarketDataClient) OnReconnect(cb func()) {
+	m.reconnectMu.Lock()
+	m.reconnectCB = append(m.reconnectCB, cb)
+	m.reconnectMu.Unlock()
 }
 
 // -----------------------------------------------------------------------
@@ -550,11 +619,42 @@ func (m *MarketDataClient) recvLoop() {
 		if err != nil {
 			return
 		}
+		m.noteInbound()
 		var obj map[string]any
 		if err := json.Unmarshal(raw, &obj); err != nil {
 			continue
 		}
 		m.dispatch(obj)
+	}
+}
+
+func (m *MarketDataClient) noteInbound() {
+	m.livenessMu.Lock()
+	m.lastInbound = time.Now()
+	m.inboundSinceLastHeartbeat = true
+	m.missedCount = 0
+	m.livenessMu.Unlock()
+}
+
+func (m *MarketDataClient) closeForStale(reason string) {
+	m.emitError(newConnectionError(reason))
+	m.connMu.Lock()
+	conn := m.conn
+	m.connMu.Unlock()
+	if conn != nil {
+		_ = conn.Close(websocket.StatusGoingAway, reason)
+	}
+}
+
+func (m *MarketDataClient) emitError(err error) {
+	m.errorMu.RLock()
+	cbs := append([]func(error){}, m.errorCB...)
+	m.errorMu.RUnlock()
+	for _, cb := range cbs {
+		func() {
+			defer func() { _ = recover() }()
+			cb(err)
+		}()
 	}
 }
 
@@ -568,6 +668,29 @@ func (m *MarketDataClient) heartbeatLoop() {
 		case <-m.loopCtx.Done():
 			return
 		case <-ticker.C:
+			m.livenessMu.Lock()
+			elapsed := time.Since(m.lastInbound)
+			if elapsed > m.cfg.StaleTimeout {
+				reason := fmt.Sprintf("stale heartbeat: no inbound message for %s", m.cfg.StaleTimeout)
+				m.livenessMu.Unlock()
+				m.closeForStale(reason)
+				return
+			}
+			if !m.inboundSinceLastHeartbeat {
+				m.missedCount++
+			}
+			if m.missedCount >= m.cfg.MissedHeartbeatLimit {
+				reason := fmt.Sprintf(
+					"stale heartbeat: missed %d heartbeat responses (limit %d)",
+					m.missedCount, m.cfg.MissedHeartbeatLimit,
+				)
+				m.livenessMu.Unlock()
+				m.closeForStale(reason)
+				return
+			}
+			m.inboundSinceLastHeartbeat = false
+			m.livenessMu.Unlock()
+
 			m.connMu.Lock()
 			conn := m.conn
 			m.connMu.Unlock()
@@ -642,6 +765,69 @@ func (m *MarketDataClient) afterDisconnect() {
 	m.disconnectMu.RLock()
 	cbs := append([]func(){}, m.disconnectCB...)
 	m.disconnectMu.RUnlock()
+	for _, cb := range cbs {
+		safeCallNoArg(cb)
+	}
+	m.maybeStartReconnect()
+}
+
+func (m *MarketDataClient) maybeStartReconnect() {
+	m.mu.Lock()
+	intentional := m.intentionalClose
+	closed := m.closed
+	disable := m.disableAutoReconnect
+	m.mu.Unlock()
+	if intentional || closed || disable {
+		return
+	}
+	m.reconnectLoopMu.Lock()
+	if m.reconnectInProgress {
+		m.reconnectLoopMu.Unlock()
+		return
+	}
+	m.reconnectInProgress = true
+	m.reconnectLoopMu.Unlock()
+	go m.reconnectLoop()
+}
+
+func (m *MarketDataClient) reconnectLoop() {
+	defer func() {
+		m.reconnectLoopMu.Lock()
+		m.reconnectInProgress = false
+		m.reconnectLoopMu.Unlock()
+	}()
+
+	attempt := 0
+	for {
+		m.mu.Lock()
+		intentional := m.intentionalClose
+		closed := m.closed
+		disable := m.disableAutoReconnect
+		m.mu.Unlock()
+		if intentional || closed || disable {
+			return
+		}
+
+		if delay := reconnectBackoff(attempt); delay > 0 {
+			time.Sleep(delay)
+		}
+		attempt++
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := m.connectInternal(ctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		m.fireReconnectCallbacks()
+		return
+	}
+}
+
+func (m *MarketDataClient) fireReconnectCallbacks() {
+	m.reconnectMu.RLock()
+	cbs := append([]func(){}, m.reconnectCB...)
+	m.reconnectMu.RUnlock()
 	for _, cb := range cbs {
 		safeCallNoArg(cb)
 	}

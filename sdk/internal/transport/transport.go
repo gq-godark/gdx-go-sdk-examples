@@ -14,8 +14,7 @@
 //
 // It does NOT handle:
 //
-//   - Auto-reconnect. The client must close + reopen on `OnDisconnect`.
-//     This matches the python SDK's contract.
+//   - Auto-reconnect lifecycle (client.go / market_data.go).
 //   - Crypto. Encrypted push frames are forwarded raw to the on-encrypted-push
 //     handler; the client decrypts them via internal/session.
 package transport
@@ -52,8 +51,11 @@ type Config struct {
 	// HeartbeatInterval is the ping period. Default 30s.
 	HeartbeatInterval time.Duration
 	// StaleTimeout: if no inbound traffic for this long, the connection is
-	// considered dead. Default 60s.
+	// considered dead. Default 120s.
 	StaleTimeout time.Duration
+	// MissedHeartbeatLimit closes the connection after this many consecutive
+	// heartbeat intervals without inbound traffic. Default 2.
+	MissedHeartbeatLimit int
 	// CommandTimeout: max wait for a command ack. Default 30s.
 	CommandTimeout time.Duration
 	// LegacyWire selects the legacy `{type, data}` wire envelope. The default
@@ -70,7 +72,10 @@ func (c *Config) applyDefaults() {
 		c.HeartbeatInterval = 30 * time.Second
 	}
 	if c.StaleTimeout == 0 {
-		c.StaleTimeout = 60 * time.Second
+		c.StaleTimeout = 120 * time.Second
+	}
+	if c.MissedHeartbeatLimit == 0 {
+		c.MissedHeartbeatLimit = 2
 	}
 	if c.CommandTimeout == 0 {
 		c.CommandTimeout = 30 * time.Second
@@ -90,6 +95,7 @@ type Handlers struct {
 	OnRekeyRequired      func(Message)
 	OnEncryptedPush      func(Message)
 	OnPublicMessage      func(Message)
+	OnStale              func(reason string)
 	OnDisconnect         func()
 }
 
@@ -122,7 +128,7 @@ type Transport struct {
 	byWireID  map[string]chan Message
 
 	// HPKE setup waiter (binary HpkeSetupReply).
-	sessionMu     sync.Mutex
+	sessionMu      sync.Mutex
 	pendingSession chan Message
 
 	// subscription ack waiter
@@ -132,8 +138,10 @@ type Transport struct {
 	subMu     sync.Mutex
 
 	// liveness tracking
-	lastInbound time.Time
-	livenessMu  sync.Mutex
+	lastInbound               time.Time
+	inboundSinceLastHeartbeat bool
+	missedCount               int
+	livenessMu                sync.Mutex
 
 	// goroutine bookkeeping
 	loopCtx    context.Context
@@ -185,20 +193,25 @@ func (t *Transport) Connect(ctx context.Context) error {
 		conn.SetReadLimit(t.config.MaxMessageSize)
 	}
 
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+
 	t.mu.Lock()
 	t.conn = conn
 	t.connected = true
 	t.closed = false
+	t.loopCtx = loopCtx
+	t.loopCancel = loopCancel
 	t.mu.Unlock()
 
 	t.livenessMu.Lock()
 	t.lastInbound = time.Now()
+	t.inboundSinceLastHeartbeat = true
+	t.missedCount = 0
 	t.livenessMu.Unlock()
 
-	t.loopCtx, t.loopCancel = context.WithCancel(context.Background())
 	t.wg.Add(2)
-	go t.recvLoop()
-	go t.heartbeatLoop()
+	go t.recvLoop(loopCtx, conn, loopCancel)
+	go t.heartbeatLoop(loopCtx, conn)
 	return nil
 }
 
@@ -214,10 +227,13 @@ func (t *Transport) Disconnect() {
 	t.connected = false
 	conn := t.conn
 	t.conn = nil
+	cancel := t.loopCancel
+	t.loopCancel = nil
+	t.loopCtx = nil
 	t.mu.Unlock()
 
-	if t.loopCancel != nil {
-		t.loopCancel()
+	if cancel != nil {
+		cancel()
 	}
 	if conn != nil {
 		_ = conn.Close(websocket.StatusNormalClosure, "disconnect")
@@ -697,32 +713,27 @@ func (t *Transport) rejectPending(err error) {
 }
 
 // recvLoop reads messages from the WS, normalizes them, and dispatches.
-func (t *Transport) recvLoop() {
+func (t *Transport) recvLoop(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
 	defer t.wg.Done()
-	defer t.afterDisconnect()
+	defer t.afterDisconnect(conn, cancel)
 
 	for {
 		select {
-		case <-t.loopCtx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
 
-		t.mu.Lock()
-		conn := t.conn
-		t.mu.Unlock()
 		if conn == nil {
 			return
 		}
 
-		typ, raw, err := conn.Read(t.loopCtx)
+		typ, raw, err := conn.Read(ctx)
 		if err != nil {
 			return
 		}
 
-		t.livenessMu.Lock()
-		t.lastInbound = time.Now()
-		t.livenessMu.Unlock()
+		t.noteInbound()
 
 		if websocket.MessageType(typ) == websocket.MessageBinary {
 			t.dispatchBinary(raw)
@@ -862,9 +873,32 @@ func (t *Transport) dispatch(msg Message) {
 	}
 }
 
-// heartbeatLoop sends periodic pings + closes the connection if no inbound
-// traffic has been seen within stale_timeout.
-func (t *Transport) heartbeatLoop() {
+func (t *Transport) noteInbound() {
+	t.livenessMu.Lock()
+	t.lastInbound = time.Now()
+	t.inboundSinceLastHeartbeat = true
+	t.missedCount = 0
+	t.livenessMu.Unlock()
+}
+
+func (t *Transport) closeForStale(conn *websocket.Conn, reason string) {
+	t.mu.Lock()
+	active := t.conn == conn && t.connected
+	t.mu.Unlock()
+	if !active {
+		return
+	}
+	if t.handler.OnStale != nil {
+		t.handler.OnStale(reason)
+	}
+	if conn != nil {
+		_ = conn.Close(websocket.StatusGoingAway, reason)
+	}
+}
+
+// heartbeatLoop sends periodic pings and closes the connection when the
+// absolute stale timeout is exceeded or the missed-heartbeat limit is reached.
+func (t *Transport) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 	defer t.wg.Done()
 
 	ticker := time.NewTicker(t.config.HeartbeatInterval)
@@ -872,22 +906,31 @@ func (t *Transport) heartbeatLoop() {
 
 	for {
 		select {
-		case <-t.loopCtx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			t.livenessMu.Lock()
 			elapsed := time.Since(t.lastInbound)
-			t.livenessMu.Unlock()
-
 			if elapsed > t.config.StaleTimeout {
-				t.mu.Lock()
-				conn := t.conn
-				t.mu.Unlock()
-				if conn != nil {
-					_ = conn.Close(websocket.StatusGoingAway, "heartbeat timeout")
-				}
+				reason := fmt.Sprintf("stale heartbeat: no inbound message for %s", t.config.StaleTimeout)
+				t.livenessMu.Unlock()
+				t.closeForStale(conn, reason)
 				return
 			}
+			if !t.inboundSinceLastHeartbeat {
+				t.missedCount++
+			}
+			if t.missedCount >= t.config.MissedHeartbeatLimit {
+				reason := fmt.Sprintf(
+					"stale heartbeat: missed %d heartbeat responses (limit %d)",
+					t.missedCount, t.config.MissedHeartbeatLimit,
+				)
+				t.livenessMu.Unlock()
+				t.closeForStale(conn, reason)
+				return
+			}
+			t.inboundSinceLastHeartbeat = false
+			t.livenessMu.Unlock()
 
 			var payload any
 			if t.use {
@@ -900,8 +943,8 @@ func (t *Transport) heartbeatLoop() {
 				payload = map[string]any{"type": "ping"}
 			}
 
-			pingCtx, cancel := context.WithTimeout(t.loopCtx, 5*time.Second)
-			err := t.SendJSON(pingCtx, payload)
+			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := sendJSONOnConn(pingCtx, conn, payload)
 			cancel()
 			if err != nil {
 				return
@@ -910,10 +953,34 @@ func (t *Transport) heartbeatLoop() {
 	}
 }
 
-func (t *Transport) afterDisconnect() {
+func sendJSONOnConn(ctx context.Context, conn *websocket.Conn, obj any) error {
+	if conn == nil {
+		return errors.New("not connected")
+	}
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	return conn.Write(ctx, websocket.MessageText, b)
+}
+
+func (t *Transport) afterDisconnect(conn *websocket.Conn, cancel context.CancelFunc) {
+	cancel()
+
+	shouldNotify := false
 	t.mu.Lock()
-	t.connected = false
+	switch {
+	case t.conn == conn:
+		t.connected = false
+		t.conn = nil
+		shouldNotify = true
+	case t.closed && t.conn == nil:
+		shouldNotify = true
+	}
 	t.mu.Unlock()
+	if !shouldNotify {
+		return
+	}
 	t.rejectPending(errors.New("connection lost"))
 	if t.handler.OnDisconnect != nil {
 		t.handler.OnDisconnect()
