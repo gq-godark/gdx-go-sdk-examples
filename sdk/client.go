@@ -141,6 +141,10 @@ type ClientConfig struct {
 	// Zero-value defaults are reasonable.
 	Transport transport.Config
 
+	// DisableAutoReconnect suppresses automatic reconnect after unexpected
+	// WebSocket disconnects. Default false (auto-reconnect enabled).
+	DisableAutoReconnect bool
+
 	// HTTPClient is forwarded to the transport for the upgrade request.
 	HTTPClient *http.Client
 
@@ -246,6 +250,17 @@ type GodarkClient struct {
 	leverageSettingsCallbacks   []func(*LeverageSettings)
 	errorCallbacks              []func(error)
 	disconnectCB                []func()
+	reconnectCB                 []func()
+
+	// subscription replay after reconnect
+	subMu           sync.Mutex
+	desiredChannels map[string]struct{}
+
+	// reconnect lifecycle
+	disableAutoReconnect bool
+	intentionalClose     bool
+	reconnectMu          sync.Mutex
+	reconnectInProgress  bool
 
 	// session-setup waiter
 	sessionMu               sync.Mutex
@@ -311,6 +326,8 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		hpkeStaticKey:           resolveHpkeStaticPublicKey(cfg.HpkeStaticPublicKeyHex, pinEnv),
 		session:                 &session.CryptoSession{},
 		pendingEncryptedByNonce: make(map[uint64]transport.Message),
+		desiredChannels:         make(map[string]struct{}),
+		disableAutoReconnect:    cfg.DisableAutoReconnect,
 		orderQueue:              make(chan *OrderUpdate, bufSize),
 		positionQueue:           make(chan *PositionUpdate, bufSize),
 		posSnapshotQueue:        make(chan *PositionsSnapshot, bufSize),
@@ -328,10 +345,24 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		OnPublicMessage:      c.handlePublicMessage,
 		OnSessionEstablished: c.handleSessionEstablished,
 		OnRekeyRequired:      c.handleRekeyRequired,
+		OnStale:              c.handleStale,
 		OnDisconnect:         c.handleDisconnect,
 	})
 	return c, nil
 }
+
+func defaultReconnectBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return time.Second
+	}
+	d := time.Second << attempt
+	if d > 30*time.Second {
+		return 30 * time.Second
+	}
+	return d
+}
+
+var reconnectBackoff = defaultReconnectBackoff
 
 // UserUUID returns the authenticated user's canonical UUID. Empty until
 // Connect has completed successfully.
@@ -379,6 +410,18 @@ func (c *GodarkClient) IsConnected() bool {
 // completes the HPKE binary session setup. After Connect returns nil, the client
 // can issue trading commands.
 func (c *GodarkClient) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	c.intentionalClose = false
+	c.mu.Unlock()
+	return c.connectSession(ctx)
+}
+
+func (c *GodarkClient) connectSession(ctx context.Context) error {
+	c.session.Reset()
+	c.pendingMu.Lock()
+	c.pendingEncryptedByNonce = make(map[uint64]transport.Message)
+	c.pendingMu.Unlock()
+
 	if err := c.transport.Connect(ctx); err != nil {
 		return newConnectionError(err.Error())
 	}
@@ -450,6 +493,7 @@ func (c *GodarkClient) Disconnect() error {
 
 func (c *GodarkClient) disconnectInternal() error {
 	c.mu.Lock()
+	c.intentionalClose = true
 	c.connected = false
 	c.mu.Unlock()
 	c.transport.Disconnect()
@@ -781,16 +825,26 @@ func (c *GodarkClient) Subscribe(ctx context.Context, channels ...string) error 
 	if len(channels) == 0 {
 		channels = []string{"orders", "positions"}
 	}
+	c.subMu.Lock()
+	for _, ch := range channels {
+		c.desiredChannels[ch] = struct{}{}
+	}
+	c.subMu.Unlock()
 	return c.transport.SendSubscribe(ctx, channels, "subscribe")
 }
 
 // Unsubscribe is the inverse of Subscribe.
 func (c *GodarkClient) Unsubscribe(ctx context.Context, channels ...string) error {
-	if !c.transport.IsConnected() {
-		return nil
-	}
 	if len(channels) == 0 {
 		channels = []string{"orders", "positions"}
+	}
+	c.subMu.Lock()
+	for _, ch := range channels {
+		delete(c.desiredChannels, ch)
+	}
+	c.subMu.Unlock()
+	if !c.transport.IsConnected() {
+		return nil
 	}
 	return c.transport.SendSubscribe(ctx, channels, "unsubscribe")
 }
@@ -925,11 +979,19 @@ func (c *GodarkClient) OnError(cb func(error)) {
 }
 
 // OnDisconnect registers a callback fired when the WebSocket closes for any
-// reason. The callback does not block reconnection logic (which is the
-// caller's responsibility - the SDK does not auto-reconnect).
+// reason. Auto-reconnect runs unless DisableAutoReconnect is set or
+// Disconnect() was called intentionally.
 func (c *GodarkClient) OnDisconnect(cb func()) {
 	c.cbMu.Lock()
 	c.disconnectCB = append(c.disconnectCB, cb)
+	c.cbMu.Unlock()
+}
+
+// OnReconnect registers a callback fired after a successful automatic reconnect
+// (auth, HPKE setup, and subscription replay completed).
+func (c *GodarkClient) OnReconnect(cb func()) {
+	c.cbMu.Lock()
+	c.reconnectCB = append(c.reconnectCB, cb)
 	c.cbMu.Unlock()
 }
 
@@ -998,6 +1060,10 @@ func (c *GodarkClient) handleRekeyRequired(msg transport.Message) {
 	}()
 }
 
+func (c *GodarkClient) handleStale(reason string) {
+	c.emitError(newConnectionError(reason))
+}
+
 func (c *GodarkClient) handleDisconnect() {
 	c.mu.Lock()
 	c.connected = false
@@ -1007,6 +1073,85 @@ func (c *GodarkClient) handleDisconnect() {
 	))
 	c.cbMu.RLock()
 	cbs := append([]func(){}, c.disconnectCB...)
+	c.cbMu.RUnlock()
+	for _, cb := range cbs {
+		safeCallNoArg(cb)
+	}
+	c.maybeStartReconnect()
+}
+
+func (c *GodarkClient) maybeStartReconnect() {
+	c.mu.RLock()
+	intentional := c.intentionalClose
+	disable := c.disableAutoReconnect
+	c.mu.RUnlock()
+	if intentional || disable {
+		return
+	}
+	c.reconnectMu.Lock()
+	if c.reconnectInProgress {
+		c.reconnectMu.Unlock()
+		return
+	}
+	c.reconnectInProgress = true
+	c.reconnectMu.Unlock()
+	go c.reconnectLoop()
+}
+
+func (c *GodarkClient) reconnectLoop() {
+	defer func() {
+		c.reconnectMu.Lock()
+		c.reconnectInProgress = false
+		c.reconnectMu.Unlock()
+	}()
+
+	attempt := 0
+	for {
+		c.mu.RLock()
+		intentional := c.intentionalClose
+		disable := c.disableAutoReconnect
+		c.mu.RUnlock()
+		if intentional || disable {
+			return
+		}
+
+		if delay := reconnectBackoff(attempt); delay > 0 {
+			time.Sleep(delay)
+		}
+		attempt++
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err := c.connectSession(ctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		replayCtx, replayCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = c.resubscribeChannels(replayCtx)
+		replayCancel()
+
+		c.fireReconnectCallbacks()
+		return
+	}
+}
+
+func (c *GodarkClient) resubscribeChannels(ctx context.Context) error {
+	c.subMu.Lock()
+	channels := make([]string, 0, len(c.desiredChannels))
+	for ch := range c.desiredChannels {
+		channels = append(channels, ch)
+	}
+	c.subMu.Unlock()
+	if len(channels) == 0 {
+		return nil
+	}
+	return c.transport.SendSubscribe(ctx, channels, "subscribe")
+}
+
+func (c *GodarkClient) fireReconnectCallbacks() {
+	c.cbMu.RLock()
+	cbs := append([]func(){}, c.reconnectCB...)
 	c.cbMu.RUnlock()
 	for _, cb := range cbs {
 		safeCallNoArg(cb)
