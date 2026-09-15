@@ -185,6 +185,26 @@ func main() {
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after MODIFY")
 
+	// Market IOC with explicit walk cap: 50 bps = 0.5% of mark (UI default).
+	// Omit SlippageBps → venue max (localnet 5%).
+	fmt.Println("Placing market IOC BUY qty=0.01 with SlippageBps=50 (0.5% walk)...")
+	slippageBps := uint32(50)
+	if mktAck, mErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
+		Symbol:      symbol,
+		Side:        godark.SideBuy,
+		OrderType:   godark.OrderTypeMarket,
+		Quantity:    0.01,
+		TimeInForce: godark.TimeInForceIOC,
+		Options:     godark.PlaceOrderOptions{SlippageBps: &slippageBps},
+	}); mErr != nil {
+		envloader.PrintOrderError("Market BUY rejected (continuing)", mErr)
+	} else {
+		fmt.Printf("MARKET BUY placed: order_id=%s\n", mktAck.OrderID)
+	}
+
+	time.Sleep(1 * time.Second)
+	drainOrderUpdates(client, "after MARKET BUY")
+
 	// Place + immediately cancel a SELL.
 	sellPx := math.Round(mark*1.03*10) / 10
 	fmt.Printf("Placing limit SELL @ %.1f...\n", sellPx)

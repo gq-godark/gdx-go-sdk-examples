@@ -117,6 +117,11 @@ modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil)
 ```
 
+`PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,
+`StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`, and
+`SlippageBps`. Omit `SlippageBps` (nil) to use the venue max walk cap (localnet 5%);
+typical explicit values are 50–500 bps (0.5%–5%).
+
 ## Push streams (encrypted WS only)
 
 `GodarkClient` exposes one buffered channel per stream plus an
