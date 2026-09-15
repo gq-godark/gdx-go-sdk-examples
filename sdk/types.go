@@ -34,6 +34,8 @@ type PlaceOrderOptions struct {
 	TakeProfitPrice *float64
 	// StopLossPrice attaches SL at placement (optional; may also use AmendTpsl).
 	StopLossPrice *float64
+	// SlippageBps is max walk vs mark for market / stop-market. Nil → venue max.
+	SlippageBps *uint32
 }
 
 // CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.

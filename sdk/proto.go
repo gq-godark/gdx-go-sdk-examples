@@ -214,6 +214,9 @@ func BuildPlaceOrderRequest(
 	if options.StopLossPrice != nil {
 		place.StopLossPrice = options.StopLossPrice
 	}
+	if options.SlippageBps != nil {
+		place.SlippageBps = options.SlippageBps
+	}
 
 	req := &sequencerpb.EdgeSequencerRequest{
 		Inner: &sequencerpb.EdgeSequencerRequest_Place{Place: place},
