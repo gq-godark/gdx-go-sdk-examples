@@ -62,6 +62,12 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
 Both examples share `examples/internal/envloader/envloader.go` for `.env`
 loading and `OrderError` pretty-printing.
 
+`PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,
+`StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`, and
+`SlippageBps`. Omit `SlippageBps` (nil) to use the venue max walk cap (localnet 5%);
+typical explicit values are 50–500 bps (0.5%–5%). See `bundle/SDK_REFERENCE.md` for
+recipient-facing trading-command examples.
+
 ## Reproducibility
 
 The release pipeline (`scripts/package.sh` + `.github/workflows/release.yml`)
