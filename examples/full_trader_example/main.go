@@ -164,26 +164,27 @@ func main() {
 		Quantity:  0.1,
 	})
 	if err != nil {
-		envloader.PrintOrderError("BUY rejected", err)
-		os.Exit(1)
+		envloader.PrintOrderError("BUY rejected (continuing to market Place)", err)
+		buyAck = nil
+	} else {
+		fmt.Printf("BUY placed: order_id=%s  sequence=%s\n", buyAck.OrderID, buyAck.Sequence)
 	}
-	fmt.Printf("BUY placed: order_id=%s  sequence=%s\n", buyAck.OrderID, buyAck.Sequence)
 
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after BUY")
 
-	// Modify the BUY price.
-	modifyPx := math.Round(mark*0.996*10) / 10
-	fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
-	newPrice := modifyPx
-	if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
-		envloader.PrintOrderError("Modify rejected", mErr)
-	} else {
-		fmt.Printf("Modified: order_id=%s\n", mAck.OrderID)
+	if buyAck != nil {
+		modifyPx := math.Round(mark*0.996*10) / 10
+		fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
+		newPrice := modifyPx
+		if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
+			envloader.PrintOrderError("Modify rejected", mErr)
+		} else {
+			fmt.Printf("Modified: order_id=%s\n", mAck.OrderID)
+		}
+		time.Sleep(1 * time.Second)
+		drainOrderUpdates(client, "after MODIFY")
 	}
-
-	time.Sleep(1 * time.Second)
-	drainOrderUpdates(client, "after MODIFY")
 
 	// Market IOC with explicit walk cap: 50 bps = 0.5% of mark (UI default).
 	// Omit SlippageBps → venue max (localnet 5%).
@@ -351,12 +352,13 @@ func main() {
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after post_only mass quotes")
 
-	// Cleanup: cancel the original BUY (if still resting).
-	fmt.Println("Cancelling original BUY (cleanup)...")
-	if _, err := client.CancelOrder(ctx, buyAck.OrderID, symbol); err != nil {
-		fmt.Println("Original BUY already filled or cancelled")
-	} else {
-		fmt.Println("Original BUY cancelled")
+	if buyAck != nil {
+		fmt.Println("Cancelling original BUY (cleanup)...")
+		if _, err := client.CancelOrder(ctx, buyAck.OrderID, symbol); err != nil {
+			fmt.Println("Original BUY already filled or cancelled")
+		} else {
+			fmt.Println("Original BUY cancelled")
+		}
 	}
 
 	// Drain anything that arrived during the session.
