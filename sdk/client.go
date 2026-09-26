@@ -1284,6 +1284,10 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 			return nil, newOrderError("expected ack inside encrypted push", "")
 		}
 		if !ack.Success {
+			if ack.ErrorCode != nil {
+				code := int32(*ack.ErrorCode)
+				return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
+			}
 			return nil, MakeOrderErrorFromJSON(ack.RejectText, "")
 		}
 		return &OrderAck{OrderID: strconv.FormatUint(ack.OrderID, 10), Success: true, Sequence: strconv.FormatUint(ack.Sequence, 10)}, nil
@@ -1674,7 +1678,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 		return
 	}
 
-	parsed, err := ParseSequencerToEdgeMessage(pt)
+	parsed, err := ParseSequencerToEdgeMessage(pt, messageType)
 	if err != nil {
 		c.emitError(fmt.Errorf("parse encrypted push body: %w", err))
 		return
