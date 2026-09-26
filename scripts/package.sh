@@ -79,8 +79,8 @@ for required in bundle/README.md bundle/SDK_REFERENCE.md bundle/go.mod \
     exit 1
   fi
 done
-if ! command -v zip >/dev/null 2>&1; then
-  echo "error: 'zip' not found in PATH (apt-get install zip)" >&2
+if ! command -v zip >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+  echo "error: packaging requires either 'zip' or 'python3'" >&2
   exit 1
 fi
 
@@ -214,7 +214,11 @@ sed -i 's/list in sync with `gdx-protocol`/list mirrors the canonical protocol s
 # ---- zip ------------------------------------------------------------------
 ARCHIVE="$REPO_ROOT/${DIST_NAME}.zip"
 rm -f "$ARCHIVE"
-( cd "$STAGING_DIR" && zip -qr "$ARCHIVE" "$DIST_NAME" )
+if command -v zip >/dev/null 2>&1; then
+  ( cd "$STAGING_DIR" && zip -qr "$ARCHIVE" "$DIST_NAME" )
+else
+  ( cd "$STAGING_DIR" && python3 -m zipfile -c "$ARCHIVE" "$DIST_NAME" )
+fi
 rm -rf "$STAGING_DIR"
 
 # ---- post-flight assertions ----------------------------------------------

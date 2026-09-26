@@ -80,6 +80,7 @@ mkdir -p "$DEST"
 #   - *_test.go, testdata/             huge size win; recipients don't run
 #                                      upstream tests
 rsync -a \
+  --exclude='.git' \
   --exclude='.git/' \
   --exclude='.github/' \
   --exclude='scripts/' \
