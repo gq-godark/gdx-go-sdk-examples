@@ -7,7 +7,7 @@ Supported order types in this distribution: `MARKET`, `LIMIT`.
 
 ## Package contents
 
-- `examples/` — `quickstart` and `full_trader_example` sources
+- `examples/` — `quickstart`, `full_trader_example`, and `rest_client_example` sources
 - `sdk/` — bundled `godark` module
 - `go.mod`, `go.sum` — workspace manifest for `go build ./examples/...`
 - `README.md`, `SDK_REFERENCE.md` — recipient docs
@@ -45,7 +45,10 @@ $EDITOR .env       # fill in your testnet creds
 Optional override:
 
 - `GODARK_EDGE_URL` — override the edge URL (default: public testnet `wss://api.godark-dex.com` via the SDK Testnet environment preset).
-`- `GDX_HPKE_STATIC_PUBLIC_KEY` — sequencer HPKE static public key (64 hex). Required for localnet/devnet Aliases: `GDX_HPKE_STATIC_PUBKEY`, `GODARK_HPKE_STATIC_PUBLIC_KEY`, `VITE_GDX_HPKE_STATIC_PUBKEY`.
+- `GDX_HPKE_STATIC_PUBLIC_KEY` — sequencer HPKE static public key (64 hex).
+  Required for localnet; testnet and devnet have baked-in pins. Aliases:
+  `GDX_HPKE_STATIC_PUBKEY`, `GODARK_HPKE_STATIC_PUBLIC_KEY`,
+  `VITE_GDX_HPKE_STATIC_PUBKEY`.
 
 The OS environment always wins over `.env`.
 
@@ -56,6 +59,7 @@ From inside the unzipped bundle:
 ```bash
 go build ./examples/quickstart            # produces ./quickstart
 go build ./examples/full_trader_example   # produces ./full_trader_example
+go build ./examples/rest_client_example   # produces ./rest_client_example
 ```
 
 Then run either binary:
@@ -63,6 +67,7 @@ Then run either binary:
 ```bash
 ./quickstart
 ./full_trader_example
+./rest_client_example
 ```
 
 The bundled `go.mod` resolves `godark` from `./sdk`.

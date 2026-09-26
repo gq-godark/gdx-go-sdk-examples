@@ -130,6 +130,7 @@ type BatchModifyAck struct {
 	Sequence string
 	Results  []BatchModifyLegResult
 }
+
 // TpslAck is the RPC reply for amend / cancel TP-SL (live feed remains TpslUpdate).
 type TpslAck struct {
 	CorrelationID uint64
@@ -141,7 +142,6 @@ type TpslAck struct {
 	ErrorCode     *uint32
 	RejectText    string
 }
-
 
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
@@ -188,14 +188,14 @@ type PositionUpdate struct {
 // AccountMarginSummary is the authoritative account-level margin summary
 // (decimal string amounts).
 type AccountMarginSummary struct {
-	TotalCollateral      string
-	PositionMargin       string
-	ReservedOrderMargin  string
-	FreeCollateral       string
-	AccountEquity        string
-	UnrealizedPnl        string
-	CrossAvailable       string
-	RealizedPnl          string
+	TotalCollateral     string
+	PositionMargin      string
+	ReservedOrderMargin string
+	FreeCollateral      string
+	AccountEquity       string
+	UnrealizedPnl       string
+	CrossAvailable      string
+	RealizedPnl         string
 }
 
 // AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
@@ -327,6 +327,7 @@ type MarginAlert struct {
 	StateVersion     uint64
 	Recovered        bool
 }
+
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.
 type FundingRateUpdate struct {
 	SymbolID        int64

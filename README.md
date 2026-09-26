@@ -23,6 +23,7 @@ gdx-go-sdk-examples/
 ├── examples/
 │   ├── quickstart/main.go                place + cancel
 │   ├── full_trader_example/main.go       subscribe + place + modify + cancel + mass-quote + batch-cancel
+│   ├── full_trader_rest/main.go          maintainer-only REST trading diagnostic
 │   ├── rest_client_example/main.go       REST residual reads
 │   └── internal/envloader/envloader.go   shared .env loader + OrderError printer
 ├── scripts/
@@ -42,8 +43,9 @@ gdx-go-sdk-examples/
 ## Configure credentials
 
 Copy `.env.example` to `.env` and set `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
-and `GODARK_PASSPHRASE`. Public testnet needs only those three for hosted
-testnet; localnet/devnet also require `GDX_HPKE_STATIC_PUBLIC_KEY`.
+and `GODARK_PASSPHRASE`. Public testnet and devnet need only those three
+because the SDK provides environment-specific HPKE pins; localnet also
+requires `GDX_HPKE_STATIC_PUBLIC_KEY`.
 
 Optional overrides: `GODARK_EDGE_URL`, `GDX_HPKE_STATIC_PUBLIC_KEY` (legacy
 HPKE env vars).
@@ -62,7 +64,7 @@ Copy `VITE_GDX_HPKE_STATIC_PUBKEY` from `gdx-web/.env.localnet` if your pin diff
 ## Local development
 
 ```bash
-go build ./examples/...                  # compile both example binaries
+go build ./examples/...                  # compile every example binary
 go vet ./...                             # static checks
 go run ./examples/quickstart             # run quickstart against testnet
 go run ./examples/full_trader_example    # run full trader against testnet

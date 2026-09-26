@@ -114,7 +114,7 @@ cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 
 newPrice := 68_000.0
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
-    &newPrice, /*newQuantity*/ nil)
+    &newPrice, /*newQuantity*/ nil, /*newTriggerPrice*/ nil)
 ```
 
 `PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,

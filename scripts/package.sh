@@ -89,7 +89,7 @@ CLEANUP_UPSTREAM=false
 
 if [[ -n "${UPSTREAM_SRC:-}" ]]; then
   echo "Using UPSTREAM_SRC=${UPSTREAM_SRC}"
-elif [[ -d "${REPO_ROOT}/../gdx-go-sdk/.git" ]]; then
+elif git -C "${REPO_ROOT}/../gdx-go-sdk" rev-parse --git-dir >/dev/null 2>&1; then
   UPSTREAM_SRC="$(cd "${REPO_ROOT}/../gdx-go-sdk" && pwd)"
   echo "Using sibling upstream checkout: $UPSTREAM_SRC"
 else
@@ -112,7 +112,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- verify upstream is at the pinned ref ---------------------------------
-if [[ ! -d "$UPSTREAM_SRC/.git" ]]; then
+if ! git -C "$UPSTREAM_SRC" rev-parse --git-dir >/dev/null 2>&1; then
   echo "error: '$UPSTREAM_SRC' is not a git checkout - cannot verify pin" >&2
   exit 1
 fi

@@ -218,7 +218,7 @@ type GodarkClient struct {
 	mu             sync.RWMutex
 	userUUID       string
 	connID         uint64
-	hpkeStaticKey string
+	hpkeStaticKey  string
 	accountID      string
 	loginSessionID string
 	tokenExpiresAt string
@@ -1975,7 +1975,6 @@ func resolveUserUUID(explicit string) string {
 	}
 	return ""
 }
-
 
 func resolveHpkeStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
