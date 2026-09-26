@@ -124,9 +124,13 @@ type ClientConfig struct {
 	// GDX_EDGE_URL → Environment preset.
 	BaseURL string
 
-	// UserUUID is an optional fallback when the edge auth response omits
-	// `user_uuid` (e.g. local edge). Also read from GODARK_USER_UUID /
-	// GDX_USER_UUID env vars.
+	// Account is an optional Solana base58 account fallback when an older local
+	// edge omits `account`. Current edges always return it after login.
+	// Also read from GODARK_ACCOUNT / GDX_ACCOUNT.
+	Account string
+
+	// UserUUID is retained for legacy edge metadata only. It is not used in
+	// current encrypted protobuf or HPKE identity domains.
 	UserUUID string
 
 	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key.
@@ -206,16 +210,17 @@ type placeOutcomeWaiter struct {
 // flight at a time (gated by the transport mutex); push-stream consumers
 // (channels and callbacks) run concurrently with command issuance.
 type GodarkClient struct {
-	authToken      string
-	baseURL        string
-	fallbackUserUU string
-	symbolMap      map[string]int64
-	bufSize        int
+	authToken       string
+	baseURL         string
+	fallbackAccount string
+	symbolMap       map[string]int64
+	bufSize         int
 
 	transport *transport.Transport
 	session   *session.CryptoSession
 
 	mu             sync.RWMutex
+	account        string
 	userUUID       string
 	connID         uint64
 	hpkeStaticKey  string
@@ -289,7 +294,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	if strings.TrimSpace(cfg.BaseURL) != "" {
 		pinEnv = inferEnvironmentFromRestURL(cfg.BaseURL)
 	}
-	fallbackUUID := resolveUserUUID(cfg.UserUUID)
+	fallbackAccount := resolveAccount(cfg.Account)
 
 	symbolMap := cfg.SymbolMap
 	if symbolMap == nil {
@@ -319,7 +324,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	c := &GodarkClient{
 		authToken:               authToken,
 		baseURL:                 baseURL,
-		fallbackUserUU:          fallbackUUID,
+		fallbackAccount:         fallbackAccount,
 		symbolMap:               symbolMap,
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
@@ -365,11 +370,19 @@ func defaultReconnectBackoff(attempt int) time.Duration {
 var reconnectBackoff = defaultReconnectBackoff
 
 // UserUUID returns the authenticated user's canonical UUID. Empty until
-// Connect has completed successfully.
+// Connect has completed successfully. Current account-based edges do not
+// provide this legacy identifier, so it is normally empty.
 func (c *GodarkClient) UserUUID() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.userUUID
+}
+
+// Account returns the authenticated 32-byte Solana account as base58.
+func (c *GodarkClient) Account() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
 }
 
 // AccountID, LoginSessionID, TokenExpiresAt, CancelOnDisconnect expose
@@ -440,24 +453,21 @@ func (c *GodarkClient) connectSession(ctx context.Context) error {
 		return newAuthenticationError(msg)
 	}
 
-	uid := stringValue(auth["user_uuid"])
-	if uid == "" {
-		uid = stringValue(auth["user_id"])
+	account := stringValue(auth["account"])
+	if account == "" {
+		account = c.fallbackAccount
 	}
-	if uid == "" {
-		uid = c.fallbackUserUU
-	}
-	if uid == "" {
+	if _, err := identity.AccountToBytes(account); err != nil {
 		_ = c.disconnectInternal()
 		return newAuthenticationError(
-			"authentication succeeded but user_uuid missing in auth_result " +
-				"and no fallback provided via constructor or " +
-				"GODARK_USER_UUID / GDX_USER_UUID env vars",
+			"authentication succeeded but account is missing or invalid; " +
+				"set ClientConfig.Account or GODARK_ACCOUNT / GDX_ACCOUNT for a legacy local edge",
 		)
 	}
 
 	c.mu.Lock()
-	c.userUUID = uid
+	c.account = account
+	c.userUUID = stringValue(auth["user_uuid"])
 	c.accountID = stringValue(auth["account_id"])
 	c.loginSessionID = stringValue(auth["session_id"])
 	c.tokenExpiresAt = stringValue(auth["token_expires_at"])
@@ -567,7 +577,7 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		uint64(symbolID),
 		req.Side, req.OrderType,
 		req.Quantity,
-		c.userUUIDBytes(),
+		c.accountBytes(),
 		pricePtr,
 		req.TimeInForce,
 		req.AON,
@@ -625,7 +635,7 @@ func (c *GodarkClient) CancelOrder(ctx context.Context, orderID string, symbol s
 		return nil, fmt.Errorf("CancelOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), corrID)
+	plaintext, err := BuildCancelOrderRequest(oid, c.accountBytes(), uint64(symbolID), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -653,7 +663,7 @@ func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, 
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +687,7 @@ func (c *GodarkClient) CancelAllOrders(ctx context.Context, symbol string) (*Cou
 		bodySymbolID = &usid
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	plaintext, err := BuildCancelAll(bodySymbolID, c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -705,7 +715,7 @@ func (c *GodarkClient) CloseAll(ctx context.Context, symbol string) (*CountAck, 
 		bodySymbolID = &usid
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCloseAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	plaintext, err := BuildCloseAll(bodySymbolID, c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +739,7 @@ func (c *GodarkClient) ReversePosition(ctx context.Context, symbol string) (*Cou
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildReverse(uint64(symbolID), c.userUUIDBytes(), corrID)
+	plaintext, err := BuildReverse(uint64(symbolID), c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -766,7 +776,7 @@ func (c *GodarkClient) AmendTpsl(
 		bodySymbolID = &sid
 	}
 	plaintext, err := BuildAmendTpsl(
-		c.userUUIDBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide,
+		c.accountBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide,
 	)
 	if err != nil {
 		return nil, err
@@ -801,7 +811,7 @@ func (c *GodarkClient) CancelTpsl(
 		sid := uint64(symbolID)
 		bodySymbolID = &sid
 	}
-	plaintext, err := BuildCancelTpsl(c.userUUIDBytes(), orderID, corrID, bodySymbolID, positionSide)
+	plaintext, err := BuildCancelTpsl(c.accountBytes(), orderID, corrID, bodySymbolID, positionSide)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,11 +1018,11 @@ func (c *GodarkClient) setupHpkeSession(ctx context.Context) error {
 		return newSessionError(err.Error())
 	}
 
-	encapped, err := c.session.Setup(remoteStatic, c.userUUIDBytes(), c.connID)
+	encapped, err := c.session.Setup(remoteStatic, c.accountBytes(), c.connID)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
-	frame, err := wire.EncodeHpkeSetup(c.userUUIDBytes(), c.connID, encapped)
+	frame, err := wire.EncodeHpkeSetup(c.accountBytes(), c.connID, encapped)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
@@ -1199,7 +1209,7 @@ func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType s
 
 	resp, err := c.transport.SendBinaryCommand(ctx, corrKey, func() ([]byte, error) {
 		nonceCounter := c.session.NextNonce()
-		aad, err := BuildOrderHeaderAADWithConn(c.userUUIDBytes(), symbolID, requestType, nonceCounter, bodyLength, correlationID, c.connectionID())
+		aad, err := BuildOrderHeaderAADWithConn(c.accountBytes(), symbolID, requestType, nonceCounter, bodyLength, correlationID, c.connectionID())
 		if err != nil {
 			return nil, err
 		}
@@ -1212,7 +1222,7 @@ func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType s
 			return nil, fmt.Errorf("unknown request_type %q", requestType)
 		}
 		header := &edgepb.OrderHeader{
-			UserUuid:      c.userUUIDBytes(),
+			Account:       c.accountBytes(),
 			SymbolId:      symbolID,
 			RequestType:   commonpb.RequestType(rt),
 			Nonce:         actualNonce,
@@ -1305,7 +1315,7 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1371,7 +1381,7 @@ func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMes
 		messageType = defaultMessageType
 	}
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1402,7 +1412,7 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1440,7 +1450,7 @@ func (c *GodarkClient) UpdateLeverage(ctx context.Context, symbol string, levera
 		lev = 1
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	plaintext, err := BuildUpdateLeverageRequest(c.accountBytes(), uint64(symbolID), lev, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1464,7 +1474,7 @@ func (c *GodarkClient) BatchCancel(ctx context.Context, symbol string, orderIDs 
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.accountBytes(), orderIDs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1501,7 +1511,7 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1631,7 +1641,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	switch messageType {
 	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack", "cancel_all_ack", "close_all_ack", "reverse_ack", "tpsl_ack":
 		aad, err := BuildResponseHeaderAADWithConn(
-			c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+			c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 		)
 		if err != nil {
@@ -1654,7 +1664,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1865,12 +1875,12 @@ func (c *GodarkClient) dispatchOpenOrdersSnapshot(snap *OpenOrdersSnapshot) {
 func (c *GodarkClient) ensureReady() error {
 	c.mu.RLock()
 	connected := c.connected
-	userUUID := c.userUUID
+	account := c.account
 	c.mu.RUnlock()
 	if !connected {
 		return newConnectionError("not connected")
 	}
-	if userUUID == "" {
+	if account == "" {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
@@ -1879,15 +1889,15 @@ func (c *GodarkClient) ensureReady() error {
 	return nil
 }
 
-func (c *GodarkClient) userUUIDBytes() []byte {
+func (c *GodarkClient) accountBytes() []byte {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.userUUID == "" {
-		return make([]byte, identity.UserUUIDLen)
+	if c.account == "" {
+		return make([]byte, identity.AccountLen)
 	}
-	b, err := identity.ToBytes(c.userUUID)
+	b, err := identity.AccountToBytes(c.account)
 	if err != nil {
-		return make([]byte, identity.UserUUIDLen)
+		return make([]byte, identity.AccountLen)
 	}
 	return b
 }
@@ -1964,11 +1974,11 @@ func resolveEdgeBaseURL(explicit string, env Environment) string {
 	return env.EdgeBaseURL()
 }
 
-func resolveUserUUID(explicit string) string {
+func resolveAccount(explicit string) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
-	for _, key := range []string{"GODARK_USER_UUID", "GDX_USER_UUID"} {
+	for _, key := range []string{"GODARK_ACCOUNT", "GDX_ACCOUNT"} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}

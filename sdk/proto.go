@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 	commonpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/common/v1"
 	edgepb "github.com/gq-godark/gdx-go-sdk/proto/gdx/edge/v1"
 	healthpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/health/v1"
@@ -131,6 +132,14 @@ func uuidBytesToString(raw []byte) string {
 	return "00000000-0000-0000-0000-000000000000"
 }
 
+func accountBytesToString(raw []byte) string {
+	account, err := identity.AccountFromBytes(raw)
+	if err != nil {
+		return ""
+	}
+	return account
+}
+
 func stringOr(p *string, fallback string) string {
 	if p == nil {
 		return fallback
@@ -187,7 +196,7 @@ func BuildPlaceOrderRequest(
 		OrderType:   commonpb.OrderType(otypeInt),
 		Quantity:    &qty,
 		TimeInForce: commonpb.TimeInForce(tifInt),
-		UserUuid:    userUUID,
+		Account:     userUUID,
 		StpMode:     commonpb.StpMode(stpInt),
 		ReduceOnly:  options.ReduceOnly,
 		PostOnly:    options.PostOnly,
@@ -227,7 +236,7 @@ func BuildPlaceOrderRequest(
 // symbolID nil cancels every market for the user.
 func BuildCancelAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
 	cancelAll := &sequencerpb.CancelAllInput{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	if symbolID != nil {
@@ -240,7 +249,7 @@ func BuildCancelAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, e
 // symbolID nil closes every market for the user.
 func BuildCloseAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
 	closeAll := &sequencerpb.CloseAllInput{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	if symbolID != nil {
@@ -253,7 +262,7 @@ func BuildCloseAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, er
 func BuildReverse(symbolID uint64, userUUID, correlationID []byte) ([]byte, error) {
 	reverse := &sequencerpb.ReverseInput{
 		SymbolId:      symbolID,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(reverse)
@@ -270,7 +279,7 @@ func BuildAmendTpsl(
 	positionSide *Side,
 ) ([]byte, error) {
 	amend := &sequencerpb.AmendTpslRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		OrderId:       orderID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
@@ -303,7 +312,7 @@ func BuildCancelTpsl(
 	positionSide *Side,
 ) ([]byte, error) {
 	cancel := &sequencerpb.CancelTpslRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		OrderId:       orderID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
@@ -327,7 +336,7 @@ func BuildCancelOrderRequest(orderID uint64, userUUID []byte, symbolID uint64, c
 		OrderId:       orderID,
 		SymbolId:      symbolID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		UserUuid:      userUUID,
+		Account:       userUUID,
 	}
 	return proto.Marshal(cancel)
 }
@@ -340,7 +349,7 @@ func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, 
 		lev = 1
 	}
 	ul := &sequencerpb.UpdateLeverageRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		SymbolId:      symbolID,
 		Leverage:      uint32(lev),
 		CorrelationId: correlationIDBodyBytes(correlationID),
@@ -352,7 +361,7 @@ func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, 
 // HPKE-sealed body.
 func BuildGetOpenOrdersRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetOpenOrdersRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(inner)
@@ -362,7 +371,7 @@ func BuildGetOpenOrdersRequest(userUUID, correlationID []byte) ([]byte, error) {
 // HPKE-sealed body.
 func BuildGetPositionsRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetPositionsRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(inner)
@@ -372,7 +381,7 @@ func BuildGetPositionsRequest(userUUID, correlationID []byte) ([]byte, error) {
 // HPKE-sealed body.
 func BuildGetAccountRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetAccountRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(inner)
@@ -392,7 +401,7 @@ func BuildModifyOrderRequest(
 		OrderId:       orderID,
 		SymbolId:      symbolID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		UserUuid:      userUUID,
+		Account:       userUUID,
 	}
 	if newPrice != nil {
 		modify.NewPrice = newPrice
@@ -471,7 +480,7 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 	mq := &sequencerpb.MassQuoteInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 		PostOnly:      &postOnlyVal,
 	}
@@ -490,7 +499,7 @@ func BuildBatchCancelRequest(symbolID uint64, userUUID []byte, orderIDs []uint64
 	bc := &sequencerpb.BatchCancelInput{
 		SymbolId:      symbolID,
 		OrderIds:      orderIDs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(bc)
@@ -528,7 +537,7 @@ func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModif
 	bm := &sequencerpb.BatchModifyInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	return proto.Marshal(bm)
@@ -546,7 +555,7 @@ func BuildOrderHeaderAADWithConn(userUUID []byte, symbolID uint64, requestType s
 		return nil, fmt.Errorf("unknown request type: %q", requestType)
 	}
 	hdr := &edgepb.OrderHeader{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		SymbolId:      symbolID,
 		RequestType:   commonpb.RequestType(reqInt),
 		Nonce:         nonce,
@@ -569,7 +578,7 @@ func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLen
 		return nil, fmt.Errorf("unknown response message type: %q", messageType)
 	}
 	hdr := &edgepb.ResponseHeader{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		MessageType:   commonpb.ResponseMessageType(msgInt),
 		BodyLength:    bodyLength,
 		Nonce:         nonce,
@@ -900,11 +909,11 @@ func ParseAccountMarginUpdate(msg *sequencerpb.AccountMarginUpdate) *AccountMarg
 		return &AccountMarginUpdate{}
 	}
 	out := &AccountMarginUpdate{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		OwnerAccount:    accountBytesToString(msg.Account),
 		ServerTimestamp: msg.ServerTimestamp,
 		CorrelationID:   correlationIDToUint64(msg.CorrelationId),
 	}
-	if a := msg.Account; a != nil {
+	if a := msg.Summary; a != nil {
 		out.Account = &AccountMarginSummary{
 			TotalCollateral:     a.TotalCollateral,
 			PositionMargin:      a.PositionMargin,
@@ -1275,7 +1284,7 @@ func ParseOrderUpdate(data []byte) (*OrderUpdate, error) {
 
 	out := &OrderUpdate{
 		OrderID:       fmt.Sprintf("%d", msg.OrderId),
-		UserUUID:      uuidBytesToString(msg.UserUuid),
+		Account:       accountBytesToString(msg.Account),
 		SymbolID:      int64(msg.SymbolId),
 		Side:          side,
 		Status:        status,
@@ -1348,7 +1357,7 @@ func ParsePositionsSnapshot(msg *sequencerpb.PositionsSnapshot) *PositionsSnapsh
 		rows[i] = parsePositionRow(r)
 	}
 	out := &PositionsSnapshot{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		Account:         accountBytesToString(msg.Account),
 		Rows:            rows,
 		ServerTimestamp: msg.ServerTimestamp,
 		Source:          parsePositionsSnapshotSource(msg.Source),
@@ -1370,7 +1379,7 @@ func ParseLeverageSettings(msg *sequencerpb.LeverageSettings) *LeverageSettings 
 		}
 	}
 	return &LeverageSettings{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		Account:         accountBytesToString(msg.Account),
 		Settings:        settings,
 		ServerTimestamp: msg.ServerTimestamp,
 	}
@@ -1421,7 +1430,7 @@ func ParseSequencerToEdgeMessage(data []byte, messageType string) (SequencerPush
 			return nil, err
 		}
 		return &BalanceUpdate{
-			UserUUID:          uuidBytesToString(b.UserUuid),
+			Account:           accountBytesToString(b.Account),
 			BalanceRaw:        b.BalanceRaw,
 			Timestamp:         b.Timestamp,
 			Balance:           b.Balance,

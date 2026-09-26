@@ -15,6 +15,7 @@ type LeverageSetting struct {
 // the encrypted WS as `leverage_settings`. REST responses leave UserUUID
 // empty and ServerTimestamp at zero.
 type LeverageSettings struct {
+	Account         string
 	UserUUID        string
 	Settings        []LeverageSetting
 	ServerTimestamp uint64
@@ -146,6 +147,7 @@ type TpslAck struct {
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
 	OrderID       string
+	Account       string
 	UserUUID      string
 	SymbolID      int64
 	Side          Side
@@ -201,6 +203,7 @@ type AccountMarginSummary struct {
 // AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
 // snapshot or WS push).
 type AccountMarginUpdate struct {
+	OwnerAccount    string
 	UserUUID        string
 	ServerTimestamp uint64
 	Account         *AccountMarginSummary
@@ -241,6 +244,7 @@ type PositionRow struct {
 // PositionsSnapshot is the periodic / event-triggered authoritative view of
 // all open positions for the authenticated user.
 type PositionsSnapshot struct {
+	Account         string
 	UserUUID        string
 	Rows            []PositionRow
 	ServerTimestamp uint64
@@ -262,6 +266,7 @@ type SystemHealthUpdate struct {
 
 // BalanceUpdate is a push frame describing the user's collateral balance.
 type BalanceUpdate struct {
+	Account           string
 	UserUUID          string
 	BalanceRaw        uint64
 	Timestamp         uint64

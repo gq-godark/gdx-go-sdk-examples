@@ -59,7 +59,7 @@ ctx := context.Background()
 if err := client.Connect(ctx); err != nil { ... }   // login + HPKE setup handshake
 defer client.Disconnect()
 
-uid := client.UserUUID()
+account := client.Account() // authenticated Solana account, base58
 ```
 
 > **Encrypted REST trading is not supported.** Earlier builds shipped a
@@ -121,6 +121,10 @@ modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
 `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`, and
 `SlippageBps`. Omit `SlippageBps` (nil) to use the venue max walk cap (localnet 5%);
 typical explicit values are 50–500 bps (0.5%–5%).
+
+Encrypted headers, HPKE info, command bodies, and private pushes use the
+32-byte Solana account returned by login. `ClientConfig.Account` /
+`GODARK_ACCOUNT` is only a fallback for older local edges that omit it.
 
 ## Push streams (encrypted WS only)
 

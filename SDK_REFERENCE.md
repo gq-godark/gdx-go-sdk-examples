@@ -68,6 +68,10 @@ loading and `OrderError` pretty-printing.
 typical explicit values are 50–500 bps (0.5%–5%). See `bundle/SDK_REFERENCE.md` for
 recipient-facing trading-command examples.
 
+Current `gdx-core` encrypted wire identity is the authenticated 32-byte Solana
+account. The vendored SDK derives it from `auth_result.account` / JWT `sub` and
+exposes it through `Client.Account()`; UUID accessors are legacy metadata only.
+
 ## Reproducibility
 
 The release pipeline (`scripts/package.sh` + `.github/workflows/release.yml`)

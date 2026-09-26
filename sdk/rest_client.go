@@ -45,8 +45,11 @@ type RestClientConfig struct {
 	// `https://host`), then falls back to the default production URL.
 	BaseURL string
 
-	// UserUUID is a fallback when the auth response omits `user_uuid` (some
-	// local edges do this). Also read from `GODARK_USER_UUID` / `GDX_USER_UUID`.
+	// Account is a Solana base58 fallback for legacy local edges that omit the
+	// current account-bearing JWT subject.
+	Account string
+
+	// UserUUID is retained for source compatibility and legacy metadata only.
 	UserUUID string
 
 	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key for
@@ -84,6 +87,7 @@ type GodarkRestClient struct {
 
 	mu             sync.RWMutex
 	bearer         string
+	account        string
 	userUUID       string
 	tokenScope     string
 	walletAddr     string
@@ -123,7 +127,7 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		symbolMap:      symMap,
 		http:           rest.New(base, cfg.HTTPClient),
 		hpkePinHex:     resolveRestHpkePin(cfg.HpkeStaticPublicKeyHex, env),
-		fallback:       resolveUserUUID(cfg.UserUUID),
+		fallback:       resolveAccount(cfg.Account),
 		localCOIDIndex: make(map[string]string),
 	}
 	c.nextRequestID.Store(1)
@@ -180,6 +184,13 @@ func (c *GodarkRestClient) UserUUID() string {
 	return c.userUUID
 }
 
+// Account returns the authenticated 32-byte Solana account as base58.
+func (c *GodarkRestClient) Account() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
+}
+
 // BearerToken returns the active bearer token (or "" if not connected).
 func (c *GodarkRestClient) BearerToken() string {
 	c.mu.RLock()
@@ -194,9 +205,8 @@ func (c *GodarkRestClient) TokenScope() string {
 	return c.tokenScope
 }
 
-// Connect authenticates REST requests via POST /api/v1/auth/token. User identity
-// is resolved from user_uuid in the auth response, constructor/env fallback, or
-// the JWT sub claim.
+// Connect authenticates REST requests via POST /api/v1/auth/token. The current
+// encrypted-wire account is resolved from the response, JWT sub, or fallback.
 func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	var (
 		authData map[string]any
@@ -219,20 +229,20 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 		return newAuthenticationError("auth/token missing access_token/token")
 	}
 
-	uid, _ := authData["user_uuid"].(string)
-	uid = strings.TrimSpace(uid)
-	if uid == "" {
-		if parsed, ok := userUUIDFromAccessTokenJWT(bearer); ok {
-			uid = parsed
+	account, _ := authData["account"].(string)
+	account = strings.TrimSpace(account)
+	if account == "" {
+		if parsed, ok := accountFromAccessTokenJWT(bearer); ok {
+			account = parsed
 		}
 	}
-	if uid == "" {
-		uid = strings.TrimSpace(c.fallback)
+	if account == "" {
+		account = strings.TrimSpace(c.fallback)
 	}
-	if uid == "" {
+	if _, err := identity.AccountToBytes(account); err != nil {
 		return newAuthenticationError(
-			"REST auth succeeded but user_uuid missing in response, JWT sub, and no fallback " +
-				"provided via constructor or GODARK_USER_UUID / GDX_USER_UUID env vars",
+			"REST auth succeeded but account is missing or invalid; " +
+				"set RestClientConfig.Account or GODARK_ACCOUNT / GDX_ACCOUNT for a legacy local edge",
 		)
 	}
 
@@ -240,7 +250,8 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.bearer = bearer
-	c.userUUID = uid
+	c.account = account
+	c.userUUID, _ = authData["user_uuid"].(string)
 	c.tokenScope = scope
 	c.mu.Unlock()
 
@@ -258,6 +269,7 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.bearer = ""
+	c.account = ""
 	c.userUUID = ""
 	c.tokenScope = ""
 	c.walletAddr = ""
@@ -307,7 +319,7 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		uint64(symbolID),
 		req.Side, req.OrderType,
 		req.Quantity,
-		c.userUUIDBytes(),
+		c.accountBytes(),
 		pricePtr,
 		tif,
 		req.AON,
@@ -358,7 +370,7 @@ func (c *GodarkRestClient) CancelOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("CancelOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), corrID)
+	plaintext, err := BuildCancelOrderRequest(oid, c.accountBytes(), uint64(symbolID), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +423,7 @@ func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +624,7 @@ func (c *GodarkRestClient) MassQuote(ctx context.Context, symbol string, legs []
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +645,7 @@ func (c *GodarkRestClient) BatchCancel(ctx context.Context, symbol string, order
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.accountBytes(), orderIDs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +666,7 @@ func (c *GodarkRestClient) BatchModify(ctx context.Context, symbol string, legs 
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -682,7 +694,7 @@ func (c *GodarkRestClient) UpdateLeverage(ctx context.Context, symbol string, le
 	}
 
 	corrID := newCorrelationID()
-	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	plaintext, err := BuildUpdateLeverageRequest(c.accountBytes(), uint64(symbolID), lev, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -760,13 +772,13 @@ func (c *GodarkRestClient) pinnedRecipient() ([]byte, error) {
 	return hpke.ParsePinnedStaticPublicKey(pin)
 }
 
-func (c *GodarkRestClient) setupRESTSession(userUUID []byte) (uint64, []byte, *hpke.SealedSession, error) {
+func (c *GodarkRestClient) setupRESTSession(account []byte) (uint64, []byte, *hpke.SealedSession, error) {
 	recipient, err := c.pinnedRecipient()
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	requestID := c.nextRequestID.Add(1) - 1
-	info := hpke.InfoForRESTRequest(userUUID, requestID)
+	info := hpke.InfoForRESTRequest(account, requestID)
 	encapped, sealed, err := hpke.SetupSession(recipient, info)
 	if err != nil {
 		return 0, nil, nil, newEncryptionError(fmt.Sprintf("HPKE setup: %v", err))
@@ -783,15 +795,15 @@ func (c *GodarkRestClient) sendEncryptedEnvelope(
 	clientOrderID string,
 	headerLeverage *int,
 ) (*hpke.SealedSession, map[string]any, error) {
-	userUUID := c.userUUIDBytes()
-	requestID, encapped, sealed, err := c.setupRESTSession(userUUID)
+	account := c.accountBytes()
+	requestID, encapped, sealed, err := c.setupRESTSession(account)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	const nonce = uint64(0)
 	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
-	aad, err := BuildOrderHeaderAAD(userUUID, symbolID, requestType, nonce, bodyLength, correlationID)
+	aad, err := BuildOrderHeaderAAD(account, symbolID, requestType, nonce, bodyLength, correlationID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -883,7 +895,7 @@ func (c *GodarkRestClient) snapshotRPC(
 	path string,
 ) (*NodeResponseVariant, error) {
 	corrID := newCorrelationID()
-	plaintext, err := build(c.userUUIDBytes(), corrID)
+	plaintext, err := build(c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -948,7 +960,7 @@ func (c *GodarkRestClient) decryptRestPlaintext(msg map[string]any, sealed *hpke
 		messageType = "ack"
 	}
 	aad, err := BuildResponseHeaderAAD(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]),
 	)
 	if err != nil {
@@ -1109,13 +1121,13 @@ func resolveOrderIDFromLookup(row map[string]any) string {
 func (c *GodarkRestClient) ensureReady() error {
 	c.mu.RLock()
 	bearer := c.bearer
-	uid := c.userUUID
+	account := c.account
 	hpkePin := c.hpkePinHex
 	c.mu.RUnlock()
 	if bearer == "" {
 		return newConnectionError("not connected: call Connect first")
 	}
-	if uid == "" {
+	if account == "" {
 		return newConnectionError("not authenticated")
 	}
 	if strings.TrimSpace(hpkePin) == "" {
@@ -1124,16 +1136,16 @@ func (c *GodarkRestClient) ensureReady() error {
 	return nil
 }
 
-func (c *GodarkRestClient) userUUIDBytes() []byte {
+func (c *GodarkRestClient) accountBytes() []byte {
 	c.mu.RLock()
-	uid := c.userUUID
+	account := c.account
 	c.mu.RUnlock()
-	if uid == "" {
-		return make([]byte, identity.UserUUIDLen)
+	if account == "" {
+		return make([]byte, identity.AccountLen)
 	}
-	b, err := identity.ToBytes(uid)
+	b, err := identity.AccountToBytes(account)
 	if err != nil {
-		return make([]byte, identity.UserUUIDLen)
+		return make([]byte, identity.AccountLen)
 	}
 	return b
 }

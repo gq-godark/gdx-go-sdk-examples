@@ -18,14 +18,14 @@ import (
 )
 
 const (
-	KeyLen          = 32
-	EncappedKeyLen  = 32
-	TagLen          = 16
-	WireVersion     = 2
-	InfoDomain      = "gdx-hpke/v1\000"
-	InfoDomainREST  = "gdx-hpke/v1/rest\000"
-	ExportC2S       = "gdx-hpke/v1 c2s"
-	ExportS2C       = "gdx-hpke/v1 s2c"
+	KeyLen         = 32
+	EncappedKeyLen = 32
+	TagLen         = 16
+	WireVersion    = 2
+	InfoDomain     = "gdx-hpke/v1\000"
+	InfoDomainREST = "gdx-hpke/v1/rest\000"
+	ExportC2S      = "gdx-hpke/v1 c2s"
+	ExportS2C      = "gdx-hpke/v1 s2c"
 )
 
 var suite = hpke.NewSuite(
@@ -34,22 +34,22 @@ var suite = hpke.NewSuite(
 	hpke.AEAD_AES256GCM,
 )
 
-// InfoForConn builds gdx-hpke/v1\0 ‖ user_uuid ‖ conn_id_be.
-func InfoForConn(userUUID []byte, connID uint64) []byte {
-	info := make([]byte, 0, len(InfoDomain)+16+8)
+// InfoForConn builds gdx-hpke/v1\0 ‖ account (32 B) ‖ conn_id_be.
+func InfoForConn(account []byte, connID uint64) []byte {
+	info := make([]byte, 0, len(InfoDomain)+32+8)
 	info = append(info, InfoDomain...)
-	info = append(info, userUUID...)
+	info = append(info, account...)
 	var connBE [8]byte
 	putU64BE(connBE[:], connID)
 	info = append(info, connBE[:]...)
 	return info
 }
 
-// InfoForRESTRequest builds gdx-hpke/v1/rest\0 ‖ user_uuid ‖ request_id_be.
-func InfoForRESTRequest(userUUID []byte, requestID uint64) []byte {
-	info := make([]byte, 0, len(InfoDomainREST)+16+8)
+// InfoForRESTRequest builds gdx-hpke/v1/rest\0 ‖ account (32 B) ‖ request_id_be.
+func InfoForRESTRequest(account []byte, requestID uint64) []byte {
+	info := make([]byte, 0, len(InfoDomainREST)+32+8)
 	info = append(info, InfoDomainREST...)
-	info = append(info, userUUID...)
+	info = append(info, account...)
 	var reqBE [8]byte
 	putU64BE(reqBE[:], requestID)
 	info = append(info, reqBE[:]...)

@@ -89,7 +89,7 @@ func main() {
 	}
 	if legacyKey != "" {
 		cfg.APIKey = legacyKey
-		cfg.UserUUID = envloader.First("GODARK_USER_UUID", "GDX_USER_UUID")
+		cfg.Account = envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT")
 	} else {
 		apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
 		apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
@@ -131,7 +131,7 @@ func main() {
 		fmt.Println("Disconnected cleanly")
 	}()
 
-	fmt.Printf("WS authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
+	fmt.Printf("WS authenticated as account=%s  (session encrypted)\n", client.Account())
 
 	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
 		log.Fatalf("Subscribe failed: %v", err)

@@ -505,7 +505,7 @@ func (t *Transport) SendSubscribe(ctx context.Context, channels []string, op str
 }
 
 // Authenticate sends the login op and waits for the auth_result frame. Returns
-// the parsed auth_result Message (with `user_uuid`, `session_id`, etc.).
+// the parsed auth_result Message (with `account`, `session_id`, etc.).
 func (t *Transport) Authenticate(ctx context.Context, apiKey string) (Message, error) {
 	result := make(chan Message, 1)
 	t.mu.Lock()
@@ -1077,7 +1077,7 @@ func normalizeInboundMessage(msg Message) Message {
 				"success": true,
 			}
 			for _, k := range []string{
-				"user_uuid", "account_id", "session_id",
+				"account", "user_uuid", "account_id", "session_id",
 				"token_expires_at", "cancel_on_disconnect", "conn_id",
 			} {
 				if v, ok := data[k]; ok {
