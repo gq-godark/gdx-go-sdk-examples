@@ -2,6 +2,7 @@
 //
 //	GODARK_REST_URL=https://api.devnet.godark-dex.com \
 //	GODARK_API_KEY_ID=... GODARK_API_SECRET=... GODARK_PASSPHRASE=... \
+//	GODARK_ACCOUNT=<Solana base58 account> \
 //	GDX_LIVE_PRICE=78000 \
 //	  go run ./examples/full_trader_rest
 package main
@@ -57,7 +58,10 @@ func main() {
 		legacyKey = os.Getenv("GDX_API_KEY")
 	}
 
-	cfg := godark.RestClientConfig{BaseURL: base}
+	cfg := godark.RestClientConfig{
+		BaseURL: base,
+		Account: envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT"),
+	}
 	if keyID != "" && secret != "" {
 		cfg.APIKeyID = keyID
 		cfg.APISecret = secret
@@ -79,7 +83,7 @@ func main() {
 	}
 	defer func() { _ = client.Disconnect(ctx) }()
 
-	fmt.Printf("identity user_uuid=%s scope=%s\n", client.UserUUID(), client.TokenScope())
+	fmt.Printf("connected account=%s\n", client.Account())
 
 	open, err := client.GetOpenOrders(ctx)
 	if err != nil {

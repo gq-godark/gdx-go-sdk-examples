@@ -43,12 +43,14 @@ gdx-go-sdk-examples/
 ## Configure credentials
 
 Copy `.env.example` to `.env` and set `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
-and `GODARK_PASSPHRASE`. Public testnet and devnet need only those three
-because the SDK provides environment-specific HPKE pins; localnet also
-requires `GDX_HPKE_STATIC_PUBLIC_KEY`.
+`GODARK_PASSPHRASE`, and `GODARK_ACCOUNT` (the Solana base58 account used by
+encrypted requests). Current public testnet and devnet auth responses normally
+provide the account, so the configured value is a fallback; legacy local edges
+require it when auth omits the account. Localnet also requires
+`GDX_HPKE_STATIC_PUBLIC_KEY`.
 
-Optional overrides: `GODARK_EDGE_URL`, `GDX_HPKE_STATIC_PUBLIC_KEY` (legacy
-HPKE env vars).
+Optional overrides: `GODARK_EDGE_URL`, `GODARK_REST_URL`,
+`GDX_HPKE_STATIC_PUBLIC_KEY` (legacy HPKE env vars).
 
 ## Localnet (`gdx up`)
 
@@ -123,8 +125,14 @@ The GitHub App (`godark-ci`) used for cross-repo access only requires
 
   - `GodarkClient` routes trading commands by correlation id, so multiple
     commands can be in flight concurrently (matching python / rust /
-    java). Encrypted REST trading is not supported; all order flow goes
-    over the WebSocket client.
+    java).
+  - `GodarkRestClient` supports one-shot HPKE place / modify / cancel,
+    mass-quote, batch cancel / modify, leverage updates, encrypted open-order /
+    position / account snapshots, authenticated order / profile / balance /
+    leverage reads, and public funding / open-interest / volume reads. REST
+    does not provide private push streams, subscription replay, automatic
+    reconnect, or a persistent HPKE session; use `GodarkClient` when those
+    WebSocket capabilities are required.
   - Push streams expose buffered Go channels (default 256) and per-stream
     callback registration; both surfaces fire concurrently with command
     issuance.

@@ -8,6 +8,7 @@
 //	GODARK_API_KEY_ID=gdk_...
 //	GODARK_API_SECRET=...
 //	GODARK_PASSPHRASE=...
+//	GODARK_ACCOUNT=<Solana base58 account>
 //	# GODARK_EDGE_URL=...   (optional; default EnvironmentTestnet)
 //
 // Run with:
@@ -50,6 +51,7 @@ func main() {
 	cfg := godark.ClientConfig{
 		Environment: godark.EnvironmentTestnet,
 		BaseURL:     baseURL,
+		Account:     envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT"),
 	}
 	if legacyKey != "" {
 		cfg.APIKey = legacyKey
@@ -79,7 +81,7 @@ func main() {
 		_ = client.Disconnect()
 	}()
 
-	fmt.Printf("Connected as user %s\n", client.UserUUID())
+	fmt.Printf("Connected as account %s\n", client.Account())
 
 	// Book confirmation waits on order-channel pushes; subscribe first.
 	if err := client.Subscribe(ctx, "orders"); err != nil {

@@ -31,11 +31,10 @@ package name" rule).
 
 ## Constructors
 
-Trading runs over the encrypted WebSocket `GodarkClient`, which uses
-**HPKE** (pin the sequencer static public key — see Configuration in
-`README.md` / `.env.example`). A read-only `MarketDataClient` is also
-available for public market data. (Encrypted REST trading is not
-supported — see the note below.)
+Trading is available through the encrypted WebSocket `GodarkClient` and the
+one-shot HPKE `GodarkRestClient` (pin the sequencer static public key — see
+Configuration in `README.md` / `.env.example`). A read-only
+`MarketDataClient` is also available for streaming public market data.
 
 ### Encrypted WebSocket trading -- `GodarkClient`
 
@@ -62,11 +61,36 @@ defer client.Disconnect()
 account := client.Account() // authenticated Solana account, base58
 ```
 
-> **Encrypted REST trading is not supported.** Earlier builds shipped a
-> `GodarkRestClient` that placed orders over HTTP; that path is retired.
-> All order flow — place / modify / cancel / mass-quote — now runs over the
-> HPKE WebSocket `GodarkClient` shown above. The examples in this bundle
-> trade exclusively over the WebSocket client.
+### One-shot encrypted REST -- `GodarkRestClient`
+
+`GodarkRestClient` authenticates with the same credentials and encrypts each
+private request with a separate HPKE setup:
+
+```go
+restClient, err := godark.NewRestClient(godark.RestClientConfig{
+    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+    APISecret:  os.Getenv("GODARK_API_SECRET"),
+    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+    Account:    os.Getenv("GODARK_ACCOUNT"),
+    BaseURL:    os.Getenv("GODARK_REST_URL"),
+})
+if err != nil { ... }
+if err := restClient.Connect(ctx); err != nil { ... }
+defer restClient.Disconnect(ctx)
+
+fmt.Printf("connected account=%s\n", restClient.Account())
+```
+
+The REST client supports place / modify / cancel (including cancel by client
+id), mass-quote, batch cancel / modify, leverage updates, encrypted open-order /
+position / account snapshots, authenticated order / profile / balance /
+leverage reads, and public funding-rate / open-interest / volume reads.
+
+REST has no private push streams, subscriptions, automatic reconnect, or
+persistent HPKE session. Use `GodarkClient` for live private updates and
+subscription replay. `Account` / `GODARK_ACCOUNT` is a fallback for legacy
+edges that omit the authenticated Solana account; `UserUUID` remains
+compatibility metadata and is not used for encrypted request identity.
 
 ### Public market-data feed -- `MarketDataClient`
 
