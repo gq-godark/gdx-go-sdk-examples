@@ -37,6 +37,9 @@ type PlaceOrderOptions struct {
 	StopLossPrice *float64
 	// SlippageBps is max walk vs mark for market / stop-market. Nil → venue max.
 	SlippageBps *uint32
+	// QuoteNotional sizes the order in quote currency. Set exactly one of
+	// PlaceOrderRequest.Quantity or QuoteNotional.
+	QuoteNotional *float64
 }
 
 // CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.

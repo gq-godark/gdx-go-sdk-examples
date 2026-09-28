@@ -184,22 +184,34 @@ func BuildPlaceOrderRequest(
 	if !ok && options.StpMode != "" {
 		return nil, fmt.Errorf("unknown stp mode: %q", options.StpMode)
 	}
+	hasQuantity := quantity != 0
+	hasQuoteNotional := options.QuoteNotional != nil
+	if hasQuantity == hasQuoteNotional {
+		return nil, fmt.Errorf("exactly one of quantity or options.QuoteNotional is required")
+	}
+	if aon && hasQuoteNotional {
+		return nil, fmt.Errorf("aon requires base quantity, not quote notional")
+	}
 	if aon && minFillSize == nil {
 		q := quantity
 		minFillSize = &q
 	}
 
-	qty := quantity
 	place := &sequencerpb.PlaceOrderInput{
 		SymbolId:    symbolID,
 		Side:        commonpb.Side(sideInt),
 		OrderType:   commonpb.OrderType(otypeInt),
-		Quantity:    &qty,
 		TimeInForce: commonpb.TimeInForce(tifInt),
 		Account:     userUUID,
 		StpMode:     commonpb.StpMode(stpInt),
 		ReduceOnly:  options.ReduceOnly,
 		PostOnly:    options.PostOnly,
+	}
+	if hasQuantity {
+		qty := quantity
+		place.Quantity = &qty
+	} else {
+		place.QuoteNotional = options.QuoteNotional
 	}
 	if price != nil {
 		place.Price = price
