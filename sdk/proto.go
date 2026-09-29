@@ -153,6 +153,7 @@ func stringOr(p *string, fallback string) string {
 
 // BuildPlaceOrderRequest assembles the encrypted-body payload for a Place
 // command: a bare PlaceOrderInput protobuf (not wrapped in EdgeSequencerRequest).
+// Prices and sizes are encoded as decimal strings at the instrument scales.
 func BuildPlaceOrderRequest(
 	symbolID uint64,
 	side Side,
@@ -166,7 +167,7 @@ func BuildPlaceOrderRequest(
 	expiryTime *uint64,
 	correlationID []byte,
 	options PlaceOrderOptions,
-	_ uint64,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	sideInt, ok := sideToProto[side]
 	if !ok {
@@ -208,16 +209,31 @@ func BuildPlaceOrderRequest(
 		PostOnly:    options.PostOnly,
 	}
 	if hasQuantity {
-		qty := quantity
-		place.Quantity = &qty
+		qtyStr, err := FormatDecimal(quantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("quantity: %w", err)
+		}
+		place.Quantity = &qtyStr
 	} else {
-		place.QuoteNotional = options.QuoteNotional
+		qnStr, err := FormatDecimal(*options.QuoteNotional, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("quote_notional: %w", err)
+		}
+		place.QuoteNotional = &qnStr
 	}
 	if price != nil {
-		place.Price = price
+		pStr, err := FormatDecimal(*price, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("price: %w", err)
+		}
+		place.Price = &pStr
 	}
 	if minFillSize != nil {
-		place.MinFillSize = minFillSize
+		mStr, err := FormatDecimal(*minFillSize, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("min_fill_size: %w", err)
+		}
+		place.MinFillSize = &mStr
 	}
 	if expiryTime != nil {
 		place.ExpiryTime = expiryTime
@@ -229,13 +245,25 @@ func BuildPlaceOrderRequest(
 		place.PegOffsetBps = options.PegOffsetBps
 	}
 	if options.TriggerPrice != nil {
-		place.TriggerPrice = options.TriggerPrice
+		s, err := FormatDecimal(*options.TriggerPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("trigger_price: %w", err)
+		}
+		place.TriggerPrice = &s
 	}
 	if options.TakeProfitPrice != nil {
-		place.TakeProfitPrice = options.TakeProfitPrice
+		s, err := FormatDecimal(*options.TakeProfitPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("take_profit_price: %w", err)
+		}
+		place.TakeProfitPrice = &s
 	}
 	if options.StopLossPrice != nil {
-		place.StopLossPrice = options.StopLossPrice
+		s, err := FormatDecimal(*options.StopLossPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("stop_loss_price: %w", err)
+		}
+		place.StopLossPrice = &s
 	}
 	if options.SlippageBps != nil {
 		place.SlippageBps = options.SlippageBps
@@ -289,18 +317,23 @@ func BuildAmendTpsl(
 	stopLossPrice *float64,
 	symbolID *uint64,
 	positionSide *Side,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	amend := &sequencerpb.AmendTpslRequest{
 		Account:       userUUID,
 		OrderId:       orderID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	if takeProfitPrice != nil {
-		amend.TakeProfitPrice = takeProfitPrice
+	tp, err := formatOptDecimal(takeProfitPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("take_profit_price: %w", err)
 	}
-	if stopLossPrice != nil {
-		amend.StopLossPrice = stopLossPrice
+	amend.TakeProfitPrice = tp
+	sl, err := formatOptDecimal(stopLossPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("stop_loss_price: %w", err)
 	}
+	amend.StopLossPrice = sl
 	if symbolID != nil {
 		amend.SymbolId = symbolID
 	}
@@ -408,6 +441,7 @@ func BuildModifyOrderRequest(
 	newQuantity *float64,
 	newTriggerPrice *float64,
 	correlationID []byte,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	modify := &sequencerpb.ModifyOrderInput{
 		OrderId:       orderID,
@@ -415,15 +449,21 @@ func BuildModifyOrderRequest(
 		CorrelationId: correlationIDBodyBytes(correlationID),
 		Account:       userUUID,
 	}
-	if newPrice != nil {
-		modify.NewPrice = newPrice
+	np, err := formatOptDecimal(newPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_price: %w", err)
 	}
-	if newQuantity != nil {
-		modify.NewQuantity = newQuantity
+	modify.NewPrice = np
+	nq, err := formatOptDecimal(newQuantity, decimals.QuantityDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_quantity: %w", err)
 	}
-	if newTriggerPrice != nil {
-		modify.NewTriggerPrice = newTriggerPrice
+	modify.NewQuantity = nq
+	nt, err := formatOptDecimal(newTriggerPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_trigger_price: %w", err)
 	}
+	modify.NewTriggerPrice = nt
 	return proto.Marshal(modify)
 }
 
@@ -444,7 +484,7 @@ const maxBatchLegs = 20
 // postOnly is the batch-level post-only flag: nil defaults to true on the wire;
 // false enables the relaxed path where a crossing leg takes liquidity up to its
 // limit and rests the remainder instead of being rejected.
-func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool) ([]byte, error) {
+func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool, decimals InstrumentDecimals) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("mass quote requires at least one leg")
 	}
@@ -472,11 +512,19 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		if leg.CancelOrderID != nil {
 			cancelID = *leg.CancelOrderID
 		}
+		priceStr, err := FormatDecimal(leg.Price, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("mass quote leg %d price: %w", i, err)
+		}
+		qtyStr, err := FormatDecimal(leg.Quantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("mass quote leg %d quantity: %w", i, err)
+		}
 		pbLeg := &sequencerpb.MassQuoteLeg{
 			CancelOrderId: cancelID,
 			Side:          commonpb.Side(sideInt),
-			Price:         leg.Price,
-			Quantity:      leg.Quantity,
+			Price:         priceStr,
+			Quantity:      qtyStr,
 			TimeInForce:   commonpb.TimeInForce(tifInt),
 			CorrelationId: newLegCorrelationID(),
 		}
@@ -520,7 +568,7 @@ func BuildBatchCancelRequest(symbolID uint64, userUUID []byte, orderIDs []uint64
 // BuildBatchModifyRequest serializes a bare BatchModifyInput (post-only amend
 // up to 20 resting orders on one symbol) for the HPKE-sealed body. Each leg
 // carries a unique 16-byte correlation id.
-func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModifyLegInput, correlationID []byte) ([]byte, error) {
+func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModifyLegInput, correlationID []byte, decimals InstrumentDecimals) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("batch modify requires at least one leg")
 	}
@@ -533,17 +581,21 @@ func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModif
 		}
 	}
 	pbLegs := make([]*sequencerpb.BatchModifyLeg, 0, len(legs))
-	for _, leg := range legs {
+	for i, leg := range legs {
 		pbLeg := &sequencerpb.BatchModifyLeg{
 			OrderId:       leg.OrderID,
 			CorrelationId: newLegCorrelationID(),
 		}
-		if leg.NewPrice != nil {
-			pbLeg.NewPrice = leg.NewPrice
+		np, err := formatOptDecimal(leg.NewPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("batch modify leg %d new_price: %w", i, err)
 		}
-		if leg.NewQuantity != nil {
-			pbLeg.NewQuantity = leg.NewQuantity
+		pbLeg.NewPrice = np
+		nq, err := formatOptDecimal(leg.NewQuantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("batch modify leg %d new_quantity: %w", i, err)
 		}
+		pbLeg.NewQuantity = nq
 		pbLegs = append(pbLegs, pbLeg)
 	}
 	bm := &sequencerpb.BatchModifyInput{

@@ -3,6 +3,7 @@ package godark
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
 	"github.com/gq-godark/gdx-go-sdk/internal/identity"
+	"github.com/gq-godark/gdx-go-sdk/internal/rest"
 	"github.com/gq-godark/gdx-go-sdk/internal/session"
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
 	"github.com/gq-godark/gdx-go-sdk/internal/wire"
@@ -102,13 +104,15 @@ type TransportConfig = transport.Config
 // (legacy single opaque key) OR APIKeyID + APISecret (key-pair) must be set.
 type ClientConfig struct {
 	// APIKey is the legacy single-token auth value. Set this OR
-	// (APIKeyID + APISecret), not both.
+	// (APIKeyID + APISecret), not both. Legacy keys (e.g. local
+	// `test-key-*`) are sent as the WebSocket login token as-is.
 	APIKey string
 
 	// APIKeyID / APISecret / Passphrase are the modern key-pair credentials.
 	// All three must be set together (Passphrase may also come from
-	// GODARK_PASSPHRASE / GDX_PASSPHRASE); the client joins them with `:`
-	// to form the wire token `key_id:secret:passphrase`.
+	// GODARK_PASSPHRASE / GDX_PASSPHRASE). On Connect the client mints
+	// POST /api/v1/auth/token (client_credentials) and logs in with the
+	// returned access_token — the raw key triple is never sent on the socket.
 	APIKeyID   string
 	APISecret  string
 	Passphrase string
@@ -211,9 +215,14 @@ type placeOutcomeWaiter struct {
 // (channels and callbacks) run concurrently with command issuance.
 type GodarkClient struct {
 	authToken       string
+	apiKeyID        string
+	apiSecret       string
+	passphrase      string
+	httpClient      *http.Client
 	baseURL         string
 	fallbackAccount string
 	symbolMap       map[string]int64
+	instrumentDecs  map[string]InstrumentDecimals
 	bufSize         int
 
 	transport *transport.Transport
@@ -282,7 +291,7 @@ type GodarkClient struct {
 // NewClient validates config and returns an unconnected client. Call Connect
 // to bring it up.
 func NewClient(cfg ClientConfig) (*GodarkClient, error) {
-	authToken, err := resolveAuthToken(cfg)
+	creds, err := resolveAuthCredentials(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -322,10 +331,15 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	}
 
 	c := &GodarkClient{
-		authToken:               authToken,
+		authToken:               creds.legacyToken,
+		apiKeyID:                creds.apiKeyID,
+		apiSecret:               creds.apiSecret,
+		passphrase:              creds.passphrase,
+		httpClient:              cfg.HTTPClient,
 		baseURL:                 baseURL,
 		fallbackAccount:         fallbackAccount,
 		symbolMap:               symbolMap,
+		instrumentDecs:          make(map[string]InstrumentDecimals),
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
 		hpkeStaticKey:           resolveHpkeStaticPublicKey(cfg.HpkeStaticPublicKeyHex, pinEnv),
@@ -435,11 +449,20 @@ func (c *GodarkClient) connectSession(ctx context.Context) error {
 	c.pendingEncryptedByNonce = make(map[uint64]transport.Message)
 	c.pendingMu.Unlock()
 
+	// Best-effort: local mocks / older edges may omit instruments. Trading
+	// then falls back to the embedded symbol map and DefaultInstrumentDecimals.
+	_ = c.refreshInstruments(ctx)
+
+	loginToken, err := c.resolveLoginToken(ctx)
+	if err != nil {
+		return newAuthenticationError(err.Error())
+	}
+
 	if err := c.transport.Connect(ctx); err != nil {
 		return newConnectionError(err.Error())
 	}
 
-	auth, err := c.transport.Authenticate(ctx, c.authToken)
+	auth, err := c.transport.Authenticate(ctx, loginToken)
 	if err != nil {
 		_ = c.disconnectInternal()
 		return newAuthenticationError(err.Error())
@@ -573,6 +596,11 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		pricePtr = &p
 	}
 
+	decimals, err := c.instrumentDecimals(req.Symbol)
+	if err != nil {
+		return nil, err
+	}
+
 	plaintext, err := BuildPlaceOrderRequest(
 		uint64(symbolID),
 		req.Side, req.OrderType,
@@ -585,7 +613,7 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		req.ExpiryTime,
 		corrID,
 		req.Options,
-		uint64(time.Now().UnixNano()),
+		decimals,
 	)
 	if err != nil {
 		return nil, err
@@ -663,7 +691,11 @@ func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, 
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -775,8 +807,12 @@ func (c *GodarkClient) AmendTpsl(
 		sid := uint64(symbolID)
 		bodySymbolID = &sid
 	}
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
 	plaintext, err := BuildAmendTpsl(
-		c.accountBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide,
+		c.accountBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide, decimals,
 	)
 	if err != nil {
 		return nil, err
@@ -1412,7 +1448,11 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -1511,7 +1551,11 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -1939,27 +1983,185 @@ func resolvePassphrase(explicit string) (string, error) {
 	return "", errors.New("passphrase is required when using APIKeyID and APISecret")
 }
 
-func resolveAuthToken(cfg ClientConfig) (string, error) {
+type authCredentials struct {
+	legacyToken string
+	apiKeyID    string
+	apiSecret   string
+	passphrase  string
+}
+
+func resolveAuthCredentials(cfg ClientConfig) (authCredentials, error) {
 	if cfg.APIKeyID != "" || cfg.APISecret != "" {
 		if cfg.APIKeyID == "" || cfg.APISecret == "" {
-			return "", errors.New("APIKeyID and APISecret must be provided together")
+			return authCredentials{}, errors.New("APIKeyID and APISecret must be provided together")
 		}
 		if cfg.APIKey != "" {
-			return "", errors.New("use either APIKey or (APIKeyID + APISecret), not both")
+			return authCredentials{}, errors.New("use either APIKey or (APIKeyID + APISecret), not both")
 		}
 		passphrase, err := resolvePassphrase(cfg.Passphrase)
 		if err != nil {
-			return "", err
+			return authCredentials{}, err
 		}
-		return cfg.APIKeyID + ":" + cfg.APISecret + ":" + passphrase, nil
+		return authCredentials{
+			apiKeyID:   cfg.APIKeyID,
+			apiSecret:  cfg.APISecret,
+			passphrase: passphrase,
+		}, nil
 	}
 	if cfg.APIKey != "" {
 		if strings.TrimSpace(cfg.Passphrase) != "" {
-			return "", errors.New("Passphrase must not be set when using legacy APIKey")
+			return authCredentials{}, errors.New("Passphrase must not be set when using legacy APIKey")
 		}
-		return cfg.APIKey, nil
+		return authCredentials{legacyToken: cfg.APIKey}, nil
 	}
-	return "", errors.New("provide APIKey or both APIKeyID + APISecret")
+	return authCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
+}
+
+// resolveAuthToken is retained for tests that assert legacy token joining is gone.
+func resolveAuthToken(cfg ClientConfig) (string, error) {
+	creds, err := resolveAuthCredentials(cfg)
+	if err != nil {
+		return "", err
+	}
+	if creds.legacyToken != "" {
+		return creds.legacyToken, nil
+	}
+	// Key-triple clients mint a JWT at Connect; constructor must not embed the secret.
+	return "", nil
+}
+
+func (c *GodarkClient) resolveLoginToken(ctx context.Context) (string, error) {
+	if c.apiKeyID != "" {
+		token, err := c.mintAccessToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		c.mu.Lock()
+		c.authToken = token
+		c.mu.Unlock()
+		return token, nil
+	}
+	if c.authToken == "" {
+		return "", errors.New("missing login token")
+	}
+	return c.authToken, nil
+}
+
+func (c *GodarkClient) mintAccessToken(ctx context.Context) (string, error) {
+	restURL := restOriginFromEdgeURL(c.baseURL)
+	tr := rest.New(restURL, c.httpClient)
+	authData, err := tr.AuthTokenClientCredentials(ctx, c.apiKeyID, c.apiSecret, c.passphrase)
+	if err != nil {
+		return "", err
+	}
+	bearer, _ := authData["access_token"].(string)
+	if bearer == "" {
+		bearer, _ = authData["token"].(string)
+	}
+	if bearer == "" {
+		return "", errors.New("auth/token missing access_token/token")
+	}
+	return bearer, nil
+}
+
+func (c *GodarkClient) refreshInstruments(ctx context.Context) error {
+	restURL := restOriginFromEdgeURL(c.baseURL)
+	tr := rest.New(restURL, c.httpClient)
+	data, err := tr.GetInstruments(ctx)
+	if err != nil {
+		return fmt.Errorf("load instruments: %w", err)
+	}
+	symMap, decs, err := parseInstrumentsPayload(data)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(symMap) > 0 {
+		c.symbolMap = symMap
+	}
+	c.instrumentDecs = decs
+	return nil
+}
+
+func (c *GodarkClient) instrumentDecimals(symbol string) (InstrumentDecimals, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if d, ok := c.instrumentDecs[symbol]; ok {
+		return d, nil
+	}
+	if len(c.instrumentDecs) == 0 {
+		return DefaultInstrumentDecimals, nil
+	}
+	return InstrumentDecimals{}, fmt.Errorf("missing instrument decimals for %q", symbol)
+}
+
+func parseInstrumentsPayload(data map[string]any) (map[string]int64, map[string]InstrumentDecimals, error) {
+	raw, ok := data["instruments"]
+	if !ok {
+		return nil, nil, fmt.Errorf("instruments response missing instruments array")
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("instruments response has unexpected type")
+	}
+	symMap := make(map[string]int64, len(arr))
+	decs := make(map[string]InstrumentDecimals, len(arr))
+	for i, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("instruments[%d] is not an object", i)
+		}
+		symbol, _ := m["symbol"].(string)
+		if symbol == "" {
+			continue
+		}
+		symMap[symbol] = coerceInt64(m["symbol_id"])
+		decs[symbol] = InstrumentDecimals{
+			PriceDecimals:    uint32(coerceUint64(m["price_decimals"])),
+			QuantityDecimals: uint32(coerceUint64(m["quantity_decimals"])),
+		}
+	}
+	return symMap, decs, nil
+}
+
+func coerceInt64(v any) int64 {
+	switch t := v.(type) {
+	case float64:
+		return int64(t)
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case json.Number:
+		i, _ := t.Int64()
+		return i
+	case string:
+		i, _ := strconv.ParseInt(t, 10, 64)
+		return i
+	default:
+		return 0
+	}
+}
+
+func restOriginFromEdgeURL(edge string) string {
+	u := strings.TrimSpace(edge)
+	u = strings.TrimRight(u, "/")
+	for _, suffix := range []string{"/ws/v1", "/ws"} {
+		if strings.HasSuffix(u, suffix) {
+			u = strings.TrimSuffix(u, suffix)
+		}
+	}
+	switch {
+	case strings.HasPrefix(u, "wss://"):
+		return "https://" + strings.TrimPrefix(u, "wss://")
+	case strings.HasPrefix(u, "ws://"):
+		return "http://" + strings.TrimPrefix(u, "ws://")
+	case strings.HasPrefix(u, "https://"), strings.HasPrefix(u, "http://"):
+		return u
+	default:
+		return "https://" + u
+	}
 }
 
 func resolveEdgeBaseURL(explicit string, env Environment) string {

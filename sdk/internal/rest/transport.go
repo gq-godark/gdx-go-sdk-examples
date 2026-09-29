@@ -311,6 +311,11 @@ func asObjectSlice(v any, path string) ([]map[string]any, error) {
 	return out, nil
 }
 
+// GetInstruments issues `GET /api/v1/instruments` (public).
+func (t *Transport) GetInstruments(ctx context.Context) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/instruments", "", nil, nil)
+}
+
 // GetFundingRates issues `GET /api/v1/market-data/funding-rates` (public, raw array).
 func (t *Transport) GetFundingRates(ctx context.Context) ([]map[string]any, error) {
 	const path = "/api/v1/market-data/funding-rates"

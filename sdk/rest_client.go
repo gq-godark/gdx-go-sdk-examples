@@ -80,10 +80,11 @@ type GodarkRestClient struct {
 	apiSecret   string
 	passphrase  string
 	baseURL     string
-	symbolMap   map[string]int64
-	http        *rest.Transport
-	hpkePinHex  string
-	fallback    string
+	symbolMap      map[string]int64
+	instrumentDecs map[string]InstrumentDecimals
+	http           *rest.Transport
+	hpkePinHex     string
+	fallback       string
 
 	mu             sync.RWMutex
 	bearer         string
@@ -125,6 +126,7 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		passphrase:     creds.passphrase,
 		baseURL:        base,
 		symbolMap:      symMap,
+		instrumentDecs: make(map[string]InstrumentDecimals),
 		http:           rest.New(base, cfg.HTTPClient),
 		hpkePinHex:     resolveRestHpkePin(cfg.HpkeStaticPublicKeyHex, env),
 		fallback:       resolveAccount(cfg.Account),
@@ -255,6 +257,10 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	c.tokenScope = scope
 	c.mu.Unlock()
 
+	if err := c.refreshInstruments(ctx); err != nil {
+		// Soft-fail: keep embedded symbol map / default decimals for mocks.
+		_ = err
+	}
 	return nil
 }
 
@@ -315,6 +321,10 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		pricePtr = &p
 	}
 
+	decimals, err := c.instrumentDecimals(req.Symbol)
+	if err != nil {
+		return nil, err
+	}
 	plaintext, err := BuildPlaceOrderRequest(
 		uint64(symbolID),
 		req.Side, req.OrderType,
@@ -327,7 +337,7 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		req.ExpiryTime,
 		corrID,
 		req.Options,
-		uint64(time.Now().UnixNano()),
+		decimals,
 	)
 	if err != nil {
 		return nil, err
@@ -423,7 +433,11 @@ func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -578,6 +592,47 @@ func (c *GodarkRestClient) GetVolume(ctx context.Context) (map[string]any, error
 	return c.http.GetVolume(ctx)
 }
 
+// GetTime calls `GET /api/v1/time` (public; Connect not required).
+func (c *GodarkRestClient) GetTime(ctx context.Context) (map[string]any, error) {
+	return c.http.TimePublic(ctx)
+}
+
+// GetInstruments calls `GET /api/v1/instruments` (public; Connect not required).
+// Connect also refreshes the local symbol map and decimal scales from this endpoint.
+func (c *GodarkRestClient) GetInstruments(ctx context.Context) (map[string]any, error) {
+	return c.http.GetInstruments(ctx)
+}
+
+func (c *GodarkRestClient) refreshInstruments(ctx context.Context) error {
+	data, err := c.http.GetInstruments(ctx)
+	if err != nil {
+		return fmt.Errorf("load instruments: %w", err)
+	}
+	symMap, decs, err := parseInstrumentsPayload(data)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(symMap) > 0 {
+		c.symbolMap = symMap
+	}
+	c.instrumentDecs = decs
+	return nil
+}
+
+func (c *GodarkRestClient) instrumentDecimals(symbol string) (InstrumentDecimals, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if d, ok := c.instrumentDecs[symbol]; ok {
+		return d, nil
+	}
+	if len(c.instrumentDecs) == 0 {
+		return DefaultInstrumentDecimals, nil
+	}
+	return InstrumentDecimals{}, fmt.Errorf("missing instrument decimals for %q", symbol)
+}
+
 // GetOpenOrders returns live open orders via encrypted POST /api/v1/openOrders.
 func (c *GodarkRestClient) GetOpenOrders(ctx context.Context) (*OpenOrdersSnapshot, error) {
 	variant, err := c.snapshotRPC(ctx, "get_open_orders", BuildGetOpenOrdersRequest, "/api/v1/openOrders")
@@ -624,7 +679,11 @@ func (c *GodarkRestClient) MassQuote(ctx context.Context, symbol string, legs []
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +725,11 @@ func (c *GodarkRestClient) BatchModify(ctx context.Context, symbol string, legs 
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
