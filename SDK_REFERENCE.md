@@ -65,10 +65,15 @@ loading and `OrderError` pretty-printing.
 `PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,
 `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`,
 `SlippageBps`, and `QuoteNotional`. Prices and sizes on place/modify/mass-quote/
-batch-modify/TP-SL are decimal `string` / `*string` (not `float64`). Omit
-`SlippageBps` (nil) to use the venue max walk cap (localnet 5%); typical explicit
-values are 50–500 bps (0.5%–5%). See `bundle/SDK_REFERENCE.md` for
-recipient-facing trading-command examples.
+batch-modify/TP-SL (including `QuoteNotional`, min fill, and trigger) are
+**decimal `string` / `*string` only** — `float64` / int fields and
+`FormatDecimal` are not part of the public trading API. Pass literals such as
+`"68000"` / `"0.01"`, or format locally with `strconv` / `math/big` /
+shopspring/decimal; `NormalizeDecimal` validates against instrument
+`price_decimals` / `quantity_decimals`. Omit `SlippageBps` (nil) to use the
+venue max walk cap (localnet 5%); typical explicit values are 50–500 bps
+(0.5%–5%). See `bundle/SDK_REFERENCE.md` for recipient-facing trading-command
+examples.
 
 Current `gdx-core` encrypted wire identity is the authenticated 32-byte Solana
 account. The vendored SDK derives it from `auth_result.account` / JWT `sub` and

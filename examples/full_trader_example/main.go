@@ -36,10 +36,14 @@ import (
 const symbol = "BTC-USDC-PERP"
 
 
+// dec formats a local float for demo math. The godark trading API accepts
+// only decimal strings — prefer literals like "78763" / "0.1" in production.
 func dec(v float64) string {
-	s, err := godark.FormatDecimal(v, 8)
-	if err != nil {
-		panic(err)
+	s := strconv.FormatFloat(v, 'f', 8, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
 	}
 	return s
 }

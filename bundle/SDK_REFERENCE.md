@@ -141,10 +141,15 @@ modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil, /*newTriggerPrice*/ nil)
 ```
 
-`PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,
-`StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`, and
-`SlippageBps`. Omit `SlippageBps` (nil) to use the venue max walk cap (localnet 5%);
-typical explicit values are 50–500 bps (0.5%–5%).
+**Rule:** prices and sizes on place/modify/mass-quote/batch-modify/TP-SL
+(including `QuoteNotional`, min fill, and trigger) are decimal `string` /
+`*string` only — not `float64` / int. Pass literals (`"67500"`, `"0.1"`) or
+format locally; the SDK has no float→string helper on the trading path.
+`PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`,
+`PostOnly`, `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`,
+`StopLossPrice`, `SlippageBps`, and `QuoteNotional`. Omit `SlippageBps` (nil)
+to use the venue max walk cap (localnet 5%); typical explicit values are
+50–500 bps (0.5%–5%).
 
 Encrypted headers, HPKE info, command bodies, and private pushes use the
 32-byte Solana account returned by login. `ClientConfig.Account` /

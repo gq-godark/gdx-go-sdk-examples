@@ -2,7 +2,6 @@ package godark
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 )
@@ -21,37 +20,9 @@ var DefaultInstrumentDecimals = InstrumentDecimals{
 	QuantityDecimals: 8,
 }
 
-// FormatDecimal renders value as a non-negative decimal string with at most
-// `decimals` fractional digits. Trailing fractional zeros are trimmed
-// ("120000.00" → "120000", "0.0010" → "0.001"). Rejects NaN/Inf, negatives,
-// and values whose exact shortest decimal form needs more fractional digits
-// than `decimals` allows (no silent rounding beyond float formatting).
-//
-// Prefer passing decimal strings on public trading APIs; FormatDecimal is a
-// helper for callers that still hold float64 locally.
-func FormatDecimal(value float64, decimals uint32) (string, error) {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return "", fmt.Errorf("decimal value must be finite")
-	}
-	if value < 0 {
-		return "", fmt.Errorf("decimal value must be non-negative")
-	}
-	if decimals > 18 {
-		return "", fmt.Errorf("decimals %d exceeds maximum 18", decimals)
-	}
-
-	// Format at the instrument scale so float noise beyond `decimals` is not
-	// written on the wire. strconv rounds half-away-from-zero at the last digit.
-	s := strconv.FormatFloat(value, 'f', int(decimals), 64)
-	s = trimFractionalZeros(s)
-	if err := validateFractionLength(s, decimals); err != nil {
-		return "", err
-	}
-	return s, nil
-}
-
 // NormalizeDecimal validates a non-negative decimal string against an
 // instrument scale, trims trailing fractional zeros, and returns the wire form.
+// Public trading APIs accept only decimal strings; there is no float64 path.
 func NormalizeDecimal(s string, decimals uint32) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -74,7 +45,9 @@ func NormalizeDecimal(s string, decimals uint32) (string, error) {
 }
 
 // ParseDecimal converts a wire decimal string to float64 for local numeric
-// helpers. Trading APIs take and return decimal strings.
+// helpers. Trading APIs take and return decimal strings; do not pass the
+// result back into place/modify without formatting it as a decimal string
+// yourself (stdlib strconv / shopspring/decimal / math/big).
 func ParseDecimal(s string) (float64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

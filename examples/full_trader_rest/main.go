@@ -1,5 +1,7 @@
 // REST-only trader demo — auth + encrypted snapshots + place/modify/cancel.
 //
+// Prices and sizes are decimal strings only (not float64).
+//
 //	GODARK_REST_URL=https://api.devnet.godark-dex.com \
 //	GODARK_API_KEY_ID=... GODARK_API_SECRET=... GODARK_PASSPHRASE=... \
 //	GODARK_ACCOUNT=<Solana base58 account> \
@@ -13,21 +15,34 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
 	"github.com/gq-godark/gdx-go-sdk-examples/examples/internal/envloader"
 )
 
-func livePrice() float64 {
-	for _, key := range []string{"GDX_LIVE_PRICE", "GODARK_LIVE_PRICE"} {
-		if v := os.Getenv(key); v != "" {
-			if p, err := strconv.ParseFloat(v, 64); err == nil {
-				return p
-			}
+func livePriceString() string {
+	for _, key := range []string{"GDX_LIVE_PRICE", "GODARK_LIVE_PRICE", "GODARK_E2E_PRICE"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
 		}
 	}
-	return 78000.0
+	return "78000"
+}
+
+func offsetPrice(base string, delta float64) string {
+	v, err := strconv.ParseFloat(base, 64)
+	if err != nil {
+		return base
+	}
+	s := strconv.FormatFloat(v+delta, 'f', 8, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
+	}
+	return s
 }
 
 func main() {
@@ -105,11 +120,8 @@ func main() {
 		fmt.Println("account total_collateral=", acct.Account.TotalCollateral)
 	}
 
-	price := livePrice()
-	limitPrice, err := godark.FormatDecimal(price-5000, 8)
-	if err != nil {
-		log.Fatal(err)
-	}
+	mark := livePriceString()
+	limitPrice := offsetPrice(mark, -5000)
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
 		PlaceOrderRequest: godark.PlaceOrderRequest{
 			Symbol: "BTC-USDC-PERP", Side: "BUY", OrderType: "LIMIT",
@@ -124,10 +136,7 @@ func main() {
 
 	time.Sleep(500 * time.Millisecond)
 
-	newPrice, err := godark.FormatDecimal(price-5000-64, 8)
-	if err != nil {
-		log.Fatal(err)
-	}
+	newPrice := offsetPrice(mark, -5000-64)
 	mod, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP", &newPrice, nil, nil)
 	if err != nil {
 		log.Fatal(err)
