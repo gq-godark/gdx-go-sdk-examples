@@ -63,9 +63,11 @@ Both examples share `examples/internal/envloader/envloader.go` for `.env`
 loading and `OrderError` pretty-printing.
 
 `PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`, `PostOnly`,
-`StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`, and
-`SlippageBps`. Omit `SlippageBps` (nil) to use the venue max walk cap (localnet 5%);
-typical explicit values are 50–500 bps (0.5%–5%). See `bundle/SDK_REFERENCE.md` for
+`StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`, `StopLossPrice`,
+`SlippageBps`, and `QuoteNotional`. Prices and sizes on place/modify/mass-quote/
+batch-modify/TP-SL are decimal `string` / `*string` (not `float64`). Omit
+`SlippageBps` (nil) to use the venue max walk cap (localnet 5%); typical explicit
+values are 50–500 bps (0.5%–5%). See `bundle/SDK_REFERENCE.md` for
 recipient-facing trading-command examples.
 
 Current `gdx-core` encrypted wire identity is the authenticated 32-byte Solana

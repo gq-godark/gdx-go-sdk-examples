@@ -315,8 +315,8 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 	}
 
 	corrID := newCorrelationID()
-	var pricePtr *float64
-	if req.Price != 0 {
+	var pricePtr *string
+	if req.Price != "" {
 		p := req.Price
 		pricePtr = &p
 	}
@@ -414,7 +414,8 @@ func (c *GodarkRestClient) CancelOrderByClientID(ctx context.Context, clientOrde
 }
 
 // ModifyOrder sends an encrypted modify via `PATCH /api/v1/orders/{id}`.
-func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
+// Price/size args are decimal strings.
+func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *string) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}

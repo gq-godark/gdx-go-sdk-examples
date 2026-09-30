@@ -26,6 +26,9 @@ var DefaultInstrumentDecimals = InstrumentDecimals{
 // ("120000.00" → "120000", "0.0010" → "0.001"). Rejects NaN/Inf, negatives,
 // and values whose exact shortest decimal form needs more fractional digits
 // than `decimals` allows (no silent rounding beyond float formatting).
+//
+// Prefer passing decimal strings on public trading APIs; FormatDecimal is a
+// helper for callers that still hold float64 locally.
 func FormatDecimal(value float64, decimals uint32) (string, error) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", fmt.Errorf("decimal value must be finite")
@@ -47,19 +50,38 @@ func FormatDecimal(value float64, decimals uint32) (string, error) {
 	return s, nil
 }
 
-// ParseDecimal converts a wire decimal string to float64 for public SDK APIs
-// that still expose numeric inputs/outputs.
+// NormalizeDecimal validates a non-negative decimal string against an
+// instrument scale, trims trailing fractional zeros, and returns the wire form.
+func NormalizeDecimal(s string, decimals uint32) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("empty decimal string")
+	}
+	if strings.HasPrefix(s, "+") || strings.HasPrefix(s, "-") {
+		return "", fmt.Errorf("decimal value must be non-negative")
+	}
+	if decimals > 18 {
+		return "", fmt.Errorf("decimals %d exceeds maximum 18", decimals)
+	}
+	if err := validateDecimalDigits(s); err != nil {
+		return "", err
+	}
+	s = trimFractionalZeros(s)
+	if err := validateFractionLength(s, decimals); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// ParseDecimal converts a wire decimal string to float64 for local numeric
+// helpers. Trading APIs take and return decimal strings.
 func ParseDecimal(s string) (float64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty decimal string")
 	}
-	if strings.HasPrefix(s, "+") || strings.HasPrefix(s, "-") {
-		// Sequencer parse_decimal rejects signed forms for order ticks; keep
-		// ParseDecimal usable for signed PnL by allowing a leading minus only.
-		if strings.HasPrefix(s, "+") {
-			return 0, fmt.Errorf("decimal string must not start with '+'")
-		}
+	if strings.HasPrefix(s, "+") {
+		return 0, fmt.Errorf("decimal string must not start with '+'")
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
@@ -80,6 +102,29 @@ func trimFractionalZeros(s string) string {
 	return s
 }
 
+func validateDecimalDigits(s string) error {
+	dotSeen := false
+	digitSeen := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' {
+			if dotSeen {
+				return fmt.Errorf("invalid decimal %q", s)
+			}
+			dotSeen = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return fmt.Errorf("invalid decimal %q", s)
+		}
+		digitSeen = true
+	}
+	if !digitSeen {
+		return fmt.Errorf("invalid decimal %q", s)
+	}
+	return nil
+}
+
 func validateFractionLength(s string, decimals uint32) error {
 	dot := strings.IndexByte(s, '.')
 	if dot < 0 {
@@ -97,11 +142,11 @@ func validateFractionLength(s string, decimals uint32) error {
 	return nil
 }
 
-func formatOptDecimal(v *float64, decimals uint32) (*string, error) {
+func formatOptDecimal(v *string, decimals uint32) (*string, error) {
 	if v == nil {
 		return nil, nil
 	}
-	s, err := FormatDecimal(*v, decimals)
+	s, err := NormalizeDecimal(*v, decimals)
 	if err != nil {
 		return nil, err
 	}

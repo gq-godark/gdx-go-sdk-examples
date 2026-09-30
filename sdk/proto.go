@@ -153,17 +153,17 @@ func stringOr(p *string, fallback string) string {
 
 // BuildPlaceOrderRequest assembles the encrypted-body payload for a Place
 // command: a bare PlaceOrderInput protobuf (not wrapped in EdgeSequencerRequest).
-// Prices and sizes are encoded as decimal strings at the instrument scales.
+// Prices and sizes are public decimal strings, normalized at the instrument scales.
 func BuildPlaceOrderRequest(
 	symbolID uint64,
 	side Side,
 	orderType OrderType,
-	quantity float64,
+	quantity string,
 	userUUID []byte,
-	price *float64,
+	price *string,
 	timeInForce TimeInForce,
 	aon bool,
-	minFillSize *float64,
+	minFillSize *string,
 	expiryTime *uint64,
 	correlationID []byte,
 	options PlaceOrderOptions,
@@ -185,7 +185,7 @@ func BuildPlaceOrderRequest(
 	if !ok && options.StpMode != "" {
 		return nil, fmt.Errorf("unknown stp mode: %q", options.StpMode)
 	}
-	hasQuantity := quantity != 0
+	hasQuantity := quantity != ""
 	hasQuoteNotional := options.QuoteNotional != nil
 	if hasQuantity == hasQuoteNotional {
 		return nil, fmt.Errorf("exactly one of quantity or options.QuoteNotional is required")
@@ -209,27 +209,27 @@ func BuildPlaceOrderRequest(
 		PostOnly:    options.PostOnly,
 	}
 	if hasQuantity {
-		qtyStr, err := FormatDecimal(quantity, decimals.QuantityDecimals)
+		qtyStr, err := NormalizeDecimal(quantity, decimals.QuantityDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("quantity: %w", err)
 		}
 		place.Quantity = &qtyStr
 	} else {
-		qnStr, err := FormatDecimal(*options.QuoteNotional, decimals.PriceDecimals)
+		qnStr, err := NormalizeDecimal(*options.QuoteNotional, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("quote_notional: %w", err)
 		}
 		place.QuoteNotional = &qnStr
 	}
 	if price != nil {
-		pStr, err := FormatDecimal(*price, decimals.PriceDecimals)
+		pStr, err := NormalizeDecimal(*price, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("price: %w", err)
 		}
 		place.Price = &pStr
 	}
 	if minFillSize != nil {
-		mStr, err := FormatDecimal(*minFillSize, decimals.QuantityDecimals)
+		mStr, err := NormalizeDecimal(*minFillSize, decimals.QuantityDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("min_fill_size: %w", err)
 		}
@@ -245,21 +245,21 @@ func BuildPlaceOrderRequest(
 		place.PegOffsetBps = options.PegOffsetBps
 	}
 	if options.TriggerPrice != nil {
-		s, err := FormatDecimal(*options.TriggerPrice, decimals.PriceDecimals)
+		s, err := NormalizeDecimal(*options.TriggerPrice, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("trigger_price: %w", err)
 		}
 		place.TriggerPrice = &s
 	}
 	if options.TakeProfitPrice != nil {
-		s, err := FormatDecimal(*options.TakeProfitPrice, decimals.PriceDecimals)
+		s, err := NormalizeDecimal(*options.TakeProfitPrice, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("take_profit_price: %w", err)
 		}
 		place.TakeProfitPrice = &s
 	}
 	if options.StopLossPrice != nil {
-		s, err := FormatDecimal(*options.StopLossPrice, decimals.PriceDecimals)
+		s, err := NormalizeDecimal(*options.StopLossPrice, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("stop_loss_price: %w", err)
 		}
@@ -313,8 +313,8 @@ func BuildAmendTpsl(
 	userUUID []byte,
 	orderID uint64,
 	correlationID []byte,
-	takeProfitPrice *float64,
-	stopLossPrice *float64,
+	takeProfitPrice *string,
+	stopLossPrice *string,
 	symbolID *uint64,
 	positionSide *Side,
 	decimals InstrumentDecimals,
@@ -437,9 +437,9 @@ func BuildModifyOrderRequest(
 	orderID uint64,
 	userUUID []byte,
 	symbolID uint64,
-	newPrice *float64,
-	newQuantity *float64,
-	newTriggerPrice *float64,
+	newPrice *string,
+	newQuantity *string,
+	newTriggerPrice *string,
 	correlationID []byte,
 	decimals InstrumentDecimals,
 ) ([]byte, error) {
@@ -512,11 +512,11 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		if leg.CancelOrderID != nil {
 			cancelID = *leg.CancelOrderID
 		}
-		priceStr, err := FormatDecimal(leg.Price, decimals.PriceDecimals)
+		priceStr, err := NormalizeDecimal(leg.Price, decimals.PriceDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("mass quote leg %d price: %w", i, err)
 		}
-		qtyStr, err := FormatDecimal(leg.Quantity, decimals.QuantityDecimals)
+		qtyStr, err := NormalizeDecimal(leg.Quantity, decimals.QuantityDecimals)
 		if err != nil {
 			return nil, fmt.Errorf("mass quote leg %d quantity: %w", i, err)
 		}

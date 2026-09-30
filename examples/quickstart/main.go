@@ -89,13 +89,16 @@ func main() {
 	}
 
 	mark := liveMarkPrice()
-	sellPx := math.Round(mark*1.03*10) / 10
+	sellPx, err := godark.FormatDecimal(math.Round(mark*1.03*10)/10, 8)
+	if err != nil {
+		log.Fatal(err)
+	}
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
 		Price:     sellPx,
-		Quantity:  0.01,
+		Quantity:  "0.01",
 		Options:   godark.PlaceOrderOptions{PostOnly: true},
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
@@ -103,7 +106,7 @@ func main() {
 		envloader.PrintOrderError("PlaceOrder", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %.1f, mark=%.1f)\n", ack.OrderID, sellPx, mark)
+	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %s, mark=%.1f)\n", ack.OrderID, sellPx, mark)
 
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)

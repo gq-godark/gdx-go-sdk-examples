@@ -123,8 +123,8 @@ func main() {
         Symbol:    "BTC-USDC-PERP",
         Side:      godark.SideSell,
         OrderType: godark.OrderTypeLimit,
-        Price:     999_999,
-        Quantity:  0.01,
+        Price:     "999999",
+        Quantity:  "0.01",
     })
     if err != nil {
         log.Fatal(err)

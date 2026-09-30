@@ -542,16 +542,17 @@ func (c *GodarkClient) disconnectInternal() error {
 // -----------------------------------------------------------------------
 
 // PlaceOrderRequest is the input to PlaceOrder. Price is required for LIMIT
-// orders, ignored for MARKET.
+// orders, ignored for MARKET. Price, Quantity, MinFillSize, and Options
+// price/size fields are decimal strings (not float64).
 type PlaceOrderRequest struct {
 	Symbol      string
 	Side        Side
 	OrderType   OrderType
-	Quantity    float64
-	Price       float64 // ignored when zero for non-LIMIT order types
+	Quantity    string
+	Price       string // ignored when empty for non-LIMIT order types
 	TimeInForce TimeInForce
 	AON         bool
-	MinFillSize *float64
+	MinFillSize *string
 	ExpiryTime  *uint64
 	// Options carries optional reduce-only / post-only / STP flags.
 	Options PlaceOrderOptions
@@ -590,8 +591,8 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 	}
 
 	corrID := newCorrelationID()
-	var pricePtr *float64
-	if req.Price != 0 {
+	var pricePtr *string
+	if req.Price != "" {
 		p := req.Price
 		pricePtr = &p
 	}
@@ -672,7 +673,8 @@ func (c *GodarkClient) CancelOrder(ctx context.Context, orderID string, symbol s
 
 // ModifyOrder sends an encrypted modify command and waits for its ack.
 // At least one of newPrice, newQuantity, or newTriggerPrice must be non-nil.
-func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
+// Price/size args are decimal strings.
+func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *string) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -783,12 +785,13 @@ func (c *GodarkClient) ReversePosition(ctx context.Context, symbol string) (*Cou
 }
 
 // AmendTpsl amends or attaches TP/SL on a resting order or open position.
+// takeProfitPrice and stopLossPrice are decimal strings.
 func (c *GodarkClient) AmendTpsl(
 	ctx context.Context,
 	symbol string,
 	orderID uint64,
-	takeProfitPrice *float64,
-	stopLossPrice *float64,
+	takeProfitPrice *string,
+	stopLossPrice *string,
 	positionSide *Side,
 ) (*TpslAck, error) {
 	if err := c.ensureReady(); err != nil {

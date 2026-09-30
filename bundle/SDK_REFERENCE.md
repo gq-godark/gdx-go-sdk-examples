@@ -126,8 +126,8 @@ ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
     Symbol:      "BTC-USDC-PERP",
     Side:        godark.SideBuy,                // SideBuy | SideSell
     OrderType:   godark.OrderTypeLimit,         // OrderTypeMarket | OrderTypeLimit
-    Quantity:    0.1,
-    Price:       67_500,                        // required for LIMIT
+    Quantity:    "0.1",
+    Price:       "67500",                       // required for LIMIT (decimal string)
     TimeInForce: godark.TimeInForceGTC,
 })
 // ack.OrderID -- decimal string, the assigned sequencer order id
@@ -136,7 +136,7 @@ ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 
 cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 
-newPrice := 68_000.0
+newPrice := "68000"
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil, /*newTriggerPrice*/ nil)
 ```

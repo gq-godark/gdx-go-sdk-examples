@@ -30,16 +30,16 @@ type PlaceOrderOptions struct {
 	// PegOffsetBps is signed bps vs Pyth mark for PEG orders.
 	PegOffsetBps *int32
 	// TriggerPrice is the mark trigger for STOP_MARKET / STOP_LIMIT orders.
-	TriggerPrice *float64
+	TriggerPrice *string
 	// TakeProfitPrice attaches TP at placement (optional; may also use AmendTpsl).
-	TakeProfitPrice *float64
+	TakeProfitPrice *string
 	// StopLossPrice attaches SL at placement (optional; may also use AmendTpsl).
-	StopLossPrice *float64
+	StopLossPrice *string
 	// SlippageBps is max walk vs mark for market / stop-market. Nil → venue max.
 	SlippageBps *uint32
 	// QuoteNotional sizes the order in quote currency. Set exactly one of
 	// PlaceOrderRequest.Quantity or QuoteNotional.
-	QuoteNotional *float64
+	QuoteNotional *string
 }
 
 // CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.
@@ -66,8 +66,8 @@ type OrderAck struct {
 // MassQuoteLegInput is one cancel-replace leg of a mass quote.
 type MassQuoteLegInput struct {
 	Side     Side
-	Price    float64
-	Quantity float64
+	Price    string
+	Quantity string
 	// CancelOrderID is the resting order to cancel-replace; nil/0 = pure place.
 	CancelOrderID *uint64
 	// TimeInForce defaults to GTC when empty.
@@ -80,8 +80,8 @@ type MassQuoteLegInput struct {
 // NewPrice / NewQuantity must be set.
 type BatchModifyLegInput struct {
 	OrderID     uint64
-	NewPrice    *float64
-	NewQuantity *float64
+	NewPrice    *string
+	NewQuantity *string
 }
 
 // MassQuoteLegResult is the outcome of one cancel-replace leg in a mass quote.

@@ -35,6 +35,15 @@ import (
 
 const symbol = "BTC-USDC-PERP"
 
+
+func dec(v float64) string {
+	s, err := godark.FormatDecimal(v, 8)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
 func liveMarkPrice() float64 {
 	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
 		if f, err := strconv.ParseFloat(raw, 64); err == nil {
@@ -154,14 +163,14 @@ func main() {
 
 	// Place a limit BUY.
 	mark := liveMarkPrice()
-	buyPx := math.Round(mark*0.997*10) / 10
-	fmt.Printf("Placing limit BUY @ %.1f (mark=%.1f)...\n", buyPx, mark)
+	buyPx := dec(math.Round(mark*0.997*10) / 10)
+	fmt.Printf("Placing limit BUY @ %s (mark=%.1f)...\n", buyPx, mark)
 	buyAck, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideBuy,
 		OrderType: godark.OrderTypeLimit,
 		Price:     buyPx,
-		Quantity:  0.1,
+		Quantity:  "0.1",
 	})
 	if err != nil {
 		envloader.PrintOrderError("BUY rejected (continuing to market Place)", err)
@@ -174,8 +183,8 @@ func main() {
 	drainOrderUpdates(client, "after BUY")
 
 	if buyAck != nil {
-		modifyPx := math.Round(mark*0.996*10) / 10
-		fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
+		modifyPx := dec(math.Round(mark*0.996*10) / 10)
+		fmt.Printf("Modifying order price to %s...\n", modifyPx)
 		newPrice := modifyPx
 		if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
 			envloader.PrintOrderError("Modify rejected", mErr)
@@ -194,7 +203,7 @@ func main() {
 		Symbol:      symbol,
 		Side:        godark.SideBuy,
 		OrderType:   godark.OrderTypeMarket,
-		Quantity:    0.01,
+		Quantity:    "0.01",
 		TimeInForce: godark.TimeInForceIOC,
 		Options:     godark.PlaceOrderOptions{SlippageBps: &slippageBps},
 	}); mErr != nil {
@@ -207,14 +216,14 @@ func main() {
 	drainOrderUpdates(client, "after MARKET BUY")
 
 	// Place + immediately cancel a SELL.
-	sellPx := math.Round(mark*1.03*10) / 10
-	fmt.Printf("Placing limit SELL @ %.1f...\n", sellPx)
+	sellPx := dec(math.Round(mark*1.03*10) / 10)
+	fmt.Printf("Placing limit SELL @ %s...\n", sellPx)
 	if sellAck, sErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
 		Price:     sellPx,
-		Quantity:  0.05,
+		Quantity:  "0.05",
 		Options:   godark.PlaceOrderOptions{PostOnly: true},
 	}); sErr != nil {
 		envloader.PrintOrderError("SELL rejected", sErr)
@@ -250,9 +259,9 @@ func main() {
 	}
 	fmt.Printf("Mass-quoting a 3-level BUY ladder (post-only), base=%.2f...\n", base)
 	ladder := []godark.MassQuoteLegInput{
-		{Side: godark.SideBuy, Price: base * (1 - 0.003), Quantity: 0.02},
-		{Side: godark.SideBuy, Price: base * (1 - 0.006), Quantity: 0.02},
-		{Side: godark.SideBuy, Price: base * (1 - 0.009), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.003)), Quantity: "0.02"},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.006)), Quantity: "0.02"},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.009)), Quantity: "0.02"},
 	}
 	var restingIDs []uint64
 	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, nil); mqErr != nil {
@@ -297,7 +306,7 @@ func main() {
 	postOnlyTrue := true
 	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
-		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.001}},
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: dec(crossPx), Quantity: "0.001"}},
 		&postOnlyTrue); mqErr != nil {
 		envloader.PrintOrderError("post_only=true mass quote rejected", mqErr)
 	} else {
@@ -316,7 +325,7 @@ func main() {
 	postOnlyFalse := false
 	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
-		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.003}},
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: dec(crossPx), Quantity: "0.003"}},
 		&postOnlyFalse); mqErr != nil {
 		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
 	} else {
