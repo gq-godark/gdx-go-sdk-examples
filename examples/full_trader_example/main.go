@@ -3,10 +3,13 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. Connect and authenticate (HPKE WebSocket session).
+//  2. Connect: REST access token, then WebSocket login and HPKE.
 //  3. Wire up channel-first push receivers (order / position / health / etc.).
 //  4. Subscribe to the private order + position channels.
-//  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
+//  5. Place, modify, and cancel orders. Prices and sizes are decimal strings.
+//     SlippageBps is only for MARKET and STOP_MARKET. PEG is incompatible
+//     with post-only. ClientOrderID is registered only after a successful
+//     WebSocket place and only when POST /orders/_register_coid returns 200.
 //  6. Drain queued updates between actions.
 //  7. Print a session summary including per-stream counts.
 //  8. Clean disconnect.
@@ -74,7 +77,8 @@ func main() {
 	fmt.Println(sep)
 	fmt.Println("  GoDark Go SDK -- Trader Reference Example")
 	fmt.Println(sep)
-	fmt.Println("Order-type support in this distribution: MARKET, LIMIT")
+	fmt.Println("Order types: MARKET, LIMIT, PEG, STOP_MARKET, STOP_LIMIT")
+	fmt.Println("SlippageBps: MARKET and STOP_MARKET only. PEG cannot be post-only.")
 
 	legacyKey := envloader.First("GODARK_API_KEY", "GDX_API_KEY")
 	wsURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")

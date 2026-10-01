@@ -42,26 +42,20 @@ gdx-go-sdk-examples/
 
 ## Configure credentials
 
-Copy `.env.example` to `.env` and set `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
-`GODARK_PASSPHRASE`, and `GODARK_ACCOUNT` (the Solana base58 account used by
-encrypted requests). Current public testnet and devnet auth responses normally
-provide the account, so the configured value is a fallback; legacy local edges
-require it when auth omits the account. Localnet also requires
-`GDX_HPKE_STATIC_PUBLIC_KEY`.
+Copy `.env.example` to `.env`. Set values in `.env` or the process environment.
+This file lists names only.
 
-Optional overrides: `GODARK_EDGE_URL`, `GODARK_REST_URL`,
-`GDX_HPKE_STATIC_PUBLIC_KEY` (legacy HPKE env vars).
+Hosted key-pair auth: `GODARK_API_KEY_ID`, `GODARK_API_SECRET`,
+`GODARK_PASSPHRASE`. Optional: `GODARK_ACCOUNT` (fallback when auth omits the
+Solana account), `GODARK_EDGE_URL`, `GODARK_REST_URL`,
+`GDX_HPKE_STATIC_PUBLIC_KEY` (required on localnet; baked in for testnet and
+devnet).
 
 ## Localnet (`gdx up`)
 
-```bash
-GODARK_EDGE_URL=ws://127.0.0.1:13300
-GODARK_API_KEY=test-key-1
-GDX_HPKE_STATIC_PUBLIC_KEY=1d61f116451fdfda1aa4aaf50b7200c3b362d0445bfa2d7ef1f80b3b8881a533
-gdx fund 00000000-0000-4000-8000-000000000001
-```
-
-Copy `VITE_GDX_HPKE_STATIC_PUBKEY` from `gdx-web/.env.localnet` if your pin differs.
+Set `GODARK_EDGE_URL`, `GODARK_REST_URL`, `GODARK_API_KEY`, and
+`GDX_HPKE_STATIC_PUBLIC_KEY` in `.env`. See the commented localnet block in
+`.env.example`. Do not commit filled-in credentials.
 
 ## Local development
 
@@ -76,6 +70,21 @@ go run ./examples/rest_client_example   # REST auth + account/public MD reads
 `quickstart` subscribes to `orders` before placing so default **book** confirmation
 receives the private OPEN update (then cancel). Do not skip that subscribe when
 copying the pattern into your own scripts.
+
+Participant path (also in `bundle/README.md`): install Go, set the env names
+above, REST `Connect` (`POST /api/v1/auth/token`), WebSocket `Connect` (login
+uses that `access_token`), `Subscribe` to `orders` and `positions`, place with
+string `Price` / `Quantity`, read positions (`GetPositions` or
+`PositionsSnapshots`), then `CancelOrder`.
+
+`/ws/v1` channels: `orders`, `positions`, `volume`, `open_interest`,
+`funding_rate`. Unknown channels, including `trades`, error on the subscribe
+waiter. There is no trades channel on `/ws/v1`.
+
+`ClientOrderID` is registered only after a successful WebSocket place, and
+only when `POST /orders/_register_coid` returns HTTP 200. REST place does not
+register it. `SlippageBps` is only for `MARKET` and `STOP_MARKET`. `PEG` is
+incompatible with post-only.
 
 The `replace github.com/gq-godark/gdx-go-sdk => ./sdk` directive in
 `go.mod` resolves the SDK from the vendored copy, so `go build` never has
@@ -123,9 +132,9 @@ The GitHub App (`godark-ci`) used for cross-repo access only requires
 
 ## Concurrency contract
 
-  - `GodarkClient` routes trading commands by correlation id, so multiple
-    commands can be in flight concurrently (matching python / rust /
-    java).
+  - `GodarkClient` serializes trading command sends (one command in flight
+    on the transport). Push-stream channels and callbacks still run
+    alongside that send path.
   - `GodarkRestClient` supports one-shot HPKE place / modify / cancel,
     mass-quote, batch cancel / modify, leverage updates, encrypted open-order /
     position / account snapshots, authenticated order / profile / balance /

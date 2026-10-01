@@ -13,16 +13,16 @@ For the recipient-facing API tutorial, see `bundle/SDK_REFERENCE.md`
 | File                                  | Surface                                       |
 | ------------------------------------- | --------------------------------------------- |
 | `sdk/client.go`                       | `GodarkClient`, `ClientConfig`, `TransportConfig` |
-| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig` (legacy; **encrypted REST trading is unsupported** — the examples trade over the WebSocket `GodarkClient`) |
+| `sdk/rest_client.go`                  | `GodarkRestClient`, `RestClientConfig` (one-shot HPKE REST; client-order ids are not registered on REST place) |
 | `sdk/market_data.go`                  | `MarketDataClient`, `MarketDataConfig`, `MarketDataMessage` |
 | `sdk/types.go`                        | `OrderAck`, `OrderUpdate`, `PositionUpdate`, etc. |
 | `sdk/enums.go`                        | `Side`, `OrderType`, `OrderStatus`, `TimeInForce`, etc. |
 | `sdk/errors.go`                       | `AuthenticationError`, `SessionError`, `OrderError`, `ConnectionError`, `EncryptionError`, `TimeoutError` |
-| `sdk/order_error_code.go`             | Canonical 34-entry numeric -> symbolic reject reason map |
+| `sdk/order_error_code.go`             | Numeric -> symbolic reject reason map (`OrderErrorCodes`) |
 | `sdk/proto.go`                        | Hand-written wrappers around generated proto (AAD builders, parsers, encoders) |
 | `sdk/symbols.go` + `sdk/shared/symbols.json` | Embedded symbol-id table |
 | `sdk/internal/hpke`         | HPKE initiator |
-| `sdk/internal/bound/bound.go`         | SHA-256-bound AEAD framing helpers |
+| `sdk/internal/wire`                   | Docs-wire helpers |
 | `sdk/internal/crypto/crypto.go`       | X25519 + AES-GCM primitives used by HPKE |
 | `sdk/internal/session/session.go`     | Post-handshake `CryptoSession` (encrypt/decrypt) |
 | `sdk/internal/identity/identity.go`   | UUID <-> 16-byte wire helpers |
@@ -38,19 +38,20 @@ above is enumerated in `bundle/SDK_REFERENCE.md`.
   - **Trading WS endpoint**: `wss://api.godark-dex.com/ws/v1` (overridable
     via `GODARK_EDGE_URL` / `GDX_EDGE_URL`).
   - **REST root**: `https://api.godark-dex.com/api/v1` (auto-derived from
-    the WS host). Not used by the examples — encrypted REST trading is
-    unsupported; all order flow goes over the WebSocket client.
-  - **Public market-data WS**: `wss://api.godark-dex.com/ws/gomarket`.
+    the WS host). Key-pair clients mint `POST /api/v1/auth/token` and the
+    WebSocket login uses that `access_token`.
+  - **Public `/ws/v1` channels**: `orders`, `positions`, `volume`,
+    `open_interest`, `funding_rate`. No `trades` channel. An unknown channel
+    fails the subscribe waiter immediately.
   - **Envelope**: docs-wire `{id, op, args}` out; `{id, op, code, data?,
     message?}` in. The transport normalises both legacy and docs envelopes
     transparently.
-  - **Crypto**: after login the client runs `HPKE`
-    (HPKE setup). Pin the sequencer static key via
-    `ClientConfig.HpkeStaticPublicKeyHex` or `GDX_HPKE_STATIC_PUBLIC_KEY`.
-    Order bodies use bound AES-GCM (`SHA256(OrderHeader) || plaintext`).
-    The legacy ECDH `session.setup` handshake is retired; all encrypted
-    order flow now uses the HPKE WebSocket client. Encrypted REST
-    trading is unsupported.
+  - **Crypto**: after login the client runs HPKE setup. Pin the sequencer
+    static key via `ClientConfig.HpkeStaticPublicKeyHex` or
+    `GDX_HPKE_STATIC_PUBLIC_KEY`. Order bodies use bound AES-GCM
+    (`SHA256(OrderHeader) || plaintext`). The legacy ECDH `session.setup`
+    handshake is retired. REST trading is one-shot HPKE and does not keep a
+    session.
 
 ## Examples mapping
 
@@ -70,10 +71,12 @@ batch-modify/TP-SL (including `QuoteNotional`, min fill, and trigger) are
 `FormatDecimal` are not part of the public trading API. Pass literals such as
 `"68000"` / `"0.01"`, or format locally with `strconv` / `math/big` /
 shopspring/decimal; `NormalizeDecimal` validates against instrument
-`price_decimals` / `quantity_decimals`. Omit `SlippageBps` (nil) to use the
-venue max walk cap (localnet 5%); typical explicit values are 50–500 bps
-(0.5%–5%). See `bundle/SDK_REFERENCE.md` for recipient-facing trading-command
-examples.
+`price_decimals` / `quantity_decimals`. `SlippageBps` is only for `MARKET`
+and `STOP_MARKET`; omit it (nil) to use the venue max walk cap. `PEG` is
+incompatible with post-only. `ClientOrderID` is registered only after a
+successful WebSocket place, and only an HTTP 200 from
+`POST /orders/_register_coid` counts. REST place does not register it.
+See `bundle/SDK_REFERENCE.md` for recipient-facing trading-command examples.
 
 Current `gdx-core` encrypted wire identity is the authenticated 32-byte Solana
 account. The vendored SDK derives it from `auth_result.account` / JWT `sub` and
@@ -111,4 +114,4 @@ The PR is annotated with a checklist: review the descriptor diff under
 
 ## RestClient example
 
-`GodarkRestClient` is exercised by `rest_client_example` / `rest-client-example`: REST auth, `/auth/me`, leverage read, and public funding/OI/volume GETs. Encrypted place/cancel/modify/update-leverage remain WebSocket-only via `GodarkClient`.
+`rest_client_example` covers REST auth, `/auth/me`, leverage, balance, and public funding/OI/volume GETs. `full_trader_rest` places, modifies, and cancels over one-shot HPKE REST and reads positions with `GetPositions`. Neither REST path registers a client-order id.

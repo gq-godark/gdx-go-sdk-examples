@@ -55,7 +55,7 @@ Lifecycle:
 
 ```go
 ctx := context.Background()
-if err := client.Connect(ctx); err != nil { ... }   // login + HPKE setup handshake
+if err := client.Connect(ctx); err != nil { ... }   // REST access_token, then WS login + HPKE
 defer client.Disconnect()
 
 account := client.Account() // authenticated Solana account, base58
@@ -81,10 +81,17 @@ defer restClient.Disconnect(ctx)
 fmt.Printf("connected account=%s\n", restClient.Account())
 ```
 
-The REST client supports place / modify / cancel (including cancel by client
-id), mass-quote, batch cancel / modify, leverage updates, encrypted open-order /
-position / account snapshots, authenticated order / profile / balance /
-leverage reads, and public funding-rate / open-interest / volume reads.
+Key-pair `Connect` on `GodarkClient` calls `POST /api/v1/auth/token` and sends
+the returned `access_token` as the WebSocket login token.
+
+The REST client supports place / modify / cancel, mass-quote, batch cancel /
+modify, leverage updates, encrypted open-order / position / account snapshots,
+authenticated order / profile / balance / leverage reads, and public
+funding-rate / open-interest / volume reads. REST place does not register a
+client-order id: the edge arms that correlation only for a WebSocket place.
+Setting `ClientOrderID` on `PlaceOrderRestRequest` returns an error. After a
+successful WebSocket place, the SDK calls `POST /orders/_register_coid` and
+treats the id as registered only when that call returns HTTP 200.
 
 REST has no private push streams, subscriptions, automatic reconnect, or
 persistent HPKE session. Use `GodarkClient` for live private updates and
@@ -94,26 +101,21 @@ compatibility metadata and is not used for encrypted request identity.
 
 ### Public market-data feed -- `MarketDataClient`
 
+Hosted market data defaults to `/ws/v1`. Public channels there are `volume`,
+`open_interest`, and `funding_rate`. There is no `trades` channel on
+`/ws/v1`. `SubscribeOrderbook` is rejected on that path. An unknown channel
+fails the subscribe call immediately.
+
 ```go
 md := godark.NewMarketDataClient(godark.MarketDataConfig{
-    BaseURL: os.Getenv("GODARK_EDGE_URL"), // same host; appends /ws/gomarket
+    BaseURL: os.Getenv("GODARK_EDGE_URL"), // default path /ws/v1
 })
 if err := md.Connect(ctx); err != nil { ... }
 defer md.Disconnect()
 
-_ = md.SubscribeOrderbook(ctx, "BTC-USDC-PERP", func(m godark.MarketDataMessage) {
-    // m.Channel == "orderbook", m.Raw["bids"] / m.Raw["asks"]
-})
-_ = md.SubscribeTrades(ctx, "BTC-USDC-PERP", func(m godark.MarketDataMessage) {
-    // m.Channel == "trades", m.Raw["price"] / m.Raw["qty"]
-})
-```
-
-Channel-first delivery is also supported:
-
-```go
-for msg := range md.OrderbookEvents() { ... }
-for msg := range md.TradesEvents()    { ... }
+_ = md.SubscribePublicChannel(ctx, "volume", nil)
+_ = md.SubscribePublicChannel(ctx, "open_interest", nil)
+_ = md.SubscribePublicChannel(ctx, "funding_rate", nil)
 ```
 
 ## Trading commands
@@ -147,9 +149,11 @@ modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
 format locally; the SDK has no float→string helper on the trading path.
 `PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`,
 `PostOnly`, `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`,
-`StopLossPrice`, `SlippageBps`, and `QuoteNotional`. Omit `SlippageBps` (nil)
-to use the venue max walk cap (localnet 5%); typical explicit values are
-50–500 bps (0.5%–5%).
+`StopLossPrice`, `SlippageBps`, and `QuoteNotional`. `SlippageBps` is accepted
+only on `MARKET` and `STOP_MARKET`. Omit it (nil) to use the venue max walk
+cap. `PEG` (`PegOffsetBps`) is incompatible with post-only. Set
+`ClientOrderID` only on the WebSocket place; registration runs after that
+place succeeds and counts only on HTTP 200 from `POST /orders/_register_coid`.
 
 Encrypted headers, HPKE info, command bodies, and private pushes use the
 32-byte Solana account returned by login. `ClientConfig.Account` /
@@ -180,8 +184,12 @@ client.OnDisconnect(func()              { ... }) // WS closed (any reason)
 client.OnReconnect(func()               { ... }) // automatic reconnect succeeded
 ```
 
-Subscribe to channels with `client.Subscribe(ctx, "orders", "positions")`.
-The SDK replays those subscriptions after an automatic reconnect.
+Subscribe with `client.Subscribe(ctx, "orders", "positions")`. The `/ws/v1`
+channel set is `orders`, `positions`, `volume`, `open_interest`, and
+`funding_rate`. An unknown name, including `trades`, returns an error on the
+subscribe waiter. The SDK replays remembered subscriptions after an automatic
+reconnect. Read positions from `PositionsSnapshots` after subscribing to
+`positions`, or from `GodarkRestClient.GetPositions`.
 
 Default transport heartbeat settings: ping every `30s`, absolute stale timeout
 `120s`, missed-heartbeat limit `2` consecutive intervals without inbound traffic.

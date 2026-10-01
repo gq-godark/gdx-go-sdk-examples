@@ -1,7 +1,8 @@
 // GoDark Go SDK — minimal GodarkRestClient demo.
 //
 // Auth + account reads + public market-data GETs. For encrypted place/modify/
-// cancel over REST (one-shot HPKE), see full_trader_rest.
+// cancel over REST (one-shot HPKE), see full_trader_rest. REST place does
+// not register a client-order id.
 //
 //	go run ./examples/rest_client_example
 //

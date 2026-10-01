@@ -1,6 +1,8 @@
 // REST-only trader demo — auth + encrypted snapshots + place/modify/cancel.
 //
-// Prices and sizes are decimal strings only (not float64).
+// Prices and sizes are decimal strings only (not float64). Do not set
+// ClientOrderID: REST place does not register it. Registration happens only
+// after a successful WebSocket place, and only on HTTP 200.
 //
 //	GODARK_REST_URL=https://api.devnet.godark-dex.com \
 //	GODARK_API_KEY_ID=... GODARK_API_SECRET=... GODARK_PASSPHRASE=... \

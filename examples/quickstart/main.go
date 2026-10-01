@@ -1,7 +1,9 @@
 // GoDark Go SDK -- Quickstart Example
 //
-// Place a limit sell, then cancel it. The minimal happy path against the
-// encrypted WebSocket trading client.
+// Place a limit sell, then cancel it. Connect mints a REST access token and
+// uses that token for the WebSocket login. Prices and sizes are strings.
+// ClientOrderID, if set, is registered only after this place succeeds and
+// only when POST /orders/_register_coid returns HTTP 200.
 //
 // Prices and sizes are decimal strings only (not float64). Pass literals such
 // as "81370" / "0.01", or format locally with strconv / math/big before calling
