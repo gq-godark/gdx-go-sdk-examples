@@ -251,7 +251,11 @@ func (t *Transport) SendBinary(ctx context.Context, payload []byte) error {
 	if conn == nil || !connected {
 		return errors.New("not connected")
 	}
-	return conn.Write(ctx, websocket.MessageBinary, payload)
+	if err := conn.Write(ctx, websocket.MessageBinary, payload); err != nil {
+		t.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 // SendJSON serializes obj and writes it as a single WebSocket text frame.
@@ -267,7 +271,11 @@ func (t *Transport) SendJSON(ctx context.Context, obj any) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		t.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 // commandKeys extracts the header correlation id and wire id from an outbound
@@ -497,7 +505,7 @@ func (t *Transport) SendSubscribe(ctx context.Context, channels []string, op str
 }
 
 // Authenticate sends the login op and waits for the auth_result frame. Returns
-// the parsed auth_result Message (with `user_uuid`, `session_id`, etc.).
+// the parsed auth_result Message (with `account`, `session_id`, etc.).
 func (t *Transport) Authenticate(ctx context.Context, apiKey string) (Message, error) {
 	result := make(chan Message, 1)
 	t.mu.Lock()
@@ -712,6 +720,30 @@ func (t *Transport) rejectPending(err error) {
 	t.subMu.Unlock()
 }
 
+// failSubscribeIfWaiting completes an in-flight subscribe/unsubscribe when
+// the edge rejects the channel with a bare error frame. Command rejects
+// include wire_id and are left for the command waiter.
+func (t *Transport) failSubscribeIfWaiting(msg Message) bool {
+	if wireID, _ := msg["wire_id"].(string); wireID != "" {
+		return false
+	}
+	t.subMu.Lock()
+	defer t.subMu.Unlock()
+	if t.subWaiter == nil {
+		return false
+	}
+	errMsg, _ := msg["message"].(string)
+	if errMsg == "" {
+		errMsg = "channel error"
+	}
+	select {
+	case t.subWaiter <- errors.New(errMsg):
+	default:
+	}
+	t.subWaiter = nil
+	return true
+}
+
 // recvLoop reads messages from the WS, normalizes them, and dispatches.
 func (t *Transport) recvLoop(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
 	defer t.wg.Done()
@@ -824,7 +856,20 @@ func (t *Transport) dispatch(msg Message) {
 			t.handler.OnEncryptedPush(msg)
 		}
 		return
-	case "ack", "error":
+	case "ack":
+		t.pendingMu.Lock()
+		t.resolveLocked(msg)
+		t.pendingMu.Unlock()
+		return
+	case "error":
+		// Hosted edges reject an unknown channel with a bare
+		// `{type:"error", message:"invalid subscribe: ..."}` frame (no op,
+		// no wire id). Command rejects carry wire_id and must stay on the
+		// command waiter. Leaving the bare frame on the command path makes
+		// Subscribe wait until CommandTimeout.
+		if t.failSubscribeIfWaiting(msg) {
+			return
+		}
 		t.pendingMu.Lock()
 		t.resolveLocked(msg)
 		t.pendingMu.Unlock()
@@ -896,6 +941,34 @@ func (t *Transport) closeForStale(conn *websocket.Conn, reason string) {
 	}
 }
 
+// closeForWriteFailure closes the socket so recvLoop exits and OnDisconnect
+// fires. Needed when the write half dies while reads may still succeed
+// (gdx-rust-sdk#56 / Go equivalent): without this, reconnect never runs.
+func (t *Transport) closeForWriteFailure(conn *websocket.Conn) {
+	t.mu.Lock()
+	active := t.conn == conn && t.connected
+	t.mu.Unlock()
+	if !active || conn == nil {
+		return
+	}
+	_ = conn.Close(websocket.StatusGoingAway, "write failed")
+}
+
+// handleWriteError forces a disconnect when a WebSocket write fails for a
+// connection-level reason. Caller context cancel/deadline alone is not treated
+// as write-half death (a single timed-out command must not tear down the socket).
+func (t *Transport) handleWriteError(ctx context.Context, conn *websocket.Conn, err error) {
+	if err == nil {
+		return
+	}
+	// Caller's ctx is done — Write failed because of that deadline/cancel, not
+	// because the socket write half is dead.
+	if ctx.Err() != nil {
+		return
+	}
+	t.closeForWriteFailure(conn)
+}
+
 // heartbeatLoop sends periodic pings and closes the connection when the
 // absolute stale timeout is exceeded or the missed-heartbeat limit is reached.
 func (t *Transport) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
@@ -947,6 +1020,11 @@ func (t *Transport) heartbeatLoop(ctx context.Context, conn *websocket.Conn) {
 			err := sendJSONOnConn(pingCtx, conn, payload)
 			cancel()
 			if err != nil {
+				// Write half gone (or ping timed out) while read may still be
+				// alive — must wake reconnect; do not rely on inbound staleness.
+				if ctx.Err() == nil {
+					t.closeForWriteFailure(conn)
+				}
 				return
 			}
 		}
@@ -1036,7 +1114,7 @@ func normalizeInboundMessage(msg Message) Message {
 				"success": true,
 			}
 			for _, k := range []string{
-				"user_uuid", "account_id", "session_id",
+				"account", "user_uuid", "account_id", "session_id",
 				"token_expires_at", "cancel_on_disconnect", "conn_id",
 			} {
 				if v, ok := data[k]; ok {

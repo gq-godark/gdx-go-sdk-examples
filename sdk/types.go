@@ -15,6 +15,7 @@ type LeverageSetting struct {
 // the encrypted WS as `leverage_settings`. REST responses leave UserUUID
 // empty and ServerTimestamp at zero.
 type LeverageSettings struct {
+	Account         string
 	UserUUID        string
 	Settings        []LeverageSetting
 	ServerTimestamp uint64
@@ -29,11 +30,16 @@ type PlaceOrderOptions struct {
 	// PegOffsetBps is signed bps vs Pyth mark for PEG orders.
 	PegOffsetBps *int32
 	// TriggerPrice is the mark trigger for STOP_MARKET / STOP_LIMIT orders.
-	TriggerPrice *float64
+	TriggerPrice *string
 	// TakeProfitPrice attaches TP at placement (optional; may also use AmendTpsl).
-	TakeProfitPrice *float64
+	TakeProfitPrice *string
 	// StopLossPrice attaches SL at placement (optional; may also use AmendTpsl).
-	StopLossPrice *float64
+	StopLossPrice *string
+	// SlippageBps is max walk vs mark for market / stop-market. Nil → venue max.
+	SlippageBps *uint32
+	// QuoteNotional sizes the order in quote currency. Set exactly one of
+	// PlaceOrderRequest.Quantity or QuoteNotional.
+	QuoteNotional *string
 }
 
 // CountAck is the ack for account-wide cancel_all / close_all or per-symbol reverse.
@@ -60,8 +66,8 @@ type OrderAck struct {
 // MassQuoteLegInput is one cancel-replace leg of a mass quote.
 type MassQuoteLegInput struct {
 	Side     Side
-	Price    float64
-	Quantity float64
+	Price    string
+	Quantity string
 	// CancelOrderID is the resting order to cancel-replace; nil/0 = pure place.
 	CancelOrderID *uint64
 	// TimeInForce defaults to GTC when empty.
@@ -74,8 +80,8 @@ type MassQuoteLegInput struct {
 // NewPrice / NewQuantity must be set.
 type BatchModifyLegInput struct {
 	OrderID     uint64
-	NewPrice    *float64
-	NewQuantity *float64
+	NewPrice    *string
+	NewQuantity *string
 }
 
 // MassQuoteLegResult is the outcome of one cancel-replace leg in a mass quote.
@@ -128,6 +134,7 @@ type BatchModifyAck struct {
 	Sequence string
 	Results  []BatchModifyLegResult
 }
+
 // TpslAck is the RPC reply for amend / cancel TP-SL (live feed remains TpslUpdate).
 type TpslAck struct {
 	CorrelationID uint64
@@ -140,10 +147,10 @@ type TpslAck struct {
 	RejectText    string
 }
 
-
 // OrderUpdate is a push frame describing a single order lifecycle event.
 type OrderUpdate struct {
 	OrderID       string
+	Account       string
 	UserUUID      string
 	SymbolID      int64
 	Side          Side
@@ -186,19 +193,20 @@ type PositionUpdate struct {
 // AccountMarginSummary is the authoritative account-level margin summary
 // (decimal string amounts).
 type AccountMarginSummary struct {
-	TotalCollateral      string
-	PositionMargin       string
-	ReservedOrderMargin  string
-	FreeCollateral       string
-	AccountEquity        string
-	UnrealizedPnl        string
-	CrossAvailable       string
-	RealizedPnl          string
+	TotalCollateral     string
+	PositionMargin      string
+	ReservedOrderMargin string
+	FreeCollateral      string
+	AccountEquity       string
+	UnrealizedPnl       string
+	CrossAvailable      string
+	RealizedPnl         string
 }
 
 // AccountMarginUpdate is an encrypted NodeResponse::AccountMarginUpdate (REST
 // snapshot or WS push).
 type AccountMarginUpdate struct {
+	OwnerAccount    string
 	UserUUID        string
 	ServerTimestamp uint64
 	Account         *AccountMarginSummary
@@ -239,6 +247,7 @@ type PositionRow struct {
 // PositionsSnapshot is the periodic / event-triggered authoritative view of
 // all open positions for the authenticated user.
 type PositionsSnapshot struct {
+	Account         string
 	UserUUID        string
 	Rows            []PositionRow
 	ServerTimestamp uint64
@@ -260,6 +269,7 @@ type SystemHealthUpdate struct {
 
 // BalanceUpdate is a push frame describing the user's collateral balance.
 type BalanceUpdate struct {
+	Account           string
 	UserUUID          string
 	BalanceRaw        uint64
 	Timestamp         uint64
@@ -325,6 +335,7 @@ type MarginAlert struct {
 	StateVersion     uint64
 	Recovered        bool
 }
+
 // FundingRateUpdate is a push frame describing per-symbol funding ticks.
 type FundingRateUpdate struct {
 	SymbolID        int64

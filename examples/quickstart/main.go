@@ -1,14 +1,22 @@
 // GoDark Go SDK -- Quickstart Example
 //
-// Place a limit sell, then cancel it. The minimal happy path against the
-// encrypted WebSocket trading client.
+// Place a limit sell, then cancel it. Connect mints a REST access token and
+// uses that token for the WebSocket login. Prices and sizes are strings.
+// ClientOrderID, if set, is registered only after this place succeeds and
+// only when POST /orders/_register_coid returns HTTP 200.
+//
+// Prices and sizes are decimal strings only (not float64). Pass literals such
+// as "81370" / "0.01", or format locally with strconv / math/big before calling
+// PlaceOrder.
 //
 // Reads credentials from `.env` (or the OS environment):
 //
 //	GODARK_API_KEY_ID=gdk_...
 //	GODARK_API_SECRET=...
 //	GODARK_PASSPHRASE=...
+//	GODARK_ACCOUNT=<Solana base58 account>
 //	# GODARK_EDGE_URL=...   (optional; default EnvironmentTestnet)
+//	# GODARK_E2E_PRICE=79000  (decimal-string mark for the demo limit)
 //
 // Run with:
 //
@@ -24,6 +32,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
@@ -32,13 +41,27 @@ import (
 
 const symbol = "BTC-USDC-PERP"
 
-func liveMarkPrice() float64 {
+// demoSellPrice returns a decimal-string limit ~3% above mark.
+func demoSellPrice() string {
+	mark := "79000"
 	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
-		if f, err := strconv.ParseFloat(raw, 64); err == nil {
-			return f
-		}
+		mark = strings.TrimSpace(raw)
 	}
-	return 79000.0
+	v, err := strconv.ParseFloat(mark, 64)
+	if err != nil {
+		return "81370"
+	}
+	return localDecimal(math.Round(v*1.03*10) / 10)
+}
+
+func localDecimal(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 8, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
+	}
+	return s
 }
 
 func main() {
@@ -50,6 +73,7 @@ func main() {
 	cfg := godark.ClientConfig{
 		Environment: godark.EnvironmentTestnet,
 		BaseURL:     baseURL,
+		Account:     envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT"),
 	}
 	if legacyKey != "" {
 		cfg.APIKey = legacyKey
@@ -79,21 +103,20 @@ func main() {
 		_ = client.Disconnect()
 	}()
 
-	fmt.Printf("Connected as user %s\n", client.UserUUID())
+	fmt.Printf("Connected as account %s\n", client.Account())
 
 	// Book confirmation waits on order-channel pushes; subscribe first.
 	if err := client.Subscribe(ctx, "orders"); err != nil {
 		log.Fatal(err)
 	}
 
-	mark := liveMarkPrice()
-	sellPx := math.Round(mark*1.03*10) / 10
+	sellPx := demoSellPrice()
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
-		Price:     sellPx,
-		Quantity:  0.01,
+		Price:     sellPx, // decimal string
+		Quantity:  "0.01",
 		Options:   godark.PlaceOrderOptions{PostOnly: true},
 		// Empty Confirmation => Book (waits for OPEN after subscribe).
 	})
@@ -101,7 +124,7 @@ func main() {
 		envloader.PrintOrderError("PlaceOrder", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %.1f, mark=%.1f)\n", ack.OrderID, sellPx, mark)
+	fmt.Printf("Place OK -- order_id=%s (limit SELL @ %s)\n", ack.OrderID, sellPx)
 
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)
@@ -113,5 +136,5 @@ func main() {
 	}
 	fmt.Printf("cancel_all OK -- count=%d ids=%v\n", cancelAck.Count, cancelAck.OrderIDs)
 
-	fmt.Println("Disconnected")
+	_ = cancelAck
 }

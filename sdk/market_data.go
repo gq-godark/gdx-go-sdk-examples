@@ -163,11 +163,19 @@ func ResolveMarketDataWsURL(baseURL string) string {
 // `channel:symbol` (mirrors Java/Python).
 func SubscriptionCallbackKey(msg map[string]any) string {
 	typ, _ := msg["type"].(string)
+	data, _ := msg["data"].(map[string]any)
+	// Live edge embeds the snapshot on the subscribe ack: {op, data:{type:"volume_snapshot"}}.
+	if typ == "" && data != nil {
+		typ, _ = data["type"].(string)
+	}
 	switch typ {
 	case "status", "subscribed", "unsubscribed", "pong", "error":
 		return ""
 	}
 	symbol, _ := msg["symbol"].(string)
+	if symbol == "" && data != nil {
+		symbol, _ = data["symbol"].(string)
+	}
 	switch typ {
 	case "orderbook":
 		return "orderbook:" + symbol
@@ -522,7 +530,11 @@ func (m *MarketDataClient) sendPublicSubscribe(ctx context.Context, channel stri
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		m.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 func (m *MarketDataClient) sendSubscribeFrame(ctx context.Context, channel, symbol string) error {
@@ -552,7 +564,11 @@ func (m *MarketDataClient) sendSubscribeFrame(ctx context.Context, channel, symb
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		m.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 func (m *MarketDataClient) sendUnsubscribeFrame(ctx context.Context, channel, symbol string) error {
@@ -575,7 +591,11 @@ func (m *MarketDataClient) sendUnsubscribeFrame(ctx context.Context, channel, sy
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		m.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 func (m *MarketDataClient) sendAction(ctx context.Context, action, channel, symbol string) error {
@@ -594,7 +614,11 @@ func (m *MarketDataClient) sendAction(ctx context.Context, action, channel, symb
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageText, b)
+	if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+		m.handleWriteError(ctx, conn, err)
+		return err
+	}
+	return nil
 }
 
 func (m *MarketDataClient) recvLoop() {
@@ -644,6 +668,28 @@ func (m *MarketDataClient) closeForStale(reason string) {
 	if conn != nil {
 		_ = conn.Close(websocket.StatusGoingAway, reason)
 	}
+}
+
+// closeForWriteFailure closes the socket so recvLoop exits and auto-reconnect
+// can run. Mirrors market-data write/ping failure → abort recv in the Rust SDK (#56).
+func (m *MarketDataClient) closeForWriteFailure(conn *websocket.Conn) {
+	m.connMu.Lock()
+	active := m.conn == conn && conn != nil
+	m.connMu.Unlock()
+	if !active {
+		return
+	}
+	_ = conn.Close(websocket.StatusGoingAway, "write failed")
+}
+
+func (m *MarketDataClient) handleWriteError(ctx context.Context, conn *websocket.Conn, err error) {
+	if err == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	m.closeForWriteFailure(conn)
 }
 
 func (m *MarketDataClient) emitError(err error) {
@@ -708,6 +754,10 @@ func (m *MarketDataClient) heartbeatLoop() {
 			err := conn.Write(pingCtx, websocket.MessageText, b)
 			cancel()
 			if err != nil {
+				// Same as stale path: wake recv so supervisor reconnects (#56).
+				if m.loopCtx.Err() == nil {
+					m.closeForWriteFailure(conn)
+				}
 				return
 			}
 		}
