@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -348,19 +349,38 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		return nil, err
 	}
 
-	// Best-effort: register the (client_order_id -> order_id) mapping post-
-	// decrypt. Failures must NOT invalidate the placed order; just log them
-	// by surfacing the order ack untouched. Matches python/rust.
+	// Register the (client_order_id -> order_id) mapping post-decrypt. The
+	// edge binds it to the place-header correlation id (non-zero decimal
+	// u128). A registration failure does not un-place the order: the ack is
+	// still returned so the caller can cancel by order id.
 	if req.ClientOrderID != "" && ack.Success && ack.OrderID != "" {
 		c.mu.Lock()
 		c.localCOIDIndex[req.ClientOrderID] = ack.OrderID
 		bearer := c.bearer
 		c.mu.Unlock()
-		if bearer != "" {
-			_, _ = c.http.RegisterClientOrderMapping(ctx, bearer, req.ClientOrderID, ack.OrderID)
+		corr := decimalCorrelationID(corrID)
+		if bearer == "" {
+			return ack, fmt.Errorf("placed %s; client_order_id registration skipped: not connected", ack.OrderID)
+		}
+		if _, err := c.http.RegisterClientOrderMapping(ctx, bearer, req.ClientOrderID, ack.OrderID, corr); err != nil {
+			return ack, fmt.Errorf("placed %s; client_order_id registration failed: %w", ack.OrderID, err)
 		}
 	}
 	return ack, nil
+}
+
+// decimalCorrelationID is the place-header correlation id as a non-zero
+// decimal string. Wire bytes are big-endian, matching the hex header the
+// edge parses as a u128.
+func decimalCorrelationID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	n := new(big.Int).SetBytes(raw)
+	if n.Sign() == 0 {
+		return ""
+	}
+	return n.String()
 }
 
 // CancelOrder sends an encrypted cancel via `DELETE /api/v1/orders/{id}`.
