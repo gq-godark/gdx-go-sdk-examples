@@ -19,14 +19,14 @@ const GCMTagLen = hpke.TagLen
 //
 // All methods are safe to call from multiple goroutines.
 type CryptoSession struct {
-	mu              sync.Mutex
-	sealed          *hpke.SealedSession
-	pendingSealed   *hpke.SealedSession
-	pendingConnID   uint64
-	connID          uint64
-	established     bool
-	sendCounter     uint64
-	seenRecvNonces  map[uint64]struct{}
+	mu             sync.Mutex
+	sealed         *hpke.SealedSession
+	pendingSealed  *hpke.SealedSession
+	pendingConnID  uint64
+	connID         uint64
+	established    bool
+	sendCounter    uint64
+	seenRecvNonces map[uint64]struct{}
 }
 
 // IsEstablished reports whether the HPKE session has completed setup.
@@ -70,17 +70,17 @@ func BodyLengthForPlaintext(plaintextLen int) (uint32, error) {
 // Setup performs HPKE Base setup against the pinned sequencer public key.
 // Returns the encapped key bytes to send in HpkeSetup. The session is not
 // established until Establish confirms the peer reply.
-func (s *CryptoSession) Setup(recipientPublic, userUUID []byte, connID uint64) ([]byte, error) {
+func (s *CryptoSession) Setup(recipientPublic, account []byte, connID uint64) ([]byte, error) {
 	if connID == 0 {
 		return nil, errors.New("HPKE conn_id must be non-zero")
 	}
-	if len(userUUID) != 16 {
-		return nil, errors.New("user UUID must be 16 bytes")
+	if len(account) != 32 {
+		return nil, errors.New("account must be 32 bytes")
 	}
 	if len(recipientPublic) != hpke.KeyLen {
 		return nil, errors.New("HPKE public key must be 32 bytes")
 	}
-	info := hpke.InfoForConn(userUUID, connID)
+	info := hpke.InfoForConn(account, connID)
 	enc, sealed, err := hpke.SetupSession(recipientPublic, info)
 	if err != nil {
 		return nil, err

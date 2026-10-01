@@ -163,11 +163,19 @@ func ResolveMarketDataWsURL(baseURL string) string {
 // `channel:symbol` (mirrors Java/Python).
 func SubscriptionCallbackKey(msg map[string]any) string {
 	typ, _ := msg["type"].(string)
+	data, _ := msg["data"].(map[string]any)
+	// Live edge embeds the snapshot on the subscribe ack: {op, data:{type:"volume_snapshot"}}.
+	if typ == "" && data != nil {
+		typ, _ = data["type"].(string)
+	}
 	switch typ {
 	case "status", "subscribed", "unsubscribed", "pong", "error":
 		return ""
 	}
 	symbol, _ := msg["symbol"].(string)
+	if symbol == "" && data != nil {
+		symbol, _ = data["symbol"].(string)
+	}
 	switch typ {
 	case "orderbook":
 		return "orderbook:" + symbol

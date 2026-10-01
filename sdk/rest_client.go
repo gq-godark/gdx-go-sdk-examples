@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,8 +46,11 @@ type RestClientConfig struct {
 	// `https://host`), then falls back to the default production URL.
 	BaseURL string
 
-	// UserUUID is a fallback when the auth response omits `user_uuid` (some
-	// local edges do this). Also read from `GODARK_USER_UUID` / `GDX_USER_UUID`.
+	// Account is a Solana base58 fallback for legacy local edges that omit the
+	// current account-bearing JWT subject.
+	Account string
+
+	// UserUUID is retained for source compatibility and legacy metadata only.
 	UserUUID string
 
 	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key for
@@ -77,13 +81,15 @@ type GodarkRestClient struct {
 	apiSecret   string
 	passphrase  string
 	baseURL     string
-	symbolMap   map[string]int64
-	http        *rest.Transport
-	hpkePinHex  string
-	fallback    string
+	symbolMap      map[string]int64
+	instrumentDecs map[string]InstrumentDecimals
+	http           *rest.Transport
+	hpkePinHex     string
+	fallback       string
 
 	mu             sync.RWMutex
 	bearer         string
+	account        string
 	userUUID       string
 	tokenScope     string
 	walletAddr     string
@@ -121,9 +127,10 @@ func NewRestClient(cfg RestClientConfig) (*GodarkRestClient, error) {
 		passphrase:     creds.passphrase,
 		baseURL:        base,
 		symbolMap:      symMap,
+		instrumentDecs: make(map[string]InstrumentDecimals),
 		http:           rest.New(base, cfg.HTTPClient),
 		hpkePinHex:     resolveRestHpkePin(cfg.HpkeStaticPublicKeyHex, env),
-		fallback:       resolveUserUUID(cfg.UserUUID),
+		fallback:       resolveAccount(cfg.Account),
 		localCOIDIndex: make(map[string]string),
 	}
 	c.nextRequestID.Store(1)
@@ -180,6 +187,13 @@ func (c *GodarkRestClient) UserUUID() string {
 	return c.userUUID
 }
 
+// Account returns the authenticated 32-byte Solana account as base58.
+func (c *GodarkRestClient) Account() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
+}
+
 // BearerToken returns the active bearer token (or "" if not connected).
 func (c *GodarkRestClient) BearerToken() string {
 	c.mu.RLock()
@@ -194,9 +208,8 @@ func (c *GodarkRestClient) TokenScope() string {
 	return c.tokenScope
 }
 
-// Connect authenticates REST requests via POST /api/v1/auth/token. User identity
-// is resolved from user_uuid in the auth response, constructor/env fallback, or
-// the JWT sub claim.
+// Connect authenticates REST requests via POST /api/v1/auth/token. The current
+// encrypted-wire account is resolved from the response, JWT sub, or fallback.
 func (c *GodarkRestClient) Connect(ctx context.Context) error {
 	var (
 		authData map[string]any
@@ -219,20 +232,20 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 		return newAuthenticationError("auth/token missing access_token/token")
 	}
 
-	uid, _ := authData["user_uuid"].(string)
-	uid = strings.TrimSpace(uid)
-	if uid == "" {
-		if parsed, ok := userUUIDFromAccessTokenJWT(bearer); ok {
-			uid = parsed
+	account, _ := authData["account"].(string)
+	account = strings.TrimSpace(account)
+	if account == "" {
+		if parsed, ok := accountFromAccessTokenJWT(bearer); ok {
+			account = parsed
 		}
 	}
-	if uid == "" {
-		uid = strings.TrimSpace(c.fallback)
+	if account == "" {
+		account = strings.TrimSpace(c.fallback)
 	}
-	if uid == "" {
+	if _, err := identity.AccountToBytes(account); err != nil {
 		return newAuthenticationError(
-			"REST auth succeeded but user_uuid missing in response, JWT sub, and no fallback " +
-				"provided via constructor or GODARK_USER_UUID / GDX_USER_UUID env vars",
+			"REST auth succeeded but account is missing or invalid; " +
+				"set RestClientConfig.Account or GODARK_ACCOUNT / GDX_ACCOUNT for a legacy local edge",
 		)
 	}
 
@@ -240,10 +253,15 @@ func (c *GodarkRestClient) Connect(ctx context.Context) error {
 
 	c.mu.Lock()
 	c.bearer = bearer
-	c.userUUID = uid
+	c.account = account
+	c.userUUID, _ = authData["user_uuid"].(string)
 	c.tokenScope = scope
 	c.mu.Unlock()
 
+	if err := c.refreshInstruments(ctx); err != nil {
+		// Soft-fail: keep embedded symbol map / default decimals for mocks.
+		_ = err
+	}
 	return nil
 }
 
@@ -258,6 +276,7 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.bearer = ""
+	c.account = ""
 	c.userUUID = ""
 	c.tokenScope = ""
 	c.walletAddr = ""
@@ -270,17 +289,22 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 // Trading
 // -----------------------------------------------------------------------
 
-// PlaceOrderRestRequest extends PlaceOrderRequest with an optional
-// ClientOrderID used by the REST routing index. The cleartext field is
-// additive: the encrypted body still carries the canonical order id once
-// the sequencer assigns one.
+// PlaceOrderRestRequest is a REST place. ClientOrderID is not registered:
+// this edge arms place correlation only for a WebSocket place, so
+// POST /orders/_register_coid after a REST forward returns 400. Set
+// PlaceOrderRequest.ClientOrderID on GodarkClient.PlaceOrder instead.
 type PlaceOrderRestRequest struct {
 	PlaceOrderRequest
+	// ClientOrderID is rejected by PlaceOrder. Kept so existing composite
+	// literals still compile; the edge does not store a REST-place mapping.
 	ClientOrderID string
 }
 
 // PlaceOrder sends an encrypted place via `POST /api/v1/orders`.
 func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestRequest) (*OrderAck, error) {
+	if strings.TrimSpace(req.ClientOrderID) != "" || strings.TrimSpace(req.PlaceOrderRequest.ClientOrderID) != "" {
+		return nil, errors.New("client_order_id registration requires a WebSocket place; REST forward does not arm place correlation on this edge")
+	}
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -297,17 +321,21 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 	}
 
 	corrID := newCorrelationID()
-	var pricePtr *float64
-	if req.Price != 0 {
+	var pricePtr *string
+	if req.Price != "" {
 		p := req.Price
 		pricePtr = &p
 	}
 
+	decimals, err := c.instrumentDecimals(req.Symbol)
+	if err != nil {
+		return nil, err
+	}
 	plaintext, err := BuildPlaceOrderRequest(
 		uint64(symbolID),
 		req.Side, req.OrderType,
 		req.Quantity,
-		c.userUUIDBytes(),
+		c.accountBytes(),
 		pricePtr,
 		tif,
 		req.AON,
@@ -315,30 +343,31 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		req.ExpiryTime,
 		corrID,
 		req.Options,
-		uint64(time.Now().UnixNano()),
+		decimals,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	ack, err := c.sendEncrypted(ctx, "place", uint64(symbolID), plaintext, corrID, req.ClientOrderID, "POST", "")
+	ack, err := c.sendEncrypted(ctx, "place", uint64(symbolID), plaintext, corrID, "", "POST", "")
 	if err != nil {
 		return nil, err
 	}
-
-	// Best-effort: register the (client_order_id -> order_id) mapping post-
-	// decrypt. Failures must NOT invalidate the placed order; just log them
-	// by surfacing the order ack untouched. Matches python/rust.
-	if req.ClientOrderID != "" && ack.Success && ack.OrderID != "" {
-		c.mu.Lock()
-		c.localCOIDIndex[req.ClientOrderID] = ack.OrderID
-		bearer := c.bearer
-		c.mu.Unlock()
-		if bearer != "" {
-			_, _ = c.http.RegisterClientOrderMapping(ctx, bearer, req.ClientOrderID, ack.OrderID)
-		}
-	}
 	return ack, nil
+}
+
+// decimalCorrelationID is the place-header correlation id as a non-zero
+// decimal string. Wire bytes are big-endian, matching the hex header the
+// edge parses as a u128.
+func decimalCorrelationID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	n := new(big.Int).SetBytes(raw)
+	if n.Sign() == 0 {
+		return ""
+	}
+	return n.String()
 }
 
 // CancelOrder sends an encrypted cancel via `DELETE /api/v1/orders/{id}`.
@@ -358,41 +387,41 @@ func (c *GodarkRestClient) CancelOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("CancelOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), corrID)
+	plaintext, err := BuildCancelOrderRequest(oid, c.accountBytes(), uint64(symbolID), corrID)
 	if err != nil {
 		return nil, err
 	}
 	return c.sendEncrypted(ctx, "cancel", uint64(symbolID), plaintext, corrID, "", "DELETE", orderID)
 }
 
-// CancelOrderByClientID resolves a client_order_id to a real order_id (local
-// index first, then `GET /api/v1/orders?client_order_id=`) and cancels.
+// CancelOrderByClientID resolves client_order_id with
+// GET /api/v1/orders?client_order_id= and cancels that order id.
+// The edge index is authoritative. A process-local entry is recorded only
+// after that GET returns HTTP 200 and is never used in place of the lookup.
 func (c *GodarkRestClient) CancelOrderByClientID(ctx context.Context, clientOrderID, symbol string) (*OrderAck, error) {
 	c.mu.RLock()
-	realID := c.localCOIDIndex[clientOrderID]
 	bearer := c.bearer
 	c.mu.RUnlock()
-	if realID == "" {
-		if bearer == "" {
-			return nil, newConnectionError("not connected")
-		}
-		row, err := c.http.GetOrderByClientOrderID(ctx, bearer, clientOrderID)
-		if err != nil {
-			return nil, fmt.Errorf("resolve client_order_id %q: %w", clientOrderID, err)
-		}
-		realID = resolveOrderIDFromLookup(row)
-		if realID == "" {
-			return nil, newOrderError(fmt.Sprintf("unknown client_order_id: %s", clientOrderID), "")
-		}
-		c.mu.Lock()
-		c.localCOIDIndex[clientOrderID] = realID
-		c.mu.Unlock()
+	if bearer == "" {
+		return nil, newConnectionError("not connected")
 	}
+	row, err := c.http.GetOrderByClientOrderID(ctx, bearer, clientOrderID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve client_order_id %q: %w", clientOrderID, err)
+	}
+	realID := resolveOrderIDFromLookup(row)
+	if realID == "" {
+		return nil, newOrderError(fmt.Sprintf("unknown client_order_id: %s", clientOrderID), "")
+	}
+	c.mu.Lock()
+	c.localCOIDIndex[clientOrderID] = realID
+	c.mu.Unlock()
 	return c.CancelOrder(ctx, realID, symbol)
 }
 
 // ModifyOrder sends an encrypted modify via `PATCH /api/v1/orders/{id}`.
-func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
+// Price/size args are decimal strings.
+func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *string) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -411,7 +440,11 @@ func (c *GodarkRestClient) ModifyOrder(ctx context.Context, orderID, symbol stri
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -566,6 +599,47 @@ func (c *GodarkRestClient) GetVolume(ctx context.Context) (map[string]any, error
 	return c.http.GetVolume(ctx)
 }
 
+// GetTime calls `GET /api/v1/time` (public; Connect not required).
+func (c *GodarkRestClient) GetTime(ctx context.Context) (map[string]any, error) {
+	return c.http.TimePublic(ctx)
+}
+
+// GetInstruments calls `GET /api/v1/instruments` (public; Connect not required).
+// Connect also refreshes the local symbol map and decimal scales from this endpoint.
+func (c *GodarkRestClient) GetInstruments(ctx context.Context) (map[string]any, error) {
+	return c.http.GetInstruments(ctx)
+}
+
+func (c *GodarkRestClient) refreshInstruments(ctx context.Context) error {
+	data, err := c.http.GetInstruments(ctx)
+	if err != nil {
+		return fmt.Errorf("load instruments: %w", err)
+	}
+	symMap, decs, err := parseInstrumentsPayload(data)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(symMap) > 0 {
+		c.symbolMap = symMap
+	}
+	c.instrumentDecs = decs
+	return nil
+}
+
+func (c *GodarkRestClient) instrumentDecimals(symbol string) (InstrumentDecimals, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if d, ok := c.instrumentDecs[symbol]; ok {
+		return d, nil
+	}
+	if len(c.instrumentDecs) == 0 {
+		return DefaultInstrumentDecimals, nil
+	}
+	return InstrumentDecimals{}, fmt.Errorf("missing instrument decimals for %q", symbol)
+}
+
 // GetOpenOrders returns live open orders via encrypted POST /api/v1/openOrders.
 func (c *GodarkRestClient) GetOpenOrders(ctx context.Context) (*OpenOrdersSnapshot, error) {
 	variant, err := c.snapshotRPC(ctx, "get_open_orders", BuildGetOpenOrdersRequest, "/api/v1/openOrders")
@@ -612,7 +686,11 @@ func (c *GodarkRestClient) MassQuote(ctx context.Context, symbol string, legs []
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +711,7 @@ func (c *GodarkRestClient) BatchCancel(ctx context.Context, symbol string, order
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.accountBytes(), orderIDs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +732,11 @@ func (c *GodarkRestClient) BatchModify(ctx context.Context, symbol string, legs 
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -682,7 +764,7 @@ func (c *GodarkRestClient) UpdateLeverage(ctx context.Context, symbol string, le
 	}
 
 	corrID := newCorrelationID()
-	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	plaintext, err := BuildUpdateLeverageRequest(c.accountBytes(), uint64(symbolID), lev, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -760,13 +842,13 @@ func (c *GodarkRestClient) pinnedRecipient() ([]byte, error) {
 	return hpke.ParsePinnedStaticPublicKey(pin)
 }
 
-func (c *GodarkRestClient) setupRESTSession(userUUID []byte) (uint64, []byte, *hpke.SealedSession, error) {
+func (c *GodarkRestClient) setupRESTSession(account []byte) (uint64, []byte, *hpke.SealedSession, error) {
 	recipient, err := c.pinnedRecipient()
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	requestID := c.nextRequestID.Add(1) - 1
-	info := hpke.InfoForRESTRequest(userUUID, requestID)
+	info := hpke.InfoForRESTRequest(account, requestID)
 	encapped, sealed, err := hpke.SetupSession(recipient, info)
 	if err != nil {
 		return 0, nil, nil, newEncryptionError(fmt.Sprintf("HPKE setup: %v", err))
@@ -783,15 +865,15 @@ func (c *GodarkRestClient) sendEncryptedEnvelope(
 	clientOrderID string,
 	headerLeverage *int,
 ) (*hpke.SealedSession, map[string]any, error) {
-	userUUID := c.userUUIDBytes()
-	requestID, encapped, sealed, err := c.setupRESTSession(userUUID)
+	account := c.accountBytes()
+	requestID, encapped, sealed, err := c.setupRESTSession(account)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	const nonce = uint64(0)
 	bodyLength := uint32(len(plaintext) + gdxcrypto.GCMTagLen)
-	aad, err := BuildOrderHeaderAAD(userUUID, symbolID, requestType, nonce, bodyLength, correlationID)
+	aad, err := BuildOrderHeaderAAD(account, symbolID, requestType, nonce, bodyLength, correlationID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -883,7 +965,7 @@ func (c *GodarkRestClient) snapshotRPC(
 	path string,
 ) (*NodeResponseVariant, error) {
 	corrID := newCorrelationID()
-	plaintext, err := build(c.userUUIDBytes(), corrID)
+	plaintext, err := build(c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -948,7 +1030,7 @@ func (c *GodarkRestClient) decryptRestPlaintext(msg map[string]any, sealed *hpke
 		messageType = "ack"
 	}
 	aad, err := BuildResponseHeaderAAD(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]),
 	)
 	if err != nil {
@@ -1109,13 +1191,13 @@ func resolveOrderIDFromLookup(row map[string]any) string {
 func (c *GodarkRestClient) ensureReady() error {
 	c.mu.RLock()
 	bearer := c.bearer
-	uid := c.userUUID
+	account := c.account
 	hpkePin := c.hpkePinHex
 	c.mu.RUnlock()
 	if bearer == "" {
 		return newConnectionError("not connected: call Connect first")
 	}
-	if uid == "" {
+	if account == "" {
 		return newConnectionError("not authenticated")
 	}
 	if strings.TrimSpace(hpkePin) == "" {
@@ -1124,16 +1206,16 @@ func (c *GodarkRestClient) ensureReady() error {
 	return nil
 }
 
-func (c *GodarkRestClient) userUUIDBytes() []byte {
+func (c *GodarkRestClient) accountBytes() []byte {
 	c.mu.RLock()
-	uid := c.userUUID
+	account := c.account
 	c.mu.RUnlock()
-	if uid == "" {
-		return make([]byte, identity.UserUUIDLen)
+	if account == "" {
+		return make([]byte, identity.AccountLen)
 	}
-	b, err := identity.ToBytes(uid)
+	b, err := identity.AccountToBytes(account)
 	if err != nil {
-		return make([]byte, identity.UserUUIDLen)
+		return make([]byte, identity.AccountLen)
 	}
 	return b
 }

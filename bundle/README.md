@@ -3,11 +3,13 @@
 This package provides the GoDark Go SDK and minimal examples for encrypted
 darkpool trading.
 
-Supported order types in this distribution: `MARKET`, `LIMIT`.
+Order types: `MARKET`, `LIMIT`, `PEG`, `STOP_MARKET`, `STOP_LIMIT`.
+`SlippageBps` is valid only on `MARKET` and `STOP_MARKET`. `PEG` cannot be
+combined with post-only. Prices and sizes are decimal Go strings.
 
 ## Package contents
 
-- `examples/` — `quickstart` and `full_trader_example` sources
+- `examples/` — `quickstart`, `full_trader_example`, and `rest_client_example` sources
 - `sdk/` — bundled `godark` module
 - `go.mod`, `go.sum` — workspace manifest for `go build ./examples/...`
 - `README.md`, `SDK_REFERENCE.md` — recipient docs
@@ -31,21 +33,23 @@ Supported order types in this distribution: `MARKET`, `LIMIT`.
 
 ## 3) Configure environment
 
-Copy `.env.example` to `.env` and set:
+Copy `.env.example` to `.env`. Set values only in that file or the process
+environment. This README names the variables and does not include secrets.
+
+Required for hosted key-pair auth:
 
 - `GODARK_API_KEY_ID`
 - `GODARK_API_SECRET`
-- `GODARK_PASSPHRASE` — required for API key-pair auth.
+- `GODARK_PASSPHRASE`
 
-```bash
-cp .env.example .env
-$EDITOR .env       # fill in your testnet creds
-```
+Optional:
 
-Optional override:
-
-- `GODARK_EDGE_URL` — override the edge URL (default: public testnet `wss://api.godark-dex.com` via the SDK Testnet environment preset).
-`- `GDX_HPKE_STATIC_PUBLIC_KEY` — sequencer HPKE static public key (64 hex). Required for localnet/devnet Aliases: `GDX_HPKE_STATIC_PUBKEY`, `GODARK_HPKE_STATIC_PUBLIC_KEY`, `VITE_GDX_HPKE_STATIC_PUBKEY`.
+- `GODARK_EDGE_URL` — WebSocket origin. Empty uses the testnet preset.
+- `GODARK_REST_URL` — REST origin. Empty is derived from the edge host.
+- `GODARK_ACCOUNT` — Solana account fallback when an older edge omits it.
+- `GDX_HPKE_STATIC_PUBLIC_KEY` — sequencer HPKE pin. Required on localnet;
+  testnet and devnet pins are baked in. Aliases: `GDX_HPKE_STATIC_PUBKEY`,
+  `GODARK_HPKE_STATIC_PUBLIC_KEY`, `VITE_GDX_HPKE_STATIC_PUBKEY`.
 
 The OS environment always wins over `.env`.
 
@@ -56,6 +60,7 @@ From inside the unzipped bundle:
 ```bash
 go build ./examples/quickstart            # produces ./quickstart
 go build ./examples/full_trader_example   # produces ./full_trader_example
+go build ./examples/rest_client_example   # produces ./rest_client_example
 ```
 
 Then run either binary:
@@ -63,6 +68,7 @@ Then run either binary:
 ```bash
 ./quickstart
 ./full_trader_example
+./rest_client_example
 ```
 
 The bundled `go.mod` resolves `godark` from `./sdk`.
@@ -85,13 +91,26 @@ replace github.com/gq-godark/gdx-go-sdk => ./vendor/godark/sdk
 (Or copy `sdk/` into your own project and reference it as
 `replace ... => ./sdk`.)
 
-Then in `cmd/bot/main.go`:
+Key-pair clients mint `POST /api/v1/auth/token` and log in on `/ws/v1` with
+that REST `access_token`. The key id, secret, and passphrase are not the
+WebSocket login token.
+
+`/ws/v1` subscribe channels are `orders`, `positions`, `volume`,
+`open_interest`, and `funding_rate`. An unknown channel (including `trades`)
+returns an error on the subscribe waiter instead of waiting out the command
+timeout. There is no trades channel on `/ws/v1`.
+
+`Price`, `Quantity`, and the other price/size fields are Go `string` values.
+`ClientOrderID` is sent to `POST /orders/_register_coid` only after a
+successful WebSocket place, and only a HTTP 200 response counts as
+registered. A REST place does not register a client-order id.
 
 ```go
 package main
 
 import (
     "context"
+    "fmt"
     "log"
     "os"
 
@@ -99,27 +118,53 @@ import (
 )
 
 func main() {
-    client, err := godark.NewClient(godark.ClientConfig{
+    ctx := context.Background()
+
+    rest, err := godark.NewRestClient(godark.RestClientConfig{
         APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
         APISecret:  os.Getenv("GODARK_API_SECRET"),
         Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+        BaseURL:    os.Getenv("GODARK_REST_URL"),
     })
     if err != nil {
         log.Fatal(err)
     }
+    if err := rest.Connect(ctx); err != nil { // REST auth/token
+        log.Fatal(err)
+    }
+    defer rest.Disconnect(ctx)
 
-    ctx := context.Background()
-    if err := client.Connect(ctx); err != nil {
+    pos, err := rest.GetPositions(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("positions=%d\n", len(pos.Rows))
+
+    client, err := godark.NewClient(godark.ClientConfig{
+        APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+        APISecret:  os.Getenv("GODARK_API_SECRET"),
+        Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+        BaseURL:    os.Getenv("GODARK_EDGE_URL"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := client.Connect(ctx); err != nil { // WS login uses the REST access token
         log.Fatal(err)
     }
     defer client.Disconnect()
 
+    if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
+        log.Fatal(err)
+    }
+
     ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
-        Symbol:    "BTC-USDC-PERP",
-        Side:      godark.SideSell,
-        OrderType: godark.OrderTypeLimit,
-        Price:     999_999,
-        Quantity:  0.01,
+        Symbol:        "BTC-USDC-PERP",
+        Side:          godark.SideSell,
+        OrderType:     godark.OrderTypeLimit,
+        Price:         "999999",
+        Quantity:      "0.01",
+        ClientOrderID: "demo-coid-1",
     })
     if err != nil {
         log.Fatal(err)
@@ -130,5 +175,8 @@ func main() {
     }
 }
 ```
+
+`SlippageBps` belongs only on `MARKET` and `STOP_MARKET`. Do not set post-only
+on a `PEG` order.
 
 See `SDK_REFERENCE.md` for the full client API.

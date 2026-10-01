@@ -31,11 +31,10 @@ package name" rule).
 
 ## Constructors
 
-Trading runs over the encrypted WebSocket `GodarkClient`, which uses
-**HPKE** (pin the sequencer static public key — see Configuration in
-`README.md` / `.env.example`). A read-only `MarketDataClient` is also
-available for public market data. (Encrypted REST trading is not
-supported — see the note below.)
+Trading is available through the encrypted WebSocket `GodarkClient` and the
+one-shot HPKE `GodarkRestClient` (pin the sequencer static public key — see
+Configuration in `README.md` / `.env.example`). A read-only
+`MarketDataClient` is also available for streaming public market data.
 
 ### Encrypted WebSocket trading -- `GodarkClient`
 
@@ -56,40 +55,67 @@ Lifecycle:
 
 ```go
 ctx := context.Background()
-if err := client.Connect(ctx); err != nil { ... }   // login + HPKE setup handshake
+if err := client.Connect(ctx); err != nil { ... }   // REST access_token, then WS login + HPKE
 defer client.Disconnect()
 
-uid := client.UserUUID()
+account := client.Account() // authenticated Solana account, base58
 ```
 
-> **Encrypted REST trading is not supported.** Earlier builds shipped a
-> `GodarkRestClient` that placed orders over HTTP; that path is retired.
-> All order flow — place / modify / cancel / mass-quote — now runs over the
-> HPKE WebSocket `GodarkClient` shown above. The examples in this bundle
-> trade exclusively over the WebSocket client.
+### One-shot encrypted REST -- `GodarkRestClient`
+
+`GodarkRestClient` authenticates with the same credentials and encrypts each
+private request with a separate HPKE setup:
+
+```go
+restClient, err := godark.NewRestClient(godark.RestClientConfig{
+    APIKeyID:   os.Getenv("GODARK_API_KEY_ID"),
+    APISecret:  os.Getenv("GODARK_API_SECRET"),
+    Passphrase: os.Getenv("GODARK_PASSPHRASE"),
+    Account:    os.Getenv("GODARK_ACCOUNT"),
+    BaseURL:    os.Getenv("GODARK_REST_URL"),
+})
+if err != nil { ... }
+if err := restClient.Connect(ctx); err != nil { ... }
+defer restClient.Disconnect(ctx)
+
+fmt.Printf("connected account=%s\n", restClient.Account())
+```
+
+Key-pair `Connect` on `GodarkClient` calls `POST /api/v1/auth/token` and sends
+the returned `access_token` as the WebSocket login token.
+
+The REST client supports place / modify / cancel, mass-quote, batch cancel /
+modify, leverage updates, encrypted open-order / position / account snapshots,
+authenticated order / profile / balance / leverage reads, and public
+funding-rate / open-interest / volume reads. REST place does not register a
+client-order id: the edge arms that correlation only for a WebSocket place.
+Setting `ClientOrderID` on `PlaceOrderRestRequest` returns an error. After a
+successful WebSocket place, the SDK calls `POST /orders/_register_coid` and
+treats the id as registered only when that call returns HTTP 200.
+
+REST has no private push streams, subscriptions, automatic reconnect, or
+persistent HPKE session. Use `GodarkClient` for live private updates and
+subscription replay. `Account` / `GODARK_ACCOUNT` is a fallback for legacy
+edges that omit the authenticated Solana account; `UserUUID` remains
+compatibility metadata and is not used for encrypted request identity.
 
 ### Public market-data feed -- `MarketDataClient`
 
+Hosted market data defaults to `/ws/v1`. Public channels there are `volume`,
+`open_interest`, and `funding_rate`. There is no `trades` channel on
+`/ws/v1`. `SubscribeOrderbook` is rejected on that path. An unknown channel
+fails the subscribe call immediately.
+
 ```go
 md := godark.NewMarketDataClient(godark.MarketDataConfig{
-    BaseURL: os.Getenv("GODARK_EDGE_URL"), // same host; appends /ws/gomarket
+    BaseURL: os.Getenv("GODARK_EDGE_URL"), // default path /ws/v1
 })
 if err := md.Connect(ctx); err != nil { ... }
 defer md.Disconnect()
 
-_ = md.SubscribeOrderbook(ctx, "BTC-USDC-PERP", func(m godark.MarketDataMessage) {
-    // m.Channel == "orderbook", m.Raw["bids"] / m.Raw["asks"]
-})
-_ = md.SubscribeTrades(ctx, "BTC-USDC-PERP", func(m godark.MarketDataMessage) {
-    // m.Channel == "trades", m.Raw["price"] / m.Raw["qty"]
-})
-```
-
-Channel-first delivery is also supported:
-
-```go
-for msg := range md.OrderbookEvents() { ... }
-for msg := range md.TradesEvents()    { ... }
+_ = md.SubscribePublicChannel(ctx, "volume", nil)
+_ = md.SubscribePublicChannel(ctx, "open_interest", nil)
+_ = md.SubscribePublicChannel(ctx, "funding_rate", nil)
 ```
 
 ## Trading commands
@@ -102,8 +128,8 @@ ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
     Symbol:      "BTC-USDC-PERP",
     Side:        godark.SideBuy,                // SideBuy | SideSell
     OrderType:   godark.OrderTypeLimit,         // OrderTypeMarket | OrderTypeLimit
-    Quantity:    0.1,
-    Price:       67_500,                        // required for LIMIT
+    Quantity:    "0.1",
+    Price:       "67500",                       // required for LIMIT (decimal string)
     TimeInForce: godark.TimeInForceGTC,
 })
 // ack.OrderID -- decimal string, the assigned sequencer order id
@@ -112,10 +138,26 @@ ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 
 cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 
-newPrice := 68_000.0
+newPrice := "68000"
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
-    &newPrice, /*newQuantity*/ nil)
+    &newPrice, /*newQuantity*/ nil, /*newTriggerPrice*/ nil)
 ```
+
+**Rule:** prices and sizes on place/modify/mass-quote/batch-modify/TP-SL
+(including `QuoteNotional`, min fill, and trigger) are decimal `string` /
+`*string` only — not `float64` / int. Pass literals (`"67500"`, `"0.1"`) or
+format locally; the SDK has no float→string helper on the trading path.
+`PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`,
+`PostOnly`, `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`,
+`StopLossPrice`, `SlippageBps`, and `QuoteNotional`. `SlippageBps` is accepted
+only on `MARKET` and `STOP_MARKET`. Omit it (nil) to use the venue max walk
+cap. `PEG` (`PegOffsetBps`) is incompatible with post-only. Set
+`ClientOrderID` only on the WebSocket place; registration runs after that
+place succeeds and counts only on HTTP 200 from `POST /orders/_register_coid`.
+
+Encrypted headers, HPKE info, command bodies, and private pushes use the
+32-byte Solana account returned by login. `ClientConfig.Account` /
+`GODARK_ACCOUNT` is only a fallback for older local edges that omit it.
 
 ## Push streams (encrypted WS only)
 
@@ -142,8 +184,12 @@ client.OnDisconnect(func()              { ... }) // WS closed (any reason)
 client.OnReconnect(func()               { ... }) // automatic reconnect succeeded
 ```
 
-Subscribe to channels with `client.Subscribe(ctx, "orders", "positions")`.
-The SDK replays those subscriptions after an automatic reconnect.
+Subscribe with `client.Subscribe(ctx, "orders", "positions")`. The `/ws/v1`
+channel set is `orders`, `positions`, `volume`, `open_interest`, and
+`funding_rate`. An unknown name, including `trades`, returns an error on the
+subscribe waiter. The SDK replays remembered subscriptions after an automatic
+reconnect. Read positions from `PositionsSnapshots` after subscribing to
+`positions`, or from `GodarkRestClient.GetPositions`.
 
 Default transport heartbeat settings: ping every `30s`, absolute stale timeout
 `120s`, missed-heartbeat limit `2` consecutive intervals without inbound traffic.
