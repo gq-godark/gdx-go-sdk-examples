@@ -127,7 +127,6 @@ func main() {
 			Symbol: "BTC-USDC-PERP", Side: "BUY", OrderType: "LIMIT",
 			Quantity: "0.01", Price: limitPrice,
 		},
-		ClientOrderID: "sdk-go-rest-demo",
 	})
 	if err != nil {
 		log.Fatal(err)

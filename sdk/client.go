@@ -560,6 +560,12 @@ type PlaceOrderRequest struct {
 	// Ack returns on the sequencer fast ack; Book waits for a definitive
 	// order update and returns OrderError on REJECTED.
 	Confirmation PlaceOrderConfirmation
+	// ClientOrderID is registered with the edge after this WebSocket place
+	// succeeds. The edge arms place correlation only on the WebSocket path,
+	// so the same id on a REST place is not registered. Registration is
+	// stored only when POST /orders/_register_coid returns HTTP 200; a 400
+	// is returned with the order ack and is not cached locally.
+	ClientOrderID string
 }
 
 // PlaceOrder sends an encrypted place command and waits for its fast ack.
@@ -629,21 +635,49 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		c.cancelPlaceOutcomeWaiter(waiter)
 		return nil, err
 	}
-	if waiter == nil {
-		return ack, nil
-	}
-	update, err := c.awaitPlaceOutcome(ctx, ack.OrderID, waiter)
-	if err != nil {
-		return nil, err
-	}
-	if update.UpdateType == OrderUpdateTypeRejected || update.Status == OrderStatusRejected {
-		if numeric, parseErr := strconv.ParseInt(update.RejectReason, 10, 32); parseErr == nil {
-			code := int32(numeric)
-			return nil, MakeOrderErrorFromCode(&code, update.Msg)
+	if waiter != nil {
+		update, waitErr := c.awaitPlaceOutcome(ctx, ack.OrderID, waiter)
+		if waitErr != nil {
+			return nil, waitErr
 		}
-		return nil, MakeOrderErrorFromJSON(update.Msg, update.RejectReason)
+		if update.UpdateType == OrderUpdateTypeRejected || update.Status == OrderStatusRejected {
+			if numeric, parseErr := strconv.ParseInt(update.RejectReason, 10, 32); parseErr == nil {
+				code := int32(numeric)
+				return nil, MakeOrderErrorFromCode(&code, update.Msg)
+			}
+			return nil, MakeOrderErrorFromJSON(update.Msg, update.RejectReason)
+		}
+	}
+	if err := c.registerPlacedClientOrder(ctx, req.ClientOrderID, ack, corrID); err != nil {
+		return ack, err
 	}
 	return ack, nil
+}
+
+// registerPlacedClientOrder binds clientOrderID to the sequencer order id
+// on the edge. The correlation is the WebSocket place header (decimal u128).
+// The edge stores the mapping only for a correlation armed by that place.
+// A non-200 response is returned; nothing is treated as registered until
+// POST /orders/_register_coid succeeds.
+func (c *GodarkClient) registerPlacedClientOrder(ctx context.Context, clientOrderID string, ack *OrderAck, corrID []byte) error {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return nil
+	}
+	if ack == nil || !ack.Success || ack.OrderID == "" {
+		return fmt.Errorf("client_order_id %q not registered: place did not return an order id", clientOrderID)
+	}
+	c.mu.RLock()
+	bearer := c.authToken
+	c.mu.RUnlock()
+	if bearer == "" {
+		return fmt.Errorf("placed %s; client_order_id registration failed: not connected", ack.OrderID)
+	}
+	tr := rest.New(restOriginFromEdgeURL(c.baseURL), c.httpClient)
+	if _, err := tr.RegisterClientOrderMapping(ctx, bearer, clientOrderID, ack.OrderID, decimalCorrelationID(corrID)); err != nil {
+		return fmt.Errorf("placed %s; client_order_id registration failed: %w", ack.OrderID, err)
+	}
+	return nil
 }
 
 // CancelOrder sends an encrypted cancel command and waits for its ack.

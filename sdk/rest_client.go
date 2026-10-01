@@ -289,17 +289,22 @@ func (c *GodarkRestClient) Disconnect(ctx context.Context) error {
 // Trading
 // -----------------------------------------------------------------------
 
-// PlaceOrderRestRequest extends PlaceOrderRequest with an optional
-// ClientOrderID used by the REST routing index. The cleartext field is
-// additive: the encrypted body still carries the canonical order id once
-// the sequencer assigns one.
+// PlaceOrderRestRequest is a REST place. ClientOrderID is not registered:
+// this edge arms place correlation only for a WebSocket place, so
+// POST /orders/_register_coid after a REST forward returns 400. Set
+// PlaceOrderRequest.ClientOrderID on GodarkClient.PlaceOrder instead.
 type PlaceOrderRestRequest struct {
 	PlaceOrderRequest
+	// ClientOrderID is rejected by PlaceOrder. Kept so existing composite
+	// literals still compile; the edge does not store a REST-place mapping.
 	ClientOrderID string
 }
 
 // PlaceOrder sends an encrypted place via `POST /api/v1/orders`.
 func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestRequest) (*OrderAck, error) {
+	if strings.TrimSpace(req.ClientOrderID) != "" || strings.TrimSpace(req.PlaceOrderRequest.ClientOrderID) != "" {
+		return nil, errors.New("client_order_id registration requires a WebSocket place; REST forward does not arm place correlation on this edge")
+	}
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -344,27 +349,9 @@ func (c *GodarkRestClient) PlaceOrder(ctx context.Context, req PlaceOrderRestReq
 		return nil, err
 	}
 
-	ack, err := c.sendEncrypted(ctx, "place", uint64(symbolID), plaintext, corrID, req.ClientOrderID, "POST", "")
+	ack, err := c.sendEncrypted(ctx, "place", uint64(symbolID), plaintext, corrID, "", "POST", "")
 	if err != nil {
 		return nil, err
-	}
-
-	// Register the (client_order_id -> order_id) mapping post-decrypt. The
-	// edge binds it to the place-header correlation id (non-zero decimal
-	// u128). A registration failure does not un-place the order: the ack is
-	// still returned so the caller can cancel by order id.
-	if req.ClientOrderID != "" && ack.Success && ack.OrderID != "" {
-		c.mu.Lock()
-		c.localCOIDIndex[req.ClientOrderID] = ack.OrderID
-		bearer := c.bearer
-		c.mu.Unlock()
-		corr := decimalCorrelationID(corrID)
-		if bearer == "" {
-			return ack, fmt.Errorf("placed %s; client_order_id registration skipped: not connected", ack.OrderID)
-		}
-		if _, err := c.http.RegisterClientOrderMapping(ctx, bearer, req.ClientOrderID, ack.OrderID, corr); err != nil {
-			return ack, fmt.Errorf("placed %s; client_order_id registration failed: %w", ack.OrderID, err)
-		}
 	}
 	return ack, nil
 }
@@ -407,29 +394,28 @@ func (c *GodarkRestClient) CancelOrder(ctx context.Context, orderID, symbol stri
 	return c.sendEncrypted(ctx, "cancel", uint64(symbolID), plaintext, corrID, "", "DELETE", orderID)
 }
 
-// CancelOrderByClientID resolves a client_order_id to a real order_id (local
-// index first, then `GET /api/v1/orders?client_order_id=`) and cancels.
+// CancelOrderByClientID resolves client_order_id with
+// GET /api/v1/orders?client_order_id= and cancels that order id.
+// The edge index is authoritative. A process-local entry is recorded only
+// after that GET returns HTTP 200 and is never used in place of the lookup.
 func (c *GodarkRestClient) CancelOrderByClientID(ctx context.Context, clientOrderID, symbol string) (*OrderAck, error) {
 	c.mu.RLock()
-	realID := c.localCOIDIndex[clientOrderID]
 	bearer := c.bearer
 	c.mu.RUnlock()
-	if realID == "" {
-		if bearer == "" {
-			return nil, newConnectionError("not connected")
-		}
-		row, err := c.http.GetOrderByClientOrderID(ctx, bearer, clientOrderID)
-		if err != nil {
-			return nil, fmt.Errorf("resolve client_order_id %q: %w", clientOrderID, err)
-		}
-		realID = resolveOrderIDFromLookup(row)
-		if realID == "" {
-			return nil, newOrderError(fmt.Sprintf("unknown client_order_id: %s", clientOrderID), "")
-		}
-		c.mu.Lock()
-		c.localCOIDIndex[clientOrderID] = realID
-		c.mu.Unlock()
+	if bearer == "" {
+		return nil, newConnectionError("not connected")
 	}
+	row, err := c.http.GetOrderByClientOrderID(ctx, bearer, clientOrderID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve client_order_id %q: %w", clientOrderID, err)
+	}
+	realID := resolveOrderIDFromLookup(row)
+	if realID == "" {
+		return nil, newOrderError(fmt.Sprintf("unknown client_order_id: %s", clientOrderID), "")
+	}
+	c.mu.Lock()
+	c.localCOIDIndex[clientOrderID] = realID
+	c.mu.Unlock()
 	return c.CancelOrder(ctx, realID, symbol)
 }
 
