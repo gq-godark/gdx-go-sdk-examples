@@ -720,6 +720,30 @@ func (t *Transport) rejectPending(err error) {
 	t.subMu.Unlock()
 }
 
+// failSubscribeIfWaiting completes an in-flight subscribe/unsubscribe when
+// the edge rejects the channel with a bare error frame. Command rejects
+// include wire_id and are left for the command waiter.
+func (t *Transport) failSubscribeIfWaiting(msg Message) bool {
+	if wireID, _ := msg["wire_id"].(string); wireID != "" {
+		return false
+	}
+	t.subMu.Lock()
+	defer t.subMu.Unlock()
+	if t.subWaiter == nil {
+		return false
+	}
+	errMsg, _ := msg["message"].(string)
+	if errMsg == "" {
+		errMsg = "channel error"
+	}
+	select {
+	case t.subWaiter <- errors.New(errMsg):
+	default:
+	}
+	t.subWaiter = nil
+	return true
+}
+
 // recvLoop reads messages from the WS, normalizes them, and dispatches.
 func (t *Transport) recvLoop(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc) {
 	defer t.wg.Done()
@@ -832,7 +856,20 @@ func (t *Transport) dispatch(msg Message) {
 			t.handler.OnEncryptedPush(msg)
 		}
 		return
-	case "ack", "error":
+	case "ack":
+		t.pendingMu.Lock()
+		t.resolveLocked(msg)
+		t.pendingMu.Unlock()
+		return
+	case "error":
+		// Hosted edges reject an unknown channel with a bare
+		// `{type:"error", message:"invalid subscribe: ..."}` frame (no op,
+		// no wire id). Command rejects carry wire_id and must stay on the
+		// command waiter. Leaving the bare frame on the command path makes
+		// Subscribe wait until CommandTimeout.
+		if t.failSubscribeIfWaiting(msg) {
+			return
+		}
 		t.pendingMu.Lock()
 		t.resolveLocked(msg)
 		t.pendingMu.Unlock()
