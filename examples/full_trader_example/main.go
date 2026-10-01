@@ -3,10 +3,13 @@
 // Demonstrates:
 //
 //  1. Load credentials from `.env` / environment.
-//  2. Connect and authenticate (HPKE WebSocket session).
+//  2. Connect: REST access token, then WebSocket login and HPKE.
 //  3. Wire up channel-first push receivers (order / position / health / etc.).
 //  4. Subscribe to the private order + position channels.
-//  5. Place, modify, and cancel `MARKET` / `LIMIT` orders.
+//  5. Place, modify, and cancel orders. Prices and sizes are decimal strings.
+//     SlippageBps is only for MARKET and STOP_MARKET. PEG is incompatible
+//     with post-only. ClientOrderID is registered only after a successful
+//     WebSocket place and only when POST /orders/_register_coid returns 200.
 //  6. Drain queued updates between actions.
 //  7. Print a session summary including per-stream counts.
 //  8. Clean disconnect.
@@ -35,6 +38,19 @@ import (
 
 const symbol = "BTC-USDC-PERP"
 
+
+// dec formats a local float for demo math. The godark trading API accepts
+// only decimal strings — prefer literals like "78763" / "0.1" in production.
+func dec(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 8, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
+	}
+	return s
+}
+
 func liveMarkPrice() float64 {
 	if raw := envloader.First("GODARK_E2E_PRICE", "GDX_E2E_PRICE", "GDX_LIVE_PRICE"); raw != "" {
 		if f, err := strconv.ParseFloat(raw, 64); err == nil {
@@ -61,7 +77,8 @@ func main() {
 	fmt.Println(sep)
 	fmt.Println("  GoDark Go SDK -- Trader Reference Example")
 	fmt.Println(sep)
-	fmt.Println("Order-type support in this distribution: MARKET, LIMIT")
+	fmt.Println("Order types: MARKET, LIMIT, PEG, STOP_MARKET, STOP_LIMIT")
+	fmt.Println("SlippageBps: MARKET and STOP_MARKET only. PEG cannot be post-only.")
 
 	legacyKey := envloader.First("GODARK_API_KEY", "GDX_API_KEY")
 	wsURL := envloader.First("GODARK_EDGE_URL", "GDX_EDGE_URL")
@@ -89,7 +106,7 @@ func main() {
 	}
 	if legacyKey != "" {
 		cfg.APIKey = legacyKey
-		cfg.UserUUID = envloader.First("GODARK_USER_UUID", "GDX_USER_UUID")
+		cfg.Account = envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT")
 	} else {
 		apiKeyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
 		apiSecret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
@@ -131,7 +148,7 @@ func main() {
 		fmt.Println("Disconnected cleanly")
 	}()
 
-	fmt.Printf("WS authenticated as user_uuid=%s  (session encrypted)\n", client.UserUUID())
+	fmt.Printf("WS authenticated as account=%s  (session encrypted)\n", client.Account())
 
 	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
 		log.Fatalf("Subscribe failed: %v", err)
@@ -154,46 +171,67 @@ func main() {
 
 	// Place a limit BUY.
 	mark := liveMarkPrice()
-	buyPx := math.Round(mark*0.997*10) / 10
-	fmt.Printf("Placing limit BUY @ %.1f (mark=%.1f)...\n", buyPx, mark)
+	buyPx := dec(math.Round(mark*0.997*10) / 10)
+	fmt.Printf("Placing limit BUY @ %s (mark=%.1f)...\n", buyPx, mark)
 	buyAck, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideBuy,
 		OrderType: godark.OrderTypeLimit,
 		Price:     buyPx,
-		Quantity:  0.1,
+		Quantity:  "0.1",
 	})
 	if err != nil {
-		envloader.PrintOrderError("BUY rejected", err)
-		os.Exit(1)
+		envloader.PrintOrderError("BUY rejected (continuing to market Place)", err)
+		buyAck = nil
+	} else {
+		fmt.Printf("BUY placed: order_id=%s  sequence=%s\n", buyAck.OrderID, buyAck.Sequence)
 	}
-	fmt.Printf("BUY placed: order_id=%s  sequence=%s\n", buyAck.OrderID, buyAck.Sequence)
 
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after BUY")
 
-	// Modify the BUY price.
-	modifyPx := math.Round(mark*0.996*10) / 10
-	fmt.Printf("Modifying order price to %.1f...\n", modifyPx)
-	newPrice := modifyPx
-	if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
-		envloader.PrintOrderError("Modify rejected", mErr)
+	if buyAck != nil {
+		modifyPx := dec(math.Round(mark*0.996*10) / 10)
+		fmt.Printf("Modifying order price to %s...\n", modifyPx)
+		newPrice := modifyPx
+		if mAck, mErr := client.ModifyOrder(ctx, buyAck.OrderID, symbol, &newPrice, nil, nil); mErr != nil {
+			envloader.PrintOrderError("Modify rejected", mErr)
+		} else {
+			fmt.Printf("Modified: order_id=%s\n", mAck.OrderID)
+		}
+		time.Sleep(1 * time.Second)
+		drainOrderUpdates(client, "after MODIFY")
+	}
+
+	// Market IOC with explicit walk cap: 50 bps = 0.5% of mark (UI default).
+	// Omit SlippageBps → venue max (localnet 5%).
+	fmt.Println("Placing market IOC BUY qty=0.01 with SlippageBps=50 (0.5% walk)...")
+	slippageBps := uint32(50)
+	if mktAck, mErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
+		Symbol:      symbol,
+		Side:        godark.SideBuy,
+		OrderType:   godark.OrderTypeMarket,
+		Quantity:    "0.01",
+		TimeInForce: godark.TimeInForceIOC,
+		Options:     godark.PlaceOrderOptions{SlippageBps: &slippageBps},
+	}); mErr != nil {
+		envloader.PrintOrderError("Market BUY rejected (continuing)", mErr)
 	} else {
-		fmt.Printf("Modified: order_id=%s\n", mAck.OrderID)
+		fmt.Printf("MARKET BUY placed: order_id=%s\n", mktAck.OrderID)
 	}
 
 	time.Sleep(1 * time.Second)
-	drainOrderUpdates(client, "after MODIFY")
+	drainOrderUpdates(client, "after MARKET BUY")
 
 	// Place + immediately cancel a SELL.
-	sellPx := math.Round(mark*1.03*10) / 10
-	fmt.Printf("Placing limit SELL @ %.1f...\n", sellPx)
+	sellPx := dec(math.Round(mark*1.03*10) / 10)
+	fmt.Printf("Placing limit SELL @ %s...\n", sellPx)
 	if sellAck, sErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
 		Symbol:    symbol,
 		Side:      godark.SideSell,
 		OrderType: godark.OrderTypeLimit,
 		Price:     sellPx,
-		Quantity:  0.05,
+		Quantity:  "0.05",
 		Options:   godark.PlaceOrderOptions{PostOnly: true},
 	}); sErr != nil {
 		envloader.PrintOrderError("SELL rejected", sErr)
@@ -229,9 +267,9 @@ func main() {
 	}
 	fmt.Printf("Mass-quoting a 3-level BUY ladder (post-only), base=%.2f...\n", base)
 	ladder := []godark.MassQuoteLegInput{
-		{Side: godark.SideBuy, Price: base * (1 - 0.003), Quantity: 0.02},
-		{Side: godark.SideBuy, Price: base * (1 - 0.006), Quantity: 0.02},
-		{Side: godark.SideBuy, Price: base * (1 - 0.009), Quantity: 0.02},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.003)), Quantity: "0.02"},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.006)), Quantity: "0.02"},
+		{Side: godark.SideBuy, Price: dec(base * (1 - 0.009)), Quantity: "0.02"},
 	}
 	var restingIDs []uint64
 	if mq, mqErr := client.MassQuote(ctx, symbol, ladder, nil); mqErr != nil {
@@ -276,7 +314,7 @@ func main() {
 	postOnlyTrue := true
 	fmt.Println("Mass-quoting a crossing BUY with post_only=true (expect rejected/2018)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
-		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.001}},
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: dec(crossPx), Quantity: "0.001"}},
 		&postOnlyTrue); mqErr != nil {
 		envloader.PrintOrderError("post_only=true mass quote rejected", mqErr)
 	} else {
@@ -295,7 +333,7 @@ func main() {
 	postOnlyFalse := false
 	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
 	if mq, mqErr := client.MassQuote(ctx, symbol,
-		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: crossPx, Quantity: 0.003}},
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: dec(crossPx), Quantity: "0.003"}},
 		&postOnlyFalse); mqErr != nil {
 		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
 	} else {
@@ -331,12 +369,13 @@ func main() {
 	time.Sleep(1 * time.Second)
 	drainOrderUpdates(client, "after post_only mass quotes")
 
-	// Cleanup: cancel the original BUY (if still resting).
-	fmt.Println("Cancelling original BUY (cleanup)...")
-	if _, err := client.CancelOrder(ctx, buyAck.OrderID, symbol); err != nil {
-		fmt.Println("Original BUY already filled or cancelled")
-	} else {
-		fmt.Println("Original BUY cancelled")
+	if buyAck != nil {
+		fmt.Println("Cancelling original BUY (cleanup)...")
+		if _, err := client.CancelOrder(ctx, buyAck.OrderID, symbol); err != nil {
+			fmt.Println("Original BUY already filled or cancelled")
+		} else {
+			fmt.Println("Original BUY cancelled")
+		}
 	}
 
 	// Drain anything that arrived during the session.

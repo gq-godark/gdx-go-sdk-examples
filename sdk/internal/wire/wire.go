@@ -32,11 +32,11 @@ const (
 )
 
 // EncodeHpkeSetup builds a TradingWsBinaryFrame with an HpkeSetup body.
-func EncodeHpkeSetup(userUUID []byte, connID uint64, encappedKey []byte) ([]byte, error) {
+func EncodeHpkeSetup(account []byte, connID uint64, encappedKey []byte) ([]byte, error) {
 	frame := &edgepb.TradingWsBinaryFrame{
 		Body: &edgepb.TradingWsBinaryFrame_HpkeSetup{
 			HpkeSetup: &edgepb.HpkeSetup{
-				UserUuid:    userUUID,
+				Account:     account,
 				ConnId:      connID,
 				EncappedKey: encappedKey,
 			},

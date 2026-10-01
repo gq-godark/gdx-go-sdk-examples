@@ -1,7 +1,12 @@
 // REST-only trader demo — auth + encrypted snapshots + place/modify/cancel.
 //
+// Prices and sizes are decimal strings only (not float64). Do not set
+// ClientOrderID: REST place does not register it. Registration happens only
+// after a successful WebSocket place, and only on HTTP 200.
+//
 //	GODARK_REST_URL=https://api.devnet.godark-dex.com \
 //	GODARK_API_KEY_ID=... GODARK_API_SECRET=... GODARK_PASSPHRASE=... \
+//	GODARK_ACCOUNT=<Solana base58 account> \
 //	GDX_LIVE_PRICE=78000 \
 //	  go run ./examples/full_trader_rest
 package main
@@ -12,21 +17,34 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
 	"github.com/gq-godark/gdx-go-sdk-examples/examples/internal/envloader"
 )
 
-func livePrice() float64 {
-	for _, key := range []string{"GDX_LIVE_PRICE", "GODARK_LIVE_PRICE"} {
-		if v := os.Getenv(key); v != "" {
-			if p, err := strconv.ParseFloat(v, 64); err == nil {
-				return p
-			}
+func livePriceString() string {
+	for _, key := range []string{"GDX_LIVE_PRICE", "GODARK_LIVE_PRICE", "GODARK_E2E_PRICE"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
 		}
 	}
-	return 78000.0
+	return "78000"
+}
+
+func offsetPrice(base string, delta float64) string {
+	v, err := strconv.ParseFloat(base, 64)
+	if err != nil {
+		return base
+	}
+	s := strconv.FormatFloat(v+delta, 'f', 8, 64)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
+	}
+	return s
 }
 
 func main() {
@@ -57,7 +75,10 @@ func main() {
 		legacyKey = os.Getenv("GDX_API_KEY")
 	}
 
-	cfg := godark.RestClientConfig{BaseURL: base}
+	cfg := godark.RestClientConfig{
+		BaseURL: base,
+		Account: envloader.First("GODARK_ACCOUNT", "GDX_ACCOUNT"),
+	}
 	if keyID != "" && secret != "" {
 		cfg.APIKeyID = keyID
 		cfg.APISecret = secret
@@ -79,7 +100,7 @@ func main() {
 	}
 	defer func() { _ = client.Disconnect(ctx) }()
 
-	fmt.Printf("identity user_uuid=%s scope=%s\n", client.UserUUID(), client.TokenScope())
+	fmt.Printf("connected account=%s\n", client.Account())
 
 	open, err := client.GetOpenOrders(ctx)
 	if err != nil {
@@ -101,14 +122,13 @@ func main() {
 		fmt.Println("account total_collateral=", acct.Account.TotalCollateral)
 	}
 
-	price := livePrice()
-	limitPrice := price - 5000
+	mark := livePriceString()
+	limitPrice := offsetPrice(mark, -5000)
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
 		PlaceOrderRequest: godark.PlaceOrderRequest{
 			Symbol: "BTC-USDC-PERP", Side: "BUY", OrderType: "LIMIT",
-			Quantity: 0.01, Price: limitPrice,
+			Quantity: "0.01", Price: limitPrice,
 		},
-		ClientOrderID: "sdk-go-rest-demo",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -117,7 +137,7 @@ func main() {
 
 	time.Sleep(500 * time.Millisecond)
 
-	newPrice := limitPrice - 64
+	newPrice := offsetPrice(mark, -5000-64)
 	mod, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP", &newPrice, nil, nil)
 	if err != nil {
 		log.Fatal(err)

@@ -3,6 +3,7 @@ package godark
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gq-godark/gdx-go-sdk/internal/hpke"
 	"github.com/gq-godark/gdx-go-sdk/internal/identity"
+	"github.com/gq-godark/gdx-go-sdk/internal/rest"
 	"github.com/gq-godark/gdx-go-sdk/internal/session"
 	"github.com/gq-godark/gdx-go-sdk/internal/transport"
 	"github.com/gq-godark/gdx-go-sdk/internal/wire"
@@ -102,13 +104,15 @@ type TransportConfig = transport.Config
 // (legacy single opaque key) OR APIKeyID + APISecret (key-pair) must be set.
 type ClientConfig struct {
 	// APIKey is the legacy single-token auth value. Set this OR
-	// (APIKeyID + APISecret), not both.
+	// (APIKeyID + APISecret), not both. Legacy keys (e.g. local
+	// `test-key-*`) are sent as the WebSocket login token as-is.
 	APIKey string
 
 	// APIKeyID / APISecret / Passphrase are the modern key-pair credentials.
 	// All three must be set together (Passphrase may also come from
-	// GODARK_PASSPHRASE / GDX_PASSPHRASE); the client joins them with `:`
-	// to form the wire token `key_id:secret:passphrase`.
+	// GODARK_PASSPHRASE / GDX_PASSPHRASE). On Connect the client mints
+	// POST /api/v1/auth/token (client_credentials) and logs in with the
+	// returned access_token — the raw key triple is never sent on the socket.
 	APIKeyID   string
 	APISecret  string
 	Passphrase string
@@ -124,9 +128,13 @@ type ClientConfig struct {
 	// GDX_EDGE_URL → Environment preset.
 	BaseURL string
 
-	// UserUUID is an optional fallback when the edge auth response omits
-	// `user_uuid` (e.g. local edge). Also read from GODARK_USER_UUID /
-	// GDX_USER_UUID env vars.
+	// Account is an optional Solana base58 account fallback when an older local
+	// edge omits `account`. Current edges always return it after login.
+	// Also read from GODARK_ACCOUNT / GDX_ACCOUNT.
+	Account string
+
+	// UserUUID is retained for legacy edge metadata only. It is not used in
+	// current encrypted protobuf or HPKE identity domains.
 	UserUUID string
 
 	// HpkeStaticPublicKeyHex pins the sequencer's 32-byte X25519 HPKE key.
@@ -206,19 +214,25 @@ type placeOutcomeWaiter struct {
 // flight at a time (gated by the transport mutex); push-stream consumers
 // (channels and callbacks) run concurrently with command issuance.
 type GodarkClient struct {
-	authToken      string
-	baseURL        string
-	fallbackUserUU string
-	symbolMap      map[string]int64
-	bufSize        int
+	authToken       string
+	apiKeyID        string
+	apiSecret       string
+	passphrase      string
+	httpClient      *http.Client
+	baseURL         string
+	fallbackAccount string
+	symbolMap       map[string]int64
+	instrumentDecs  map[string]InstrumentDecimals
+	bufSize         int
 
 	transport *transport.Transport
 	session   *session.CryptoSession
 
 	mu             sync.RWMutex
+	account        string
 	userUUID       string
 	connID         uint64
-	hpkeStaticKey string
+	hpkeStaticKey  string
 	accountID      string
 	loginSessionID string
 	tokenExpiresAt string
@@ -277,7 +291,7 @@ type GodarkClient struct {
 // NewClient validates config and returns an unconnected client. Call Connect
 // to bring it up.
 func NewClient(cfg ClientConfig) (*GodarkClient, error) {
-	authToken, err := resolveAuthToken(cfg)
+	creds, err := resolveAuthCredentials(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +303,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	if strings.TrimSpace(cfg.BaseURL) != "" {
 		pinEnv = inferEnvironmentFromRestURL(cfg.BaseURL)
 	}
-	fallbackUUID := resolveUserUUID(cfg.UserUUID)
+	fallbackAccount := resolveAccount(cfg.Account)
 
 	symbolMap := cfg.SymbolMap
 	if symbolMap == nil {
@@ -317,10 +331,15 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 	}
 
 	c := &GodarkClient{
-		authToken:               authToken,
+		authToken:               creds.legacyToken,
+		apiKeyID:                creds.apiKeyID,
+		apiSecret:               creds.apiSecret,
+		passphrase:              creds.passphrase,
+		httpClient:              cfg.HTTPClient,
 		baseURL:                 baseURL,
-		fallbackUserUU:          fallbackUUID,
+		fallbackAccount:         fallbackAccount,
 		symbolMap:               symbolMap,
+		instrumentDecs:          make(map[string]InstrumentDecimals),
 		bufSize:                 bufSize,
 		placeTerminalTimeout:    terminalTimeout,
 		hpkeStaticKey:           resolveHpkeStaticPublicKey(cfg.HpkeStaticPublicKeyHex, pinEnv),
@@ -365,11 +384,19 @@ func defaultReconnectBackoff(attempt int) time.Duration {
 var reconnectBackoff = defaultReconnectBackoff
 
 // UserUUID returns the authenticated user's canonical UUID. Empty until
-// Connect has completed successfully.
+// Connect has completed successfully. Current account-based edges do not
+// provide this legacy identifier, so it is normally empty.
 func (c *GodarkClient) UserUUID() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.userUUID
+}
+
+// Account returns the authenticated 32-byte Solana account as base58.
+func (c *GodarkClient) Account() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.account
 }
 
 // AccountID, LoginSessionID, TokenExpiresAt, CancelOnDisconnect expose
@@ -422,11 +449,20 @@ func (c *GodarkClient) connectSession(ctx context.Context) error {
 	c.pendingEncryptedByNonce = make(map[uint64]transport.Message)
 	c.pendingMu.Unlock()
 
+	// Best-effort: local mocks / older edges may omit instruments. Trading
+	// then falls back to the embedded symbol map and DefaultInstrumentDecimals.
+	_ = c.refreshInstruments(ctx)
+
+	loginToken, err := c.resolveLoginToken(ctx)
+	if err != nil {
+		return newAuthenticationError(err.Error())
+	}
+
 	if err := c.transport.Connect(ctx); err != nil {
 		return newConnectionError(err.Error())
 	}
 
-	auth, err := c.transport.Authenticate(ctx, c.authToken)
+	auth, err := c.transport.Authenticate(ctx, loginToken)
 	if err != nil {
 		_ = c.disconnectInternal()
 		return newAuthenticationError(err.Error())
@@ -440,24 +476,21 @@ func (c *GodarkClient) connectSession(ctx context.Context) error {
 		return newAuthenticationError(msg)
 	}
 
-	uid := stringValue(auth["user_uuid"])
-	if uid == "" {
-		uid = stringValue(auth["user_id"])
+	account := stringValue(auth["account"])
+	if account == "" {
+		account = c.fallbackAccount
 	}
-	if uid == "" {
-		uid = c.fallbackUserUU
-	}
-	if uid == "" {
+	if _, err := identity.AccountToBytes(account); err != nil {
 		_ = c.disconnectInternal()
 		return newAuthenticationError(
-			"authentication succeeded but user_uuid missing in auth_result " +
-				"and no fallback provided via constructor or " +
-				"GODARK_USER_UUID / GDX_USER_UUID env vars",
+			"authentication succeeded but account is missing or invalid; " +
+				"set ClientConfig.Account or GODARK_ACCOUNT / GDX_ACCOUNT for a legacy local edge",
 		)
 	}
 
 	c.mu.Lock()
-	c.userUUID = uid
+	c.account = account
+	c.userUUID = stringValue(auth["user_uuid"])
 	c.accountID = stringValue(auth["account_id"])
 	c.loginSessionID = stringValue(auth["session_id"])
 	c.tokenExpiresAt = stringValue(auth["token_expires_at"])
@@ -509,16 +542,17 @@ func (c *GodarkClient) disconnectInternal() error {
 // -----------------------------------------------------------------------
 
 // PlaceOrderRequest is the input to PlaceOrder. Price is required for LIMIT
-// orders, ignored for MARKET.
+// orders, ignored for MARKET. Price, Quantity, MinFillSize, and Options
+// price/size fields are decimal strings (not float64).
 type PlaceOrderRequest struct {
 	Symbol      string
 	Side        Side
 	OrderType   OrderType
-	Quantity    float64
-	Price       float64 // ignored when zero for non-LIMIT order types
+	Quantity    string
+	Price       string // ignored when empty for non-LIMIT order types
 	TimeInForce TimeInForce
 	AON         bool
-	MinFillSize *float64
+	MinFillSize *string
 	ExpiryTime  *uint64
 	// Options carries optional reduce-only / post-only / STP flags.
 	Options PlaceOrderOptions
@@ -526,6 +560,12 @@ type PlaceOrderRequest struct {
 	// Ack returns on the sequencer fast ack; Book waits for a definitive
 	// order update and returns OrderError on REJECTED.
 	Confirmation PlaceOrderConfirmation
+	// ClientOrderID is registered with the edge after this WebSocket place
+	// succeeds. The edge arms place correlation only on the WebSocket path,
+	// so the same id on a REST place is not registered. Registration is
+	// stored only when POST /orders/_register_coid returns HTTP 200; a 400
+	// is returned with the order ack and is not cached locally.
+	ClientOrderID string
 }
 
 // PlaceOrder sends an encrypted place command and waits for its fast ack.
@@ -557,17 +597,22 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 	}
 
 	corrID := newCorrelationID()
-	var pricePtr *float64
-	if req.Price != 0 {
+	var pricePtr *string
+	if req.Price != "" {
 		p := req.Price
 		pricePtr = &p
+	}
+
+	decimals, err := c.instrumentDecimals(req.Symbol)
+	if err != nil {
+		return nil, err
 	}
 
 	plaintext, err := BuildPlaceOrderRequest(
 		uint64(symbolID),
 		req.Side, req.OrderType,
 		req.Quantity,
-		c.userUUIDBytes(),
+		c.accountBytes(),
 		pricePtr,
 		req.TimeInForce,
 		req.AON,
@@ -575,7 +620,7 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		req.ExpiryTime,
 		corrID,
 		req.Options,
-		uint64(time.Now().UnixNano()),
+		decimals,
 	)
 	if err != nil {
 		return nil, err
@@ -590,21 +635,49 @@ func (c *GodarkClient) PlaceOrder(ctx context.Context, req PlaceOrderRequest) (*
 		c.cancelPlaceOutcomeWaiter(waiter)
 		return nil, err
 	}
-	if waiter == nil {
-		return ack, nil
-	}
-	update, err := c.awaitPlaceOutcome(ctx, ack.OrderID, waiter)
-	if err != nil {
-		return nil, err
-	}
-	if update.UpdateType == OrderUpdateTypeRejected || update.Status == OrderStatusRejected {
-		if numeric, parseErr := strconv.ParseInt(update.RejectReason, 10, 32); parseErr == nil {
-			code := int32(numeric)
-			return nil, MakeOrderErrorFromCode(&code, update.Msg)
+	if waiter != nil {
+		update, waitErr := c.awaitPlaceOutcome(ctx, ack.OrderID, waiter)
+		if waitErr != nil {
+			return nil, waitErr
 		}
-		return nil, MakeOrderErrorFromJSON(update.Msg, update.RejectReason)
+		if update.UpdateType == OrderUpdateTypeRejected || update.Status == OrderStatusRejected {
+			if numeric, parseErr := strconv.ParseInt(update.RejectReason, 10, 32); parseErr == nil {
+				code := int32(numeric)
+				return nil, MakeOrderErrorFromCode(&code, update.Msg)
+			}
+			return nil, MakeOrderErrorFromJSON(update.Msg, update.RejectReason)
+		}
+	}
+	if err := c.registerPlacedClientOrder(ctx, req.ClientOrderID, ack, corrID); err != nil {
+		return ack, err
 	}
 	return ack, nil
+}
+
+// registerPlacedClientOrder binds clientOrderID to the sequencer order id
+// on the edge. The correlation is the WebSocket place header (decimal u128).
+// The edge stores the mapping only for a correlation armed by that place.
+// A non-200 response is returned; nothing is treated as registered until
+// POST /orders/_register_coid succeeds.
+func (c *GodarkClient) registerPlacedClientOrder(ctx context.Context, clientOrderID string, ack *OrderAck, corrID []byte) error {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return nil
+	}
+	if ack == nil || !ack.Success || ack.OrderID == "" {
+		return fmt.Errorf("client_order_id %q not registered: place did not return an order id", clientOrderID)
+	}
+	c.mu.RLock()
+	bearer := c.authToken
+	c.mu.RUnlock()
+	if bearer == "" {
+		return fmt.Errorf("placed %s; client_order_id registration failed: not connected", ack.OrderID)
+	}
+	tr := rest.New(restOriginFromEdgeURL(c.baseURL), c.httpClient)
+	if _, err := tr.RegisterClientOrderMapping(ctx, bearer, clientOrderID, ack.OrderID, decimalCorrelationID(corrID)); err != nil {
+		return fmt.Errorf("placed %s; client_order_id registration failed: %w", ack.OrderID, err)
+	}
+	return nil
 }
 
 // CancelOrder sends an encrypted cancel command and waits for its ack.
@@ -625,7 +698,7 @@ func (c *GodarkClient) CancelOrder(ctx context.Context, orderID string, symbol s
 		return nil, fmt.Errorf("CancelOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), corrID)
+	plaintext, err := BuildCancelOrderRequest(oid, c.accountBytes(), uint64(symbolID), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -634,7 +707,8 @@ func (c *GodarkClient) CancelOrder(ctx context.Context, orderID string, symbol s
 
 // ModifyOrder sends an encrypted modify command and waits for its ack.
 // At least one of newPrice, newQuantity, or newTriggerPrice must be non-nil.
-func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *float64) (*OrderAck, error) {
+// Price/size args are decimal strings.
+func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, newPrice, newQuantity, newTriggerPrice *string) (*OrderAck, error) {
 	if err := c.ensureReady(); err != nil {
 		return nil, err
 	}
@@ -653,7 +727,11 @@ func (c *GodarkClient) ModifyOrder(ctx context.Context, orderID, symbol string, 
 		return nil, fmt.Errorf("ModifyOrder: invalid order_id %q: %w", orderID, err)
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildModifyOrderRequest(oid, c.userUUIDBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildModifyOrderRequest(oid, c.accountBytes(), uint64(symbolID), newPrice, newQuantity, newTriggerPrice, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +755,7 @@ func (c *GodarkClient) CancelAllOrders(ctx context.Context, symbol string) (*Cou
 		bodySymbolID = &usid
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCancelAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	plaintext, err := BuildCancelAll(bodySymbolID, c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -705,7 +783,7 @@ func (c *GodarkClient) CloseAll(ctx context.Context, symbol string) (*CountAck, 
 		bodySymbolID = &usid
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildCloseAll(bodySymbolID, c.userUUIDBytes(), corrID)
+	plaintext, err := BuildCloseAll(bodySymbolID, c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +807,7 @@ func (c *GodarkClient) ReversePosition(ctx context.Context, symbol string) (*Cou
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildReverse(uint64(symbolID), c.userUUIDBytes(), corrID)
+	plaintext, err := BuildReverse(uint64(symbolID), c.accountBytes(), corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -741,12 +819,13 @@ func (c *GodarkClient) ReversePosition(ctx context.Context, symbol string) (*Cou
 }
 
 // AmendTpsl amends or attaches TP/SL on a resting order or open position.
+// takeProfitPrice and stopLossPrice are decimal strings.
 func (c *GodarkClient) AmendTpsl(
 	ctx context.Context,
 	symbol string,
 	orderID uint64,
-	takeProfitPrice *float64,
-	stopLossPrice *float64,
+	takeProfitPrice *string,
+	stopLossPrice *string,
 	positionSide *Side,
 ) (*TpslAck, error) {
 	if err := c.ensureReady(); err != nil {
@@ -765,8 +844,12 @@ func (c *GodarkClient) AmendTpsl(
 		sid := uint64(symbolID)
 		bodySymbolID = &sid
 	}
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
 	plaintext, err := BuildAmendTpsl(
-		c.userUUIDBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide,
+		c.accountBytes(), orderID, corrID, takeProfitPrice, stopLossPrice, bodySymbolID, positionSide, decimals,
 	)
 	if err != nil {
 		return nil, err
@@ -801,7 +884,7 @@ func (c *GodarkClient) CancelTpsl(
 		sid := uint64(symbolID)
 		bodySymbolID = &sid
 	}
-	plaintext, err := BuildCancelTpsl(c.userUUIDBytes(), orderID, corrID, bodySymbolID, positionSide)
+	plaintext, err := BuildCancelTpsl(c.accountBytes(), orderID, corrID, bodySymbolID, positionSide)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,11 +1091,11 @@ func (c *GodarkClient) setupHpkeSession(ctx context.Context) error {
 		return newSessionError(err.Error())
 	}
 
-	encapped, err := c.session.Setup(remoteStatic, c.userUUIDBytes(), c.connID)
+	encapped, err := c.session.Setup(remoteStatic, c.accountBytes(), c.connID)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
-	frame, err := wire.EncodeHpkeSetup(c.userUUIDBytes(), c.connID, encapped)
+	frame, err := wire.EncodeHpkeSetup(c.accountBytes(), c.connID, encapped)
 	if err != nil {
 		return newSessionError(err.Error())
 	}
@@ -1199,7 +1282,7 @@ func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType s
 
 	resp, err := c.transport.SendBinaryCommand(ctx, corrKey, func() ([]byte, error) {
 		nonceCounter := c.session.NextNonce()
-		aad, err := BuildOrderHeaderAADWithConn(c.userUUIDBytes(), symbolID, requestType, nonceCounter, bodyLength, correlationID, c.connectionID())
+		aad, err := BuildOrderHeaderAADWithConn(c.accountBytes(), symbolID, requestType, nonceCounter, bodyLength, correlationID, c.connectionID())
 		if err != nil {
 			return nil, err
 		}
@@ -1212,7 +1295,7 @@ func (c *GodarkClient) sendEncryptedCommandEx(ctx context.Context, requestType s
 			return nil, fmt.Errorf("unknown request_type %q", requestType)
 		}
 		header := &edgepb.OrderHeader{
-			UserUuid:      c.userUUIDBytes(),
+			Account:       c.accountBytes(),
 			SymbolId:      symbolID,
 			RequestType:   commonpb.RequestType(rt),
 			Nonce:         actualNonce,
@@ -1284,6 +1367,10 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 			return nil, newOrderError("expected ack inside encrypted push", "")
 		}
 		if !ack.Success {
+			if ack.ErrorCode != nil {
+				code := int32(*ack.ErrorCode)
+				return nil, MakeOrderErrorFromCode(&code, ack.RejectText)
+			}
 			return nil, MakeOrderErrorFromJSON(ack.RejectText, "")
 		}
 		return &OrderAck{OrderID: strconv.FormatUint(ack.OrderID, 10), Success: true, Sequence: strconv.FormatUint(ack.Sequence, 10)}, nil
@@ -1301,7 +1388,7 @@ func (c *GodarkClient) decryptAckPush(msg transport.Message) (*OrderAck, error) 
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1367,7 +1454,7 @@ func (c *GodarkClient) decryptCommandPlaintext(msg transport.Message, defaultMes
 		messageType = defaultMessageType
 	}
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1398,7 +1485,11 @@ func (c *GodarkClient) MassQuote(ctx context.Context, symbol string, legs []Mass
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID, postOnly)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildMassQuoteRequest(uint64(symbolID), c.accountBytes(), legs, corrID, postOnly, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -1436,7 +1527,7 @@ func (c *GodarkClient) UpdateLeverage(ctx context.Context, symbol string, levera
 		lev = 1
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildUpdateLeverageRequest(c.userUUIDBytes(), uint64(symbolID), lev, corrID)
+	plaintext, err := BuildUpdateLeverageRequest(c.accountBytes(), uint64(symbolID), lev, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1460,7 +1551,7 @@ func (c *GodarkClient) BatchCancel(ctx context.Context, symbol string, orderIDs 
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.userUUIDBytes(), orderIDs, corrID)
+	plaintext, err := BuildBatchCancelRequest(uint64(symbolID), c.accountBytes(), orderIDs, corrID)
 	if err != nil {
 		return nil, err
 	}
@@ -1497,7 +1588,11 @@ func (c *GodarkClient) BatchModify(ctx context.Context, symbol string, legs []Ba
 		return nil, err
 	}
 	corrID := newCorrelationID()
-	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.userUUIDBytes(), legs, corrID)
+	decimals, err := c.instrumentDecimals(symbol)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := BuildBatchModifyRequest(uint64(symbolID), c.accountBytes(), legs, corrID, decimals)
 	if err != nil {
 		return nil, err
 	}
@@ -1627,7 +1722,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	switch messageType {
 	case "ack", "mass_quote_ack", "batch_cancel_ack", "batch_modify_ack", "cancel_all_ack", "close_all_ack", "reverse_ack", "tpsl_ack":
 		aad, err := BuildResponseHeaderAADWithConn(
-			c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+			c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 			correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 		)
 		if err != nil {
@@ -1650,7 +1745,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 	}
 
 	aad, err := BuildResponseHeaderAADWithConn(
-		c.userUUIDBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
+		c.accountBytes(), messageType, uint32(len(ct)), nonce, fencingEpoch,
 		correlationIDFromWire(msg["correlation_id"]), coerceUint64(msg["session_seq"]), c.messageConnID(msg),
 	)
 	if err != nil {
@@ -1674,7 +1769,7 @@ func (c *GodarkClient) dispatchEncryptedPush(msg transport.Message) {
 		return
 	}
 
-	parsed, err := ParseSequencerToEdgeMessage(pt)
+	parsed, err := ParseSequencerToEdgeMessage(pt, messageType)
 	if err != nil {
 		c.emitError(fmt.Errorf("parse encrypted push body: %w", err))
 		return
@@ -1861,12 +1956,12 @@ func (c *GodarkClient) dispatchOpenOrdersSnapshot(snap *OpenOrdersSnapshot) {
 func (c *GodarkClient) ensureReady() error {
 	c.mu.RLock()
 	connected := c.connected
-	userUUID := c.userUUID
+	account := c.account
 	c.mu.RUnlock()
 	if !connected {
 		return newConnectionError("not connected")
 	}
-	if userUUID == "" {
+	if account == "" {
 		return newConnectionError("not authenticated")
 	}
 	if !c.session.IsEstablished() {
@@ -1875,15 +1970,15 @@ func (c *GodarkClient) ensureReady() error {
 	return nil
 }
 
-func (c *GodarkClient) userUUIDBytes() []byte {
+func (c *GodarkClient) accountBytes() []byte {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.userUUID == "" {
-		return make([]byte, identity.UserUUIDLen)
+	if c.account == "" {
+		return make([]byte, identity.AccountLen)
 	}
-	b, err := identity.ToBytes(c.userUUID)
+	b, err := identity.AccountToBytes(c.account)
 	if err != nil {
-		return make([]byte, identity.UserUUIDLen)
+		return make([]byte, identity.AccountLen)
 	}
 	return b
 }
@@ -1925,27 +2020,185 @@ func resolvePassphrase(explicit string) (string, error) {
 	return "", errors.New("passphrase is required when using APIKeyID and APISecret")
 }
 
-func resolveAuthToken(cfg ClientConfig) (string, error) {
+type authCredentials struct {
+	legacyToken string
+	apiKeyID    string
+	apiSecret   string
+	passphrase  string
+}
+
+func resolveAuthCredentials(cfg ClientConfig) (authCredentials, error) {
 	if cfg.APIKeyID != "" || cfg.APISecret != "" {
 		if cfg.APIKeyID == "" || cfg.APISecret == "" {
-			return "", errors.New("APIKeyID and APISecret must be provided together")
+			return authCredentials{}, errors.New("APIKeyID and APISecret must be provided together")
 		}
 		if cfg.APIKey != "" {
-			return "", errors.New("use either APIKey or (APIKeyID + APISecret), not both")
+			return authCredentials{}, errors.New("use either APIKey or (APIKeyID + APISecret), not both")
 		}
 		passphrase, err := resolvePassphrase(cfg.Passphrase)
 		if err != nil {
-			return "", err
+			return authCredentials{}, err
 		}
-		return cfg.APIKeyID + ":" + cfg.APISecret + ":" + passphrase, nil
+		return authCredentials{
+			apiKeyID:   cfg.APIKeyID,
+			apiSecret:  cfg.APISecret,
+			passphrase: passphrase,
+		}, nil
 	}
 	if cfg.APIKey != "" {
 		if strings.TrimSpace(cfg.Passphrase) != "" {
-			return "", errors.New("Passphrase must not be set when using legacy APIKey")
+			return authCredentials{}, errors.New("Passphrase must not be set when using legacy APIKey")
 		}
-		return cfg.APIKey, nil
+		return authCredentials{legacyToken: cfg.APIKey}, nil
 	}
-	return "", errors.New("provide APIKey or both APIKeyID + APISecret")
+	return authCredentials{}, errors.New("provide APIKey or both APIKeyID + APISecret")
+}
+
+// resolveAuthToken is retained for tests that assert legacy token joining is gone.
+func resolveAuthToken(cfg ClientConfig) (string, error) {
+	creds, err := resolveAuthCredentials(cfg)
+	if err != nil {
+		return "", err
+	}
+	if creds.legacyToken != "" {
+		return creds.legacyToken, nil
+	}
+	// Key-triple clients mint a JWT at Connect; constructor must not embed the secret.
+	return "", nil
+}
+
+func (c *GodarkClient) resolveLoginToken(ctx context.Context) (string, error) {
+	if c.apiKeyID != "" {
+		token, err := c.mintAccessToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		c.mu.Lock()
+		c.authToken = token
+		c.mu.Unlock()
+		return token, nil
+	}
+	if c.authToken == "" {
+		return "", errors.New("missing login token")
+	}
+	return c.authToken, nil
+}
+
+func (c *GodarkClient) mintAccessToken(ctx context.Context) (string, error) {
+	restURL := restOriginFromEdgeURL(c.baseURL)
+	tr := rest.New(restURL, c.httpClient)
+	authData, err := tr.AuthTokenClientCredentials(ctx, c.apiKeyID, c.apiSecret, c.passphrase)
+	if err != nil {
+		return "", err
+	}
+	bearer, _ := authData["access_token"].(string)
+	if bearer == "" {
+		bearer, _ = authData["token"].(string)
+	}
+	if bearer == "" {
+		return "", errors.New("auth/token missing access_token/token")
+	}
+	return bearer, nil
+}
+
+func (c *GodarkClient) refreshInstruments(ctx context.Context) error {
+	restURL := restOriginFromEdgeURL(c.baseURL)
+	tr := rest.New(restURL, c.httpClient)
+	data, err := tr.GetInstruments(ctx)
+	if err != nil {
+		return fmt.Errorf("load instruments: %w", err)
+	}
+	symMap, decs, err := parseInstrumentsPayload(data)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(symMap) > 0 {
+		c.symbolMap = symMap
+	}
+	c.instrumentDecs = decs
+	return nil
+}
+
+func (c *GodarkClient) instrumentDecimals(symbol string) (InstrumentDecimals, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if d, ok := c.instrumentDecs[symbol]; ok {
+		return d, nil
+	}
+	if len(c.instrumentDecs) == 0 {
+		return DefaultInstrumentDecimals, nil
+	}
+	return InstrumentDecimals{}, fmt.Errorf("missing instrument decimals for %q", symbol)
+}
+
+func parseInstrumentsPayload(data map[string]any) (map[string]int64, map[string]InstrumentDecimals, error) {
+	raw, ok := data["instruments"]
+	if !ok {
+		return nil, nil, fmt.Errorf("instruments response missing instruments array")
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("instruments response has unexpected type")
+	}
+	symMap := make(map[string]int64, len(arr))
+	decs := make(map[string]InstrumentDecimals, len(arr))
+	for i, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, nil, fmt.Errorf("instruments[%d] is not an object", i)
+		}
+		symbol, _ := m["symbol"].(string)
+		if symbol == "" {
+			continue
+		}
+		symMap[symbol] = coerceInt64(m["symbol_id"])
+		decs[symbol] = InstrumentDecimals{
+			PriceDecimals:    uint32(coerceUint64(m["price_decimals"])),
+			QuantityDecimals: uint32(coerceUint64(m["quantity_decimals"])),
+		}
+	}
+	return symMap, decs, nil
+}
+
+func coerceInt64(v any) int64 {
+	switch t := v.(type) {
+	case float64:
+		return int64(t)
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	case json.Number:
+		i, _ := t.Int64()
+		return i
+	case string:
+		i, _ := strconv.ParseInt(t, 10, 64)
+		return i
+	default:
+		return 0
+	}
+}
+
+func restOriginFromEdgeURL(edge string) string {
+	u := strings.TrimSpace(edge)
+	u = strings.TrimRight(u, "/")
+	for _, suffix := range []string{"/ws/v1", "/ws"} {
+		if strings.HasSuffix(u, suffix) {
+			u = strings.TrimSuffix(u, suffix)
+		}
+	}
+	switch {
+	case strings.HasPrefix(u, "wss://"):
+		return "https://" + strings.TrimPrefix(u, "wss://")
+	case strings.HasPrefix(u, "ws://"):
+		return "http://" + strings.TrimPrefix(u, "ws://")
+	case strings.HasPrefix(u, "https://"), strings.HasPrefix(u, "http://"):
+		return u
+	default:
+		return "https://" + u
+	}
 }
 
 func resolveEdgeBaseURL(explicit string, env Environment) string {
@@ -1960,18 +2213,17 @@ func resolveEdgeBaseURL(explicit string, env Environment) string {
 	return env.EdgeBaseURL()
 }
 
-func resolveUserUUID(explicit string) string {
+func resolveAccount(explicit string) string {
 	if v := strings.TrimSpace(explicit); v != "" {
 		return v
 	}
-	for _, key := range []string{"GODARK_USER_UUID", "GDX_USER_UUID"} {
+	for _, key := range []string{"GODARK_ACCOUNT", "GDX_ACCOUNT"} {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
 	}
 	return ""
 }
-
 
 func resolveHpkeStaticPublicKey(explicit string, env Environment) string {
 	if v := strings.TrimSpace(explicit); v != "" {
