@@ -1,0 +1,127 @@
+package godark
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// InstrumentDecimals holds the venue scale for one symbol from
+// GET /api/v1/instruments (price_decimals / quantity_decimals).
+type InstrumentDecimals struct {
+	PriceDecimals    uint32
+	QuantityDecimals uint32
+}
+
+// DefaultInstrumentDecimals is used only when instruments have not been
+// loaded yet (unit tests / offline encode). Prefer values from the edge.
+var DefaultInstrumentDecimals = InstrumentDecimals{
+	PriceDecimals:    8,
+	QuantityDecimals: 8,
+}
+
+// NormalizeDecimal validates a non-negative decimal string against an
+// instrument scale, trims trailing fractional zeros, and returns the wire form.
+// Public trading APIs accept only decimal strings; there is no float64 path.
+func NormalizeDecimal(s string, decimals uint32) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("empty decimal string")
+	}
+	if strings.HasPrefix(s, "+") || strings.HasPrefix(s, "-") {
+		return "", fmt.Errorf("decimal value must be non-negative")
+	}
+	if decimals > 18 {
+		return "", fmt.Errorf("decimals %d exceeds maximum 18", decimals)
+	}
+	if err := validateDecimalDigits(s); err != nil {
+		return "", err
+	}
+	s = trimFractionalZeros(s)
+	if err := validateFractionLength(s, decimals); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// ParseDecimal converts a wire decimal string to float64 for local numeric
+// helpers. Trading APIs take and return decimal strings; do not pass the
+// result back into place/modify without formatting it as a decimal string
+// yourself (stdlib strconv / shopspring/decimal / math/big).
+func ParseDecimal(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty decimal string")
+	}
+	if strings.HasPrefix(s, "+") {
+		return 0, fmt.Errorf("decimal string must not start with '+'")
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid decimal %q: %w", s, err)
+	}
+	return v, nil
+}
+
+func trimFractionalZeros(s string) string {
+	if !strings.Contains(s, ".") {
+		return s
+	}
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	if s == "" {
+		return "0"
+	}
+	return s
+}
+
+func validateDecimalDigits(s string) error {
+	dotSeen := false
+	digitSeen := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' {
+			if dotSeen {
+				return fmt.Errorf("invalid decimal %q", s)
+			}
+			dotSeen = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return fmt.Errorf("invalid decimal %q", s)
+		}
+		digitSeen = true
+	}
+	if !digitSeen {
+		return fmt.Errorf("invalid decimal %q", s)
+	}
+	return nil
+}
+
+func validateFractionLength(s string, decimals uint32) error {
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return nil
+	}
+	frac := s[dot+1:]
+	if uint32(len(frac)) > decimals {
+		return fmt.Errorf("fractional digits %d exceed instrument decimals %d", len(frac), decimals)
+	}
+	for _, c := range frac {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("invalid fractional digit in %q", s)
+		}
+	}
+	return nil
+}
+
+func formatOptDecimal(v *string, decimals uint32) (*string, error) {
+	if v == nil {
+		return nil, nil
+	}
+	s, err := NormalizeDecimal(*v, decimals)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}

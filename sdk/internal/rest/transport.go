@@ -254,12 +254,19 @@ func (t *Transport) GetOrderByClientOrderID(ctx context.Context, bearer, clientO
 	return t.doJSON(ctx, http.MethodGet, "/api/v1/orders", bearer, nil, q)
 }
 
-// RegisterClientOrderMapping pushes the `(coid, order_id)` mapping the SDK
-// learned post-decrypt back to the edge so future coid lookups resolve.
-func (t *Transport) RegisterClientOrderMapping(ctx context.Context, bearer, clientOrderID, orderID string) (map[string]any, error) {
+// RegisterClientOrderMapping pushes the `(coid, order_id, correlation_id)`
+// mapping the SDK learned post-decrypt back to the edge so future coid
+// lookups resolve. correlationID is the place-header u128 as a non-zero
+// decimal string; the edge rejects the mapping without it.
+func (t *Transport) RegisterClientOrderMapping(ctx context.Context, bearer, clientOrderID, orderID, correlationID string) (map[string]any, error) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || correlationID == "0" {
+		return nil, errors.New("correlation_id required (non-zero decimal from place header)")
+	}
 	return t.doJSON(ctx, http.MethodPost, "/api/v1/orders/_register_coid", bearer, map[string]any{
 		"client_order_id": clientOrderID,
 		"order_id":        orderID,
+		"correlation_id":  correlationID,
 	}, nil)
 }
 
@@ -309,6 +316,11 @@ func asObjectSlice(v any, path string) ([]map[string]any, error) {
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// GetInstruments issues `GET /api/v1/instruments` (public).
+func (t *Transport) GetInstruments(ctx context.Context) (map[string]any, error) {
+	return t.doJSON(ctx, http.MethodGet, "/api/v1/instruments", "", nil, nil)
 }
 
 // GetFundingRates issues `GET /api/v1/market-data/funding-rates` (public, raw array).

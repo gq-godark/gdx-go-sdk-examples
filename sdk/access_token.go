@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/google/uuid"
+	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 )
 
-// userUUIDFromAccessTokenJWT parses the internal user UUID from a compact access
-// JWT's sub claim. Signature is not verified — callers should only use tokens
+// accountFromAccessTokenJWT parses the Solana account from a compact access
+// JWT's sub claim. Signature is not verified; callers should only use tokens
 // returned by the edge auth/token response.
-func userUUIDFromAccessTokenJWT(token string) (string, bool) {
+func accountFromAccessTokenJWT(token string) (string, bool) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return "", false
@@ -28,7 +28,7 @@ func userUUIDFromAccessTokenJWT(token string) (string, bool) {
 	if sub == "" {
 		return "", false
 	}
-	if _, err := uuid.Parse(sub); err != nil {
+	if _, err := identity.AccountToBytes(sub); err != nil {
 		return "", false
 	}
 	return sub, true

@@ -50,12 +50,19 @@ type OrderError struct {
 	// ErrorCode is the symbolic error code. Empty when the server emitted
 	// a free-form rejection without a code.
 	ErrorCode string
+	// UserMessage is catalog default English when FindOrderErrorCode hits.
+	UserMessage string
 }
 
-func newOrderError(msg, errorCode string) *OrderError {
+func newOrderError(msg, errorCode string, userMessage ...string) *OrderError {
+	um := ""
+	if len(userMessage) > 0 {
+		um = userMessage[0]
+	}
 	return &OrderError{
-		baseError: baseError{Kind: "OrderError", Message: msg},
-		ErrorCode: errorCode,
+		baseError:   baseError{Kind: "OrderError", Message: msg},
+		ErrorCode:   errorCode,
+		UserMessage: um,
 	}
 }
 

@@ -30,7 +30,7 @@ if [[ ! -d "$SRC" ]]; then
   echo "error: source directory '$SRC' does not exist" >&2
   exit 1
 fi
-if [[ ! -d "$SRC/.git" ]]; then
+if ! git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
   echo "error: '$SRC' is not a git checkout - pin cannot be recorded" >&2
   exit 1
 fi
@@ -80,6 +80,7 @@ mkdir -p "$DEST"
 #   - *_test.go, testdata/             huge size win; recipients don't run
 #                                      upstream tests
 rsync -a \
+  --exclude='.git' \
   --exclude='.git/' \
   --exclude='.github/' \
   --exclude='scripts/' \

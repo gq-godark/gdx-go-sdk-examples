@@ -17,8 +17,10 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/gq-godark/gdx-go-sdk/internal/identity"
 	commonpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/common/v1"
 	edgepb "github.com/gq-godark/gdx-go-sdk/proto/gdx/edge/v1"
+	healthpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/health/v1"
 	sequencerpb "github.com/gq-godark/gdx-go-sdk/proto/gdx/sequencer/v1"
 )
 
@@ -130,6 +132,14 @@ func uuidBytesToString(raw []byte) string {
 	return "00000000-0000-0000-0000-000000000000"
 }
 
+func accountBytesToString(raw []byte) string {
+	account, err := identity.AccountFromBytes(raw)
+	if err != nil {
+		return ""
+	}
+	return account
+}
+
 func stringOr(p *string, fallback string) string {
 	if p == nil {
 		return fallback
@@ -142,21 +152,22 @@ func stringOr(p *string, fallback string) string {
 // ---------------------------------------------------------------------------
 
 // BuildPlaceOrderRequest assembles the encrypted-body payload for a Place
-// command: a PlaceOrderInput wrapped in EdgeSequencerRequest, serialized.
+// command: a bare PlaceOrderInput protobuf (not wrapped in EdgeSequencerRequest).
+// Prices and sizes are public decimal strings, normalized at the instrument scales.
 func BuildPlaceOrderRequest(
 	symbolID uint64,
 	side Side,
 	orderType OrderType,
-	quantity float64,
+	quantity string,
 	userUUID []byte,
-	price *float64,
+	price *string,
 	timeInForce TimeInForce,
 	aon bool,
-	minFillSize *float64,
+	minFillSize *string,
 	expiryTime *uint64,
 	correlationID []byte,
 	options PlaceOrderOptions,
-	_ uint64,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	sideInt, ok := sideToProto[side]
 	if !ok {
@@ -174,6 +185,14 @@ func BuildPlaceOrderRequest(
 	if !ok && options.StpMode != "" {
 		return nil, fmt.Errorf("unknown stp mode: %q", options.StpMode)
 	}
+	hasQuantity := quantity != ""
+	hasQuoteNotional := options.QuoteNotional != nil
+	if hasQuantity == hasQuoteNotional {
+		return nil, fmt.Errorf("exactly one of quantity or options.QuoteNotional is required")
+	}
+	if aon && hasQuoteNotional {
+		return nil, fmt.Errorf("aon requires base quantity, not quote notional")
+	}
 	if aon && minFillSize == nil {
 		q := quantity
 		minFillSize = &q
@@ -183,18 +202,38 @@ func BuildPlaceOrderRequest(
 		SymbolId:    symbolID,
 		Side:        commonpb.Side(sideInt),
 		OrderType:   commonpb.OrderType(otypeInt),
-		Quantity:    quantity,
 		TimeInForce: commonpb.TimeInForce(tifInt),
-		UserUuid:    userUUID,
+		Account:     userUUID,
 		StpMode:     commonpb.StpMode(stpInt),
 		ReduceOnly:  options.ReduceOnly,
 		PostOnly:    options.PostOnly,
 	}
+	if hasQuantity {
+		qtyStr, err := NormalizeDecimal(quantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("quantity: %w", err)
+		}
+		place.Quantity = &qtyStr
+	} else {
+		qnStr, err := NormalizeDecimal(*options.QuoteNotional, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("quote_notional: %w", err)
+		}
+		place.QuoteNotional = &qnStr
+	}
 	if price != nil {
-		place.Price = price
+		pStr, err := NormalizeDecimal(*price, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("price: %w", err)
+		}
+		place.Price = &pStr
 	}
 	if minFillSize != nil {
-		place.MinFillSize = minFillSize
+		mStr, err := NormalizeDecimal(*minFillSize, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("min_fill_size: %w", err)
+		}
+		place.MinFillSize = &mStr
 	}
 	if expiryTime != nil {
 		place.ExpiryTime = expiryTime
@@ -206,87 +245,95 @@ func BuildPlaceOrderRequest(
 		place.PegOffsetBps = options.PegOffsetBps
 	}
 	if options.TriggerPrice != nil {
-		place.TriggerPrice = options.TriggerPrice
+		s, err := NormalizeDecimal(*options.TriggerPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("trigger_price: %w", err)
+		}
+		place.TriggerPrice = &s
 	}
 	if options.TakeProfitPrice != nil {
-		place.TakeProfitPrice = options.TakeProfitPrice
+		s, err := NormalizeDecimal(*options.TakeProfitPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("take_profit_price: %w", err)
+		}
+		place.TakeProfitPrice = &s
 	}
 	if options.StopLossPrice != nil {
-		place.StopLossPrice = options.StopLossPrice
+		s, err := NormalizeDecimal(*options.StopLossPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("stop_loss_price: %w", err)
+		}
+		place.StopLossPrice = &s
+	}
+	if options.SlippageBps != nil {
+		place.SlippageBps = options.SlippageBps
 	}
 
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_Place{Place: place},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(place)
 }
 
-// BuildCancelAll serializes a CancelAllInput wrapped in EdgeSequencerRequest.
+// BuildCancelAll serializes a bare CancelAllInput for the HPKE-sealed body.
 // symbolID nil cancels every market for the user.
 func BuildCancelAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
 	cancelAll := &sequencerpb.CancelAllInput{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	if symbolID != nil {
 		cancelAll.SymbolId = symbolID
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_CancelAll{CancelAll: cancelAll},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(cancelAll)
 }
 
-// BuildCloseAll serializes a CloseAllInput wrapped in EdgeSequencerRequest.
+// BuildCloseAll serializes a bare CloseAllInput for the HPKE-sealed body.
 // symbolID nil closes every market for the user.
 func BuildCloseAll(symbolID *uint64, userUUID, correlationID []byte) ([]byte, error) {
 	closeAll := &sequencerpb.CloseAllInput{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
 	if symbolID != nil {
 		closeAll.SymbolId = symbolID
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_CloseAll{CloseAll: closeAll},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(closeAll)
 }
 
-// BuildReverse serializes a ReverseInput wrapped in EdgeSequencerRequest.
+// BuildReverse serializes a bare ReverseInput for the HPKE-sealed body.
 func BuildReverse(symbolID uint64, userUUID, correlationID []byte) ([]byte, error) {
 	reverse := &sequencerpb.ReverseInput{
 		SymbolId:      symbolID,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_Reverse{Reverse: reverse},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(reverse)
 }
 
-// BuildAmendTpsl serializes an AmendTpslRequest wrapped in EdgeSequencerRequest.
+// BuildAmendTpsl serializes a bare AmendTpslRequest for the HPKE-sealed body.
 func BuildAmendTpsl(
 	userUUID []byte,
 	orderID uint64,
 	correlationID []byte,
-	takeProfitPrice *float64,
-	stopLossPrice *float64,
+	takeProfitPrice *string,
+	stopLossPrice *string,
 	symbolID *uint64,
 	positionSide *Side,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	amend := &sequencerpb.AmendTpslRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		OrderId:       orderID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	if takeProfitPrice != nil {
-		amend.TakeProfitPrice = takeProfitPrice
+	tp, err := formatOptDecimal(takeProfitPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("take_profit_price: %w", err)
 	}
-	if stopLossPrice != nil {
-		amend.StopLossPrice = stopLossPrice
+	amend.TakeProfitPrice = tp
+	sl, err := formatOptDecimal(stopLossPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("stop_loss_price: %w", err)
 	}
+	amend.StopLossPrice = sl
 	if symbolID != nil {
 		amend.SymbolId = symbolID
 	}
@@ -298,13 +345,10 @@ func BuildAmendTpsl(
 		ps := commonpb.Side(s)
 		amend.PositionSide = &ps
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_AmendTpsl{AmendTpsl: amend},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(amend)
 }
 
-// BuildCancelTpsl serializes a CancelTpslRequest wrapped in EdgeSequencerRequest.
+// BuildCancelTpsl serializes a bare CancelTpslRequest for the HPKE-sealed body.
 func BuildCancelTpsl(
 	userUUID []byte,
 	orderID uint64,
@@ -313,7 +357,7 @@ func BuildCancelTpsl(
 	positionSide *Side,
 ) ([]byte, error) {
 	cancel := &sequencerpb.CancelTpslRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		OrderId:       orderID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
@@ -328,113 +372,99 @@ func BuildCancelTpsl(
 		ps := commonpb.Side(s)
 		cancel.PositionSide = &ps
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_CancelTpsl{CancelTpsl: cancel},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(cancel)
 }
 
-// BuildCancelOrderRequest serializes a CancelOrderInput wrapped in EdgeSequencerRequest.
+// BuildCancelOrderRequest serializes a bare CancelOrderInput for the HPKE-sealed body.
 func BuildCancelOrderRequest(orderID uint64, userUUID []byte, symbolID uint64, correlationID []byte) ([]byte, error) {
 	cancel := &sequencerpb.CancelOrderInput{
 		OrderId:       orderID,
 		SymbolId:      symbolID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		UserUuid:      userUUID,
+		Account:       userUUID,
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_Cancel{Cancel: cancel},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(cancel)
 }
 
-// BuildUpdateLeverageRequest serializes an UpdateLeverageRequest wrapped in
-// EdgeSequencerRequest (field 19). Leverage is clamped to max(1, floor(value)).
+// BuildUpdateLeverageRequest serializes a bare UpdateLeverageRequest for the
+// HPKE-sealed body. Leverage is clamped to max(1, floor(value)).
 func BuildUpdateLeverageRequest(userUUID []byte, symbolID uint64, leverage int, correlationID []byte) ([]byte, error) {
 	lev := leverage
 	if lev < 1 {
 		lev = 1
 	}
 	ul := &sequencerpb.UpdateLeverageRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		SymbolId:      symbolID,
 		Leverage:      uint32(lev),
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_UpdateLeverage{UpdateLeverage: ul},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(ul)
 }
 
-// BuildGetOpenOrdersRequest serializes a GetOpenOrdersRequest wrapped in
-// EdgeSequencerRequest.
+// BuildGetOpenOrdersRequest serializes a bare GetOpenOrdersRequest for the
+// HPKE-sealed body.
 func BuildGetOpenOrdersRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetOpenOrdersRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_GetOpenOrders{GetOpenOrders: inner},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(inner)
 }
 
-// BuildGetPositionsRequest serializes a GetPositionsRequest wrapped in
-// EdgeSequencerRequest.
+// BuildGetPositionsRequest serializes a bare GetPositionsRequest for the
+// HPKE-sealed body.
 func BuildGetPositionsRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetPositionsRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_GetPositions{GetPositions: inner},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(inner)
 }
 
-// BuildGetAccountRequest serializes a GetAccountRequest wrapped in
-// EdgeSequencerRequest.
+// BuildGetAccountRequest serializes a bare GetAccountRequest for the
+// HPKE-sealed body.
 func BuildGetAccountRequest(userUUID, correlationID []byte) ([]byte, error) {
 	inner := &sequencerpb.GetAccountRequest{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_GetAccount{GetAccount: inner},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(inner)
 }
 
-// BuildModifyOrderRequest serializes a ModifyOrderInput wrapped in EdgeSequencerRequest.
+// BuildModifyOrderRequest serializes a bare ModifyOrderInput for the HPKE-sealed body.
 func BuildModifyOrderRequest(
 	orderID uint64,
 	userUUID []byte,
 	symbolID uint64,
-	newPrice *float64,
-	newQuantity *float64,
-	newTriggerPrice *float64,
+	newPrice *string,
+	newQuantity *string,
+	newTriggerPrice *string,
 	correlationID []byte,
+	decimals InstrumentDecimals,
 ) ([]byte, error) {
 	modify := &sequencerpb.ModifyOrderInput{
 		OrderId:       orderID,
 		SymbolId:      symbolID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
-		UserUuid:      userUUID,
+		Account:       userUUID,
 	}
-	if newPrice != nil {
-		modify.NewPrice = newPrice
+	np, err := formatOptDecimal(newPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_price: %w", err)
 	}
-	if newQuantity != nil {
-		modify.NewQuantity = newQuantity
+	modify.NewPrice = np
+	nq, err := formatOptDecimal(newQuantity, decimals.QuantityDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_quantity: %w", err)
 	}
-	if newTriggerPrice != nil {
-		modify.NewTriggerPrice = newTriggerPrice
+	modify.NewQuantity = nq
+	nt, err := formatOptDecimal(newTriggerPrice, decimals.PriceDecimals)
+	if err != nil {
+		return nil, fmt.Errorf("new_trigger_price: %w", err)
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_Modify{Modify: modify},
-	}
-	return proto.Marshal(req)
+	modify.NewTriggerPrice = nt
+	return proto.Marshal(modify)
 }
 
 func newLegCorrelationID() []byte {
@@ -448,13 +478,13 @@ func newLegCorrelationID() []byte {
 // client-side before reaching the wire.
 const maxBatchLegs = 20
 
-// BuildMassQuoteRequest serializes a MassQuoteInput (bulk cancel-replace)
-// wrapped in EdgeSequencerRequest. Each leg becomes its own order and carries a
+// BuildMassQuoteRequest serializes a bare MassQuoteInput (bulk cancel-replace)
+// for the HPKE-sealed body. Each leg becomes its own order and carries a
 // unique 16-byte correlation id (the wire requires exactly 16 bytes per leg).
 // postOnly is the batch-level post-only flag: nil defaults to true on the wire;
 // false enables the relaxed path where a crossing leg takes liquidity up to its
 // limit and rests the remainder instead of being rejected.
-func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool) ([]byte, error) {
+func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLegInput, correlationID []byte, postOnly *bool, decimals InstrumentDecimals) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("mass quote requires at least one leg")
 	}
@@ -482,11 +512,19 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 		if leg.CancelOrderID != nil {
 			cancelID = *leg.CancelOrderID
 		}
+		priceStr, err := NormalizeDecimal(leg.Price, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("mass quote leg %d price: %w", i, err)
+		}
+		qtyStr, err := NormalizeDecimal(leg.Quantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("mass quote leg %d quantity: %w", i, err)
+		}
 		pbLeg := &sequencerpb.MassQuoteLeg{
 			CancelOrderId: cancelID,
 			Side:          commonpb.Side(sideInt),
-			Price:         leg.Price,
-			Quantity:      leg.Quantity,
+			Price:         priceStr,
+			Quantity:      qtyStr,
 			TimeInForce:   commonpb.TimeInForce(tifInt),
 			CorrelationId: newLegCorrelationID(),
 		}
@@ -502,18 +540,15 @@ func BuildMassQuoteRequest(symbolID uint64, userUUID []byte, legs []MassQuoteLeg
 	mq := &sequencerpb.MassQuoteInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 		PostOnly:      &postOnlyVal,
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_MassQuote{MassQuote: mq},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(mq)
 }
 
-// BuildBatchCancelRequest serializes a BatchCancelInput (cancel up to 20 resting
-// orders on one symbol) wrapped in EdgeSequencerRequest.
+// BuildBatchCancelRequest serializes a bare BatchCancelInput (cancel up to 20
+// resting orders on one symbol) for the HPKE-sealed body.
 func BuildBatchCancelRequest(symbolID uint64, userUUID []byte, orderIDs []uint64, correlationID []byte) ([]byte, error) {
 	if len(orderIDs) == 0 {
 		return nil, fmt.Errorf("batch cancel requires at least one order id")
@@ -524,19 +559,16 @@ func BuildBatchCancelRequest(symbolID uint64, userUUID []byte, orderIDs []uint64
 	bc := &sequencerpb.BatchCancelInput{
 		SymbolId:      symbolID,
 		OrderIds:      orderIDs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_BatchCancel{BatchCancel: bc},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(bc)
 }
 
-// BuildBatchModifyRequest serializes a BatchModifyInput (post-only amend up to
-// 20 resting orders on one symbol) wrapped in EdgeSequencerRequest. Each leg
+// BuildBatchModifyRequest serializes a bare BatchModifyInput (post-only amend
+// up to 20 resting orders on one symbol) for the HPKE-sealed body. Each leg
 // carries a unique 16-byte correlation id.
-func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModifyLegInput, correlationID []byte) ([]byte, error) {
+func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModifyLegInput, correlationID []byte, decimals InstrumentDecimals) ([]byte, error) {
 	if len(legs) == 0 {
 		return nil, fmt.Errorf("batch modify requires at least one leg")
 	}
@@ -549,29 +581,30 @@ func BuildBatchModifyRequest(symbolID uint64, userUUID []byte, legs []BatchModif
 		}
 	}
 	pbLegs := make([]*sequencerpb.BatchModifyLeg, 0, len(legs))
-	for _, leg := range legs {
+	for i, leg := range legs {
 		pbLeg := &sequencerpb.BatchModifyLeg{
 			OrderId:       leg.OrderID,
 			CorrelationId: newLegCorrelationID(),
 		}
-		if leg.NewPrice != nil {
-			pbLeg.NewPrice = leg.NewPrice
+		np, err := formatOptDecimal(leg.NewPrice, decimals.PriceDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("batch modify leg %d new_price: %w", i, err)
 		}
-		if leg.NewQuantity != nil {
-			pbLeg.NewQuantity = leg.NewQuantity
+		pbLeg.NewPrice = np
+		nq, err := formatOptDecimal(leg.NewQuantity, decimals.QuantityDecimals)
+		if err != nil {
+			return nil, fmt.Errorf("batch modify leg %d new_quantity: %w", i, err)
 		}
+		pbLeg.NewQuantity = nq
 		pbLegs = append(pbLegs, pbLeg)
 	}
 	bm := &sequencerpb.BatchModifyInput{
 		SymbolId:      symbolID,
 		Legs:          pbLegs,
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		CorrelationId: correlationIDBodyBytes(correlationID),
 	}
-	req := &sequencerpb.EdgeSequencerRequest{
-		Inner: &sequencerpb.EdgeSequencerRequest_BatchModify{BatchModify: bm},
-	}
-	return proto.Marshal(req)
+	return proto.Marshal(bm)
 }
 
 // BuildOrderHeaderAAD serializes an OrderHeader for use as AES-GCM AAD.
@@ -586,7 +619,7 @@ func BuildOrderHeaderAADWithConn(userUUID []byte, symbolID uint64, requestType s
 		return nil, fmt.Errorf("unknown request type: %q", requestType)
 	}
 	hdr := &edgepb.OrderHeader{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		SymbolId:      symbolID,
 		RequestType:   commonpb.RequestType(reqInt),
 		Nonce:         nonce,
@@ -609,7 +642,7 @@ func BuildResponseHeaderAADWithConn(userUUID []byte, messageType string, bodyLen
 		return nil, fmt.Errorf("unknown response message type: %q", messageType)
 	}
 	hdr := &edgepb.ResponseHeader{
-		UserUuid:      userUUID,
+		Account:       userUUID,
 		MessageType:   commonpb.ResponseMessageType(msgInt),
 		BodyLength:    bodyLength,
 		Nonce:         nonce,
@@ -940,11 +973,11 @@ func ParseAccountMarginUpdate(msg *sequencerpb.AccountMarginUpdate) *AccountMarg
 		return &AccountMarginUpdate{}
 	}
 	out := &AccountMarginUpdate{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		OwnerAccount:    accountBytesToString(msg.Account),
 		ServerTimestamp: msg.ServerTimestamp,
 		CorrelationID:   correlationIDToUint64(msg.CorrelationId),
 	}
-	if a := msg.Account; a != nil {
+	if a := msg.Summary; a != nil {
 		out.Account = &AccountMarginSummary{
 			TotalCollateral:     a.TotalCollateral,
 			PositionMargin:      a.PositionMargin,
@@ -1315,7 +1348,7 @@ func ParseOrderUpdate(data []byte) (*OrderUpdate, error) {
 
 	out := &OrderUpdate{
 		OrderID:       fmt.Sprintf("%d", msg.OrderId),
-		UserUUID:      uuidBytesToString(msg.UserUuid),
+		Account:       accountBytesToString(msg.Account),
 		SymbolID:      int64(msg.SymbolId),
 		Side:          side,
 		Status:        status,
@@ -1380,16 +1413,15 @@ func parsePositionRow(row *sequencerpb.PositionRow) PositionRow {
 }
 
 // ParsePositionsSnapshot is exported because it consumes an already-decoded
-// PositionsSnapshot proto (from a SequencerToEdgeMessage oneof). Callers that
-// have raw bytes should use ParseSequencerToEdgeMessage and pattern-match the
-// returned variant.
+// PositionsSnapshot proto. Callers that have raw bytes should use
+// ParseSequencerToEdgeMessage(data, "positions_snapshot").
 func ParsePositionsSnapshot(msg *sequencerpb.PositionsSnapshot) *PositionsSnapshot {
 	rows := make([]PositionRow, len(msg.Rows))
 	for i, r := range msg.Rows {
 		rows[i] = parsePositionRow(r)
 	}
 	out := &PositionsSnapshot{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		Account:         accountBytesToString(msg.Account),
 		Rows:            rows,
 		ServerTimestamp: msg.ServerTimestamp,
 		Source:          parsePositionsSnapshotSource(msg.Source),
@@ -1411,35 +1443,31 @@ func ParseLeverageSettings(msg *sequencerpb.LeverageSettings) *LeverageSettings 
 		}
 	}
 	return &LeverageSettings{
-		UserUUID:        uuidBytesToString(msg.UserUuid),
+		Account:         accountBytesToString(msg.Account),
 		Settings:        settings,
 		ServerTimestamp: msg.ServerTimestamp,
 	}
 }
 
-// ParseSequencerToEdgeMessage is the umbrella push-frame parser. Decodes a
-// SequencerToEdgeMessage and returns the appropriate public type based on the
-// inner oneof variant. Unknown variants become *UnknownSequencerPush.
-func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
-	var msg sequencerpb.SequencerToEdgeMessage
-	if err := proto.Unmarshal(data, &msg); err != nil {
-		return nil, err
-	}
-
-	switch inner := msg.Inner.(type) {
-	case *sequencerpb.SequencerToEdgeMessage_OrderUpdate:
-		// We re-serialize the inner and feed it back through the byte-level
-		// parser to keep one canonical decode path. This is a micro-cost on
-		// the order of a few hundred bytes per push.
-		b, err := proto.Marshal(inner.OrderUpdate)
-		if err != nil {
+// ParseSequencerToEdgeMessage is the umbrella push-frame parser. Decodes the
+// bare inner sequencer protobuf selected by message_type (the ResponseHeader
+// / encrypted_push envelope field). Unknown message types become
+// *UnknownSequencerPush.
+func ParseSequencerToEdgeMessage(data []byte, messageType string) (SequencerPush, error) {
+	switch strings.ReplaceAll(messageType, "-", "_") {
+	case "order_update":
+		return ParseOrderUpdate(data)
+	case "positions_snapshot":
+		var s sequencerpb.PositionsSnapshot
+		if err := proto.Unmarshal(data, &s); err != nil {
 			return nil, err
 		}
-		return ParseOrderUpdate(b)
-	case *sequencerpb.SequencerToEdgeMessage_PositionsSnapshot:
-		return ParsePositionsSnapshot(inner.PositionsSnapshot), nil
-	case *sequencerpb.SequencerToEdgeMessage_HealthReport:
-		h := inner.HealthReport
+		return ParsePositionsSnapshot(&s), nil
+	case "system_health":
+		var h healthpb.HealthReport
+		if err := proto.Unmarshal(data, &h); err != nil {
+			return nil, err
+		}
 		return &SystemHealthUpdate{
 			ComponentID:    h.ComponentId,
 			State:          int32(h.State),
@@ -1449,30 +1477,38 @@ func ParseSequencerToEdgeMessage(data []byte) (SequencerPush, error) {
 			Sequence:       h.Sequence,
 			SchemaVersion:  h.SchemaVersion,
 		}, nil
-	case *sequencerpb.SequencerToEdgeMessage_FundingRateUpdate:
-		f := inner.FundingRateUpdate
+	case "funding_rate_update", "funding_rate":
+		var f sequencerpb.FundingRateUpdateMessage
+		if err := proto.Unmarshal(data, &f); err != nil {
+			return nil, err
+		}
 		return &FundingRateUpdate{
 			SymbolID:        int64(f.SymbolId),
 			FundingRate:     f.FundingRate,
 			Timestamp:       f.Timestamp,
 			LastFundingRate: f.LastFundingRate,
 		}, nil
-	case *sequencerpb.SequencerToEdgeMessage_BalanceUpdate:
-		b := inner.BalanceUpdate
+	case "balance_update":
+		var b sequencerpb.BalanceUpdateMessage
+		if err := proto.Unmarshal(data, &b); err != nil {
+			return nil, err
+		}
 		return &BalanceUpdate{
-			UserUUID:          uuidBytesToString(b.UserUuid),
+			Account:           accountBytesToString(b.Account),
 			BalanceRaw:        b.BalanceRaw,
 			Timestamp:         b.Timestamp,
 			Balance:           b.Balance,
 			SignedBalance8dp:  b.SignedBalance_8Dp,
 			FreeCollateral8dp: b.FreeCollateral_8Dp,
 		}, nil
-	case *sequencerpb.SequencerToEdgeMessage_LeverageSettings:
-		return ParseLeverageSettings(inner.LeverageSettings), nil
+	case "leverage_settings":
+		var ls sequencerpb.LeverageSettings
+		if err := proto.Unmarshal(data, &ls); err != nil {
+			return nil, err
+		}
+		return ParseLeverageSettings(&ls), nil
 	default:
-		// New variants (OrderHistoryInsert, OpenInterestUpdate,
-		// BalanceAndPosition, future additions) fall through here.
-		return &UnknownSequencerPush{OneofField: fmt.Sprintf("%T", msg.Inner)}, nil
+		return &UnknownSequencerPush{OneofField: messageType}, nil
 	}
 }
 
