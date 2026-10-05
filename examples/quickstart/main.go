@@ -129,12 +129,12 @@ func main() {
 	// Allow the resting order to settle before cancel (avoids CANCEL_TOO_SOON).
 	time.Sleep(500 * time.Millisecond)
 
-	cancelAck, err := client.CancelAllOrders(ctx, symbol)
+	cancelAck, err := client.CancelOrder(ctx, ack.OrderID, symbol)
 	if err != nil {
-		envloader.PrintOrderError("CancelAllOrders", err)
+		envloader.PrintOrderError("CancelOrder", err)
 		os.Exit(1)
 	}
-	fmt.Printf("cancel_all OK -- count=%d ids=%v\n", cancelAck.Count, cancelAck.OrderIDs)
+	fmt.Printf("cancel OK -- order_id=%s\n", cancelAck.OrderID)
 
 	_ = cancelAck
 }

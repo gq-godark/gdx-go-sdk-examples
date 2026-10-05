@@ -203,25 +203,8 @@ func main() {
 		drainOrderUpdates(client, "after MODIFY")
 	}
 
-	// Market IOC with explicit walk cap: 50 bps = 0.5% of mark (UI default).
-	// Omit SlippageBps → venue max (localnet 5%).
-	fmt.Println("Placing market IOC BUY qty=0.01 with SlippageBps=50 (0.5% walk)...")
-	slippageBps := uint32(50)
-	if mktAck, mErr := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
-		Symbol:      symbol,
-		Side:        godark.SideBuy,
-		OrderType:   godark.OrderTypeMarket,
-		Quantity:    "0.01",
-		TimeInForce: godark.TimeInForceIOC,
-		Options:     godark.PlaceOrderOptions{SlippageBps: &slippageBps},
-	}); mErr != nil {
-		envloader.PrintOrderError("Market BUY rejected (continuing)", mErr)
-	} else {
-		fmt.Printf("MARKET BUY placed: order_id=%s\n", mktAck.OrderID)
-	}
-
-	time.Sleep(1 * time.Second)
-	drainOrderUpdates(client, "after MARKET BUY")
+	// A market IOC can fill and leave a position. This sample does not send one.
+	fmt.Println("Skipping market IOC so the sample does not open a position.")
 
 	// Place + immediately cancel a SELL.
 	sellPx := dec(math.Round(mark*1.03*10) / 10)
@@ -295,11 +278,14 @@ func main() {
 	drainOrderUpdates(client, "after MASS QUOTE")
 
 	if len(restingIDs) > 0 {
-		fmt.Println("cancel_all_orders (cleanup ladder)...")
-		if ca, caErr := client.CancelAllOrders(ctx, symbol); caErr != nil {
-			envloader.PrintOrderError("cancel_all rejected", caErr)
-		} else {
-			fmt.Printf("  cancel_all: count=%d ids=%v\n", ca.Count, ca.OrderIDs)
+		fmt.Printf("Cancelling %d ladder order(s) by id...\n", len(restingIDs))
+		for _, id := range restingIDs {
+			oid := strconv.FormatUint(id, 10)
+			if ca, caErr := client.CancelOrder(ctx, oid, symbol); caErr != nil {
+				envloader.PrintOrderError("cancel "+oid+" rejected", caErr)
+			} else {
+				fmt.Printf("  cancel order_id=%s\n", ca.OrderID)
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 		drainOrderUpdates(client, "after CANCEL ALL")
@@ -328,12 +314,12 @@ func main() {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// post_only=false (relaxed): the crossing leg takes liquidity up to its
-	// limit and rests the remainder; taker fills are reported per leg as FillCount.
+	// post_only=false still prices below the mark so the leg rests instead of filling.
 	postOnlyFalse := false
-	fmt.Println("Mass-quoting a crossing BUY with post_only=false (expect filled, fills>0)...")
+	restPx := dec(base * 0.95)
+	fmt.Printf("Mass-quoting a resting BUY @ %s with post_only=false (cancelled by id)...\n", restPx)
 	if mq, mqErr := client.MassQuote(ctx, symbol,
-		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: dec(crossPx), Quantity: "0.003"}},
+		[]godark.MassQuoteLegInput{{Side: godark.SideBuy, Price: restPx, Quantity: "0.003"}},
 		&postOnlyFalse); mqErr != nil {
 		envloader.PrintOrderError("post_only=false mass quote rejected", mqErr)
 	} else {
