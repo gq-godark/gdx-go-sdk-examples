@@ -69,32 +69,25 @@ func main() {
 	}
 	defer func() { _ = client.Disconnect(ctx) }()
 
-	me, err := client.GetMe(ctx)
+	positions, err := client.GetPositions(ctx)
 	if err != nil {
-		fmt.Printf("GetMe skipped: %v\n", err)
-	} else {
-		fmt.Printf("me: id=%s wallet=%s tier=%s\n", me.ID, me.WalletAddress, me.Tier)
+		log.Fatalf("GetPositions: %v", err)
 	}
-
-	lev, err := client.GetLeverage(ctx)
+	orders, err := client.GetOpenOrders(ctx)
 	if err != nil {
-		fmt.Printf("GetLeverage skipped: %v\n", err)
-	} else {
-		fmt.Printf("leverage settings: %d entries\n", len(lev.Settings))
-		for i, row := range lev.Settings {
-			if i >= 5 {
-				break
-			}
-			fmt.Printf("  symbol_id=%d leverage=%d\n", row.SymbolID, row.Leverage)
-		}
+		log.Fatalf("GetOpenOrders: %v", err)
 	}
-
-	if bal, err := client.GetMyBalance(ctx); err != nil {
-		fmt.Printf("GetMyBalance skipped: %v\n", err)
-	} else {
-		fmt.Printf("balance: shielded_raw=%d wallet_ui=%.6f\n",
-			bal.ShieldedBalanceRaw, bal.WalletUSDTUI)
+	account, err := client.GetAccount(ctx)
+	if err != nil {
+		log.Fatalf("GetAccount: %v", err)
 	}
+	fmt.Printf("positions: %d rows\n", len(positions.Rows))
+	fmt.Printf("open_orders: %d rows\n", len(orders.Rows))
+	collateral := "?"
+	if account.Account != nil {
+		collateral = account.Account.TotalCollateral
+	}
+	fmt.Printf("account total_collateral=%s\n", collateral)
 
 	fmt.Println("REST reads succeeded.")
 	fmt.Println("For REST trading (place/modify/cancel), see full_trader_rest.")
