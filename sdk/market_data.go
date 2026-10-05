@@ -281,10 +281,10 @@ func NewMarketDataClient(cfg MarketDataConfig) *MarketDataClient {
 		bufSize:              bufSize,
 		disableAutoReconnect: cfg.DisableAutoReconnect,
 		callbacks:            make(map[string][]func(MarketDataMessage)),
-		orderbookCh: make(chan MarketDataMessage, bufSize),
-		tradesCh:    make(chan MarketDataMessage, bufSize),
-		rawCh:       make(chan MarketDataMessage, bufSize),
-		desired:     make(map[string]struct{}),
+		orderbookCh:          make(chan MarketDataMessage, bufSize),
+		tradesCh:             make(chan MarketDataMessage, bufSize),
+		rawCh:                make(chan MarketDataMessage, bufSize),
+		desired:              make(map[string]struct{}),
 	}
 }
 
@@ -858,7 +858,7 @@ func (m *MarketDataClient) reconnectLoop() {
 			return
 		}
 
-		if delay := reconnectBackoff(attempt); delay > 0 {
+		if delay := currentReconnectBackoff(attempt); delay > 0 {
 			time.Sleep(delay)
 		}
 		attempt++
