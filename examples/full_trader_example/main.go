@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
@@ -68,7 +69,8 @@ const btcSymbolID = 1
 // "not seen yet" (fall back to GDX_BASE).
 var lastBtcMark float64
 
-var leverageCount int
+var leverageCount atomic.Int64
+var leverageNotes = make(chan string, 32)
 
 func main() {
 	envloader.LoadDotenv()
@@ -125,7 +127,7 @@ func main() {
 	}
 
 	client.OnLeverageSettings(func(ls *godark.LeverageSettings) {
-		leverageCount++
+		leverageCount.Add(1)
 		parts := make([]string, 0, 5)
 		for i, row := range ls.Settings {
 			if i >= 5 {
@@ -137,7 +139,11 @@ func main() {
 		if len(ls.Settings) > 5 {
 			suffix = "..."
 		}
-		fmt.Printf("LEVERAGE settings=[%s%s]\n", strings.Join(parts, ", "), suffix)
+		note := fmt.Sprintf("LEVERAGE settings=[%s%s]", strings.Join(parts, ", "), suffix)
+		select {
+		case leverageNotes <- note:
+		default:
+		}
 	})
 
 	if err := client.Connect(ctx); err != nil {
@@ -151,6 +157,8 @@ func main() {
 	fmt.Printf("WS authenticated as account=%s  (session encrypted)\n", client.Account())
 
 	if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
+		_ = client.Disconnect()
+		fmt.Println("Disconnected cleanly")
 		log.Fatalf("Subscribe failed: %v", err)
 	}
 	fmt.Println("Subscribed to order + position updates")
@@ -372,10 +380,19 @@ func main() {
 	fundingCount := drainFunding(client)
 	settleCount := drainSettlement(client)
 
+	for {
+		select {
+		case note := <-leverageNotes:
+			fmt.Println(note)
+		default:
+			goto leverageDrained
+		}
+	}
+leverageDrained:
 	fmt.Println(sep)
 	fmt.Println("  Session complete")
 	fmt.Printf("  Pushes: snapshots=%d  health=%d  balance=%d  margin=%d  funding=%d  settle=%d  leverage=%d\n",
-		snapCount, healthCount, balanceCount, marginCount, fundingCount, settleCount, leverageCount)
+		snapCount, healthCount, balanceCount, marginCount, fundingCount, settleCount, leverageCount.Load())
 	fmt.Println(sep)
 }
 
