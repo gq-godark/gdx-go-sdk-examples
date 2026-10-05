@@ -124,28 +124,32 @@ _ = md.SubscribePublicChannel(ctx, "funding_rate", nil)
 `GodarkClient`. Their request structs:
 
 ```go
+sellPx := markPlus500   // decimal string; post-only limit at least 500 above the live mark
+newPrice := markPlus501 // still at least 500 from the live mark
 ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
     Symbol:      "BTC-USDC-PERP",
-    Side:        godark.SideBuy,                // SideBuy | SideSell
-    OrderType:   godark.OrderTypeLimit,         // OrderTypeMarket | OrderTypeLimit
-    Quantity:    "0.1",
-    Price:       "67500",                       // required for LIMIT (decimal string)
+    Side:        godark.SideSell,               // SideBuy | SideSell
+    OrderType:   godark.OrderTypeLimit,
+    Quantity:    "0.001",
+    Price:       sellPx,                        // post-only limit, at least mark+500
     TimeInForce: godark.TimeInForceGTC,
+    Options:     godark.PlaceOrderOptions{PostOnly: true},
 })
 // ack.OrderID -- decimal string, the assigned sequencer order id
 // ack.Sequence -- decimal string, the sequencer sequence number
 // ack.Success  -- always true on a non-error return
 
+// Wait at least a second, then cancel this order id.
 cancelAck, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
 
-newPrice := "68000"
+// newPrice stays a post-only limit at least 500 from the live mark.
 modAck, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP",
     &newPrice, /*newQuantity*/ nil, /*newTriggerPrice*/ nil)
 ```
 
 **Rule:** prices and sizes on place/modify/mass-quote/batch-modify/TP-SL
 (including `QuoteNotional`, min fill, and trigger) are decimal `string` /
-`*string` only — not `float64` / int. Pass literals (`"67500"`, `"0.1"`) or
+`*string` only — not `float64` / int. Pass literals (`"0.001"`) or
 format locally; the SDK has no float→string helper on the trading path.
 `PlaceOrderRequest.Options` (`PlaceOrderOptions`) includes `ReduceOnly`,
 `PostOnly`, `StpMode`, `PegOffsetBps`, `TriggerPrice`, `TakeProfitPrice`,

@@ -13,7 +13,7 @@ the integrator-facing copy of these instructions.
 ```text
 gdx-go-sdk-examples/
 ├── go.mod                                module github.com/gq-godark/gdx-go-sdk-examples
-├── go.sum                                with `replace godark => ./sdk`
+├── go.sum                                with `replace github.com/gq-godark/gdx-go-sdk => ./sdk`
 ├── README.md                             (this file)
 ├── SDK_REFERENCE.md                      maintainer view of the public surface
 ├── .env.example
