@@ -40,6 +40,7 @@ func (*MarginAlert) isSequencerPush()          {}
 func (*FundingRateUpdate) isSequencerPush()    {}
 func (*SettlementUpdate) isSequencerPush()     {}
 func (*LeverageSettings) isSequencerPush()     {}
+func (*AccountMarginUpdate) isSequencerPush()  {}
 func (*UnknownSequencerPush) isSequencerPush() {}
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1508,12 @@ func ParseSequencerToEdgeMessage(data []byte, messageType string) (SequencerPush
 			return nil, err
 		}
 		return ParseLeverageSettings(&ls), nil
+	case "account_margin_update", "account_update":
+		var margin sequencerpb.AccountMarginUpdate
+		if err := proto.Unmarshal(data, &margin); err != nil {
+			return nil, err
+		}
+		return ParseAccountMarginUpdate(&margin), nil
 	default:
 		return &UnknownSequencerPush{OneofField: messageType}, nil
 	}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -246,6 +247,7 @@ type GodarkClient struct {
 	systemHealthQueue       chan *SystemHealthUpdate
 	balanceQueue            chan *BalanceUpdate
 	marginAlertQueue        chan *MarginAlert
+	accountMarginQueue      chan *AccountMarginUpdate
 	fundingRateQueue        chan *FundingRateUpdate
 	settlementQueue         chan *SettlementUpdate
 	leverageSettingsQueue   chan *LeverageSettings
@@ -259,6 +261,7 @@ type GodarkClient struct {
 	healthCallbacks             []func(*SystemHealthUpdate)
 	balanceCallbacks            []func(*BalanceUpdate)
 	marginCallbacks             []func(*MarginAlert)
+	accountMarginCallbacks      []func(*AccountMarginUpdate)
 	fundingCallbacks            []func(*FundingRateUpdate)
 	settlementCBs               []func(*SettlementUpdate)
 	leverageSettingsCallbacks   []func(*LeverageSettings)
@@ -353,6 +356,7 @@ func NewClient(cfg ClientConfig) (*GodarkClient, error) {
 		systemHealthQueue:       make(chan *SystemHealthUpdate, bufSize),
 		balanceQueue:            make(chan *BalanceUpdate, bufSize),
 		marginAlertQueue:        make(chan *MarginAlert, bufSize),
+		accountMarginQueue:      make(chan *AccountMarginUpdate, bufSize),
 		fundingRateQueue:        make(chan *FundingRateUpdate, bufSize),
 		settlementQueue:         make(chan *SettlementUpdate, bufSize),
 		leverageSettingsQueue:   make(chan *LeverageSettings, bufSize),
@@ -381,7 +385,23 @@ func defaultReconnectBackoff(attempt int) time.Duration {
 	return d
 }
 
-var reconnectBackoff = defaultReconnectBackoff
+type reconnectBackoffFunc func(attempt int) time.Duration
+
+// reconnectBackoff is process-wide so tests can shorten delays. atomic.Value
+// keeps a reconnect goroutine from racing a test that swaps the function.
+var reconnectBackoff atomic.Value
+
+func init() {
+	reconnectBackoff.Store(reconnectBackoffFunc(defaultReconnectBackoff))
+}
+
+func currentReconnectBackoff(attempt int) time.Duration {
+	fn, _ := reconnectBackoff.Load().(reconnectBackoffFunc)
+	if fn == nil {
+		return defaultReconnectBackoff(attempt)
+	}
+	return fn(attempt)
+}
 
 // UserUUID returns the authenticated user's canonical UUID. Empty until
 // Connect has completed successfully. Current account-based edges do not
@@ -964,6 +984,11 @@ func (c *GodarkClient) BalanceUpdates() <-chan *BalanceUpdate { return c.balance
 // MarginAlerts emits margin-tier transitions.
 func (c *GodarkClient) MarginAlerts() <-chan *MarginAlert { return c.marginAlertQueue }
 
+// AccountMargins emits encrypted account_margin_update pushes.
+// This is the same buffer OnAccountMargin delivers. Drain it, or the capped
+// channel drops the oldest unread update once it is full.
+func (c *GodarkClient) AccountMargins() <-chan *AccountMarginUpdate { return c.accountMarginQueue }
+
 // FundingRateUpdates emits per-symbol funding-rate ticks.
 func (c *GodarkClient) FundingRateUpdates() <-chan *FundingRateUpdate {
 	return c.fundingRateQueue
@@ -1020,9 +1045,18 @@ func (c *GodarkClient) OnBalanceUpdate(cb func(*BalanceUpdate)) {
 }
 
 // OnMarginAlert registers a callback for margin-tier transitions.
+// The current edge does not emit margin_alert. Account margin arrives as
+// account_margin_update; use OnAccountMargin.
 func (c *GodarkClient) OnMarginAlert(cb func(*MarginAlert)) {
 	c.cbMu.Lock()
 	c.marginCallbacks = append(c.marginCallbacks, cb)
+	c.cbMu.Unlock()
+}
+
+// OnAccountMargin registers a callback for encrypted account_margin_update pushes.
+func (c *GodarkClient) OnAccountMargin(cb func(*AccountMarginUpdate)) {
+	c.cbMu.Lock()
+	c.accountMarginCallbacks = append(c.accountMarginCallbacks, cb)
 	c.cbMu.Unlock()
 }
 
@@ -1034,6 +1068,7 @@ func (c *GodarkClient) OnFundingRateUpdate(cb func(*FundingRateUpdate)) {
 }
 
 // OnSettlementUpdate registers a callback for settlement-batch lifecycle.
+// The current edge does not emit settlement_update.
 func (c *GodarkClient) OnSettlementUpdate(cb func(*SettlementUpdate)) {
 	c.cbMu.Lock()
 	c.settlementCBs = append(c.settlementCBs, cb)
@@ -1198,7 +1233,7 @@ func (c *GodarkClient) reconnectLoop() {
 			return
 		}
 
-		if delay := reconnectBackoff(attempt); delay > 0 {
+		if delay := currentReconnectBackoff(attempt); delay > 0 {
 			time.Sleep(delay)
 		}
 		attempt++
@@ -1908,6 +1943,12 @@ func (c *GodarkClient) dispatchSequencerPush(parsed SequencerPush) {
 		for _, cb := range c.snapshotCallbacks {
 			safeCallSnap(cb, v)
 		}
+		c.emitPositionRowsAsUpdates(v)
+	case *AccountMarginUpdate:
+		nonBlockingSend(c.accountMarginQueue, v)
+		for _, cb := range c.accountMarginCallbacks {
+			safeCallAccountMargin(cb, v)
+		}
 	case *SystemHealthUpdate:
 		nonBlockingSend(c.systemHealthQueue, v)
 		for _, cb := range c.healthCallbacks {
@@ -2392,6 +2433,37 @@ func safeCallHealth(cb func(*SystemHealthUpdate), v *SystemHealthUpdate) {
 	cb(v)
 }
 func safeCallBalance(cb func(*BalanceUpdate), v *BalanceUpdate) {
+	defer func() { _ = recover() }()
+	cb(v)
+}
+func (c *GodarkClient) emitPositionRowsAsUpdates(snapshot *PositionsSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	for _, row := range snapshot.Rows {
+		update := &PositionUpdate{
+			UserUUID:     snapshot.Account,
+			SymbolID:     row.SymbolID,
+			Side:         row.Side,
+			UpdateType:   PositionUpdateTypeSnapshot,
+			Size:         row.Size,
+			EntryPrice:   row.EntryPrice,
+			PreviousSize: "0",
+			FillPrice:    row.MarkPrice,
+			FillQty:      "0",
+			Timestamp:    snapshot.ServerTimestamp,
+		}
+		if update.FillPrice == "" {
+			update.FillPrice = "0"
+		}
+		nonBlockingSend(c.positionQueue, update)
+		for _, cb := range c.positionCallbacks {
+			safeCallPosition(cb, update)
+		}
+	}
+}
+
+func safeCallAccountMargin(cb func(*AccountMarginUpdate), v *AccountMarginUpdate) {
 	defer func() { _ = recover() }()
 	cb(v)
 }
