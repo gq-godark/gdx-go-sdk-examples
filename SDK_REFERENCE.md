@@ -69,7 +69,7 @@ loading and `OrderError` pretty-printing.
 batch-modify/TP-SL (including `QuoteNotional`, min fill, and trigger) are
 **decimal `string` / `*string` only** — `float64` / int fields and
 `FormatDecimal` are not part of the public trading API. Pass literals such as
-`"68000"` / `"0.01"`, or format locally with `strconv` / `math/big` /
+`"100.5"` / `"0.001"`, or format locally with `strconv` / `math/big` /
 shopspring/decimal; `NormalizeDecimal` validates against instrument
 `price_decimals` / `quantity_decimals`. `SlippageBps` is only for `MARKET`
 and `STOP_MARKET`; omit it (nil) to use the venue max walk cap. `PEG` is
@@ -114,4 +114,4 @@ The PR is annotated with a checklist: review the descriptor diff under
 
 ## RestClient example
 
-`rest_client_example` covers REST auth, `/auth/me`, leverage, balance, and public funding/OI/volume GETs. `full_trader_rest` places, modifies, and cancels over one-shot HPKE REST and reads positions with `GetPositions`. Neither REST path registers a client-order id.
+`rest_client_example` covers REST auth (`POST /api/v1/auth/token`), encrypted position, open-order, and account reads, and public funding/OI/volume GETs. It does not place orders. `full_trader_rest` places, modifies, and cancels one post-only limit (priced from the live mark, at least 500 away) over one-shot HPKE REST and reads positions with `GetPositions`. Neither REST path registers a client-order id.

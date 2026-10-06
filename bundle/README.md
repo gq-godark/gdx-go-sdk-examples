@@ -113,6 +113,7 @@ import (
     "fmt"
     "log"
     "os"
+    "time"
 
     "github.com/gq-godark/gdx-go-sdk"
 )
@@ -155,22 +156,26 @@ func main() {
     defer client.Disconnect()
 
     if err := client.Subscribe(ctx, "orders", "positions"); err != nil {
+        _ = client.Disconnect()
         log.Fatal(err)
     }
 
     ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRequest{
-        Symbol:        "BTC-USDC-PERP",
-        Side:          godark.SideSell,
-        OrderType:     godark.OrderTypeLimit,
-        Price:         "999999",
-        Quantity:      "0.01",
-        ClientOrderID: "demo-coid-1",
+        Symbol:    "BTC-USDC-PERP",
+        Side:      godark.SideSell,
+        OrderType: godark.OrderTypeLimit,
+        Price:     sellPx, // post-only limit at least 500 above the live mark
+        Quantity:  "0.001",
+        Options:   godark.PlaceOrderOptions{PostOnly: true},
     })
     if err != nil {
+        _ = client.Disconnect()
         log.Fatal(err)
     }
 
+    time.Sleep(time.Second)
     if _, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP"); err != nil {
+        _ = client.Disconnect()
         log.Fatal(err)
     }
 }

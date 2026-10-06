@@ -4,10 +4,14 @@
 // ClientOrderID: REST place does not register it. Registration happens only
 // after a successful WebSocket place, and only on HTTP 200.
 //
-//	GODARK_REST_URL=https://api.devnet.godark-dex.com \
+// The limit is a post-only buy at least 500 below the live mark, size 0.001.
+// GODARK_EDGE_URL / GDX_EDGE_URL (or the REST URL aliases) select the host.
+// There is no hardcoded mark and no fallback to the public testnet host when
+// an edge URL is set.
+//
+//	GODARK_EDGE_URL=https://api.devnet.godark-dex.com \
 //	GODARK_API_KEY_ID=... GODARK_API_SECRET=... GODARK_PASSPHRASE=... \
 //	GODARK_ACCOUNT=<Solana base58 account> \
-//	GDX_LIVE_PRICE=78000 \
 //	  go run ./examples/full_trader_rest
 package main
 
@@ -16,64 +20,31 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gq-godark/gdx-go-sdk"
 	"github.com/gq-godark/gdx-go-sdk-examples/examples/internal/envloader"
 )
 
-func livePriceString() string {
-	for _, key := range []string{"GDX_LIVE_PRICE", "GODARK_LIVE_PRICE", "GODARK_E2E_PRICE"} {
-		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-			return v
-		}
-	}
-	return "78000"
-}
-
-func offsetPrice(base string, delta float64) string {
-	v, err := strconv.ParseFloat(base, 64)
-	if err != nil {
-		return base
-	}
-	s := strconv.FormatFloat(v+delta, 'f', 8, 64)
-	s = strings.TrimRight(s, "0")
-	s = strings.TrimRight(s, ".")
-	if s == "" {
-		return "0"
-	}
-	return s
-}
+const (
+	symbol     = "BTC-USDC-PERP"
+	cancelWait = 1200 * time.Millisecond
+)
 
 func main() {
 	envloader.LoadDotenv()
 
-	base := os.Getenv("GODARK_REST_URL")
+	base := envloader.HTTPOrigin(envloader.First(
+		"GODARK_REST_URL", "GDX_REST_URL", "GODARK_EDGE_URL", "GDX_EDGE_URL",
+	))
 	if base == "" {
-		base = os.Getenv("GDX_REST_URL")
-	}
-	if base == "" {
-		base = "https://api.godark-dex.com"
+		log.Fatal("Set GODARK_EDGE_URL or GDX_EDGE_URL (or GODARK_REST_URL / GDX_REST_URL)")
 	}
 
-	keyID := os.Getenv("GODARK_API_KEY_ID")
-	if keyID == "" {
-		keyID = os.Getenv("GDX_API_KEY_ID")
-	}
-	secret := os.Getenv("GODARK_API_SECRET")
-	if secret == "" {
-		secret = os.Getenv("GDX_API_SECRET")
-	}
-	passphrase := os.Getenv("GODARK_PASSPHRASE")
-	if passphrase == "" {
-		passphrase = os.Getenv("GDX_PASSPHRASE")
-	}
-	legacyKey := os.Getenv("GODARK_API_KEY")
-	if legacyKey == "" {
-		legacyKey = os.Getenv("GDX_API_KEY")
-	}
+	keyID := envloader.First("GODARK_API_KEY_ID", "GDX_API_KEY_ID")
+	secret := envloader.First("GODARK_API_SECRET", "GDX_API_SECRET")
+	passphrase := envloader.First("GODARK_PASSPHRASE", "GDX_PASSPHRASE")
+	legacyKey := envloader.First("GODARK_API_KEY", "GDX_API_KEY")
 
 	cfg := godark.RestClientConfig{
 		BaseURL: base,
@@ -98,55 +69,134 @@ func main() {
 	if err := client.Connect(ctx); err != nil {
 		log.Fatal(err)
 	}
-	defer func() { _ = client.Disconnect(ctx) }()
 
+	code := run(ctx, client)
+	if err := client.Disconnect(ctx); err != nil && code == 0 {
+		fmt.Fprintf(os.Stderr, "disconnect: %v\n", err)
+		code = 1
+	}
+	if code != 0 {
+		os.Exit(code)
+	}
+}
+
+func run(ctx context.Context, client *godark.GodarkRestClient) int {
 	fmt.Printf("connected account=%s\n", client.Account())
 
-	open, err := client.GetOpenOrders(ctx)
-	if err != nil {
-		log.Fatal(err)
+	var open *godark.OpenOrdersSnapshot
+	if err := retryRead(func() error {
+		var err error
+		open, err = client.GetOpenOrders(ctx)
+		return err
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "GetOpenOrders: %v\n", err)
+		return 1
 	}
 	fmt.Println("open_orders", len(open.Rows))
 
-	pos, err := client.GetPositions(ctx)
-	if err != nil {
-		log.Fatal(err)
+	var pos *godark.PositionsSnapshot
+	if err := retryRead(func() error {
+		var err error
+		pos, err = client.GetPositions(ctx)
+		return err
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "GetPositions: %v\n", err)
+		return 1
 	}
 	fmt.Println("positions", len(pos.Rows))
 
-	acct, err := client.GetAccount(ctx)
-	if err != nil {
-		log.Fatal(err)
+	var acct *godark.AccountMarginUpdate
+	if err := retryRead(func() error {
+		var err error
+		acct, err = client.GetAccount(ctx)
+		return err
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "GetAccount: %v\n", err)
+		return 1
 	}
 	if acct.Account != nil {
 		fmt.Println("account total_collateral=", acct.Account.TotalCollateral)
 	}
 
-	mark := livePriceString()
-	limitPrice := offsetPrice(mark, -5000)
+	oi, oiErr := client.GetOpenInterest(ctx)
+	if oiErr != nil {
+		oi = nil
+	}
+	mark, err := envloader.ResolveMark(0, oi)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "live mark: %v\n", err)
+		return 1
+	}
+	limitPrice, err := envloader.PostOnlyBuy(mark, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "buy price: %v\n", err)
+		return 1
+	}
+	fmt.Printf("live mark=%.4f  post-only buy=%s qty=%s\n", mark, limitPrice, envloader.DemoQuantity)
+
 	ack, err := client.PlaceOrder(ctx, godark.PlaceOrderRestRequest{
 		PlaceOrderRequest: godark.PlaceOrderRequest{
-			Symbol: "BTC-USDC-PERP", Side: "BUY", OrderType: "LIMIT",
-			Quantity: "0.01", Price: limitPrice,
+			Symbol:    symbol,
+			Side:      godark.SideBuy,
+			OrderType: godark.OrderTypeLimit,
+			Quantity:  envloader.DemoQuantity,
+			Price:     limitPrice,
+			Options:   godark.PlaceOrderOptions{PostOnly: true},
 		},
 	})
 	if err != nil {
-		log.Fatal(err)
+		envloader.PrintOrderError("PlaceOrder", err)
+		return 1
 	}
 	fmt.Println("placed order_id=", ack.OrderID, "success=", ack.Success)
+	placedAt := time.Now()
 
-	time.Sleep(500 * time.Millisecond)
-
-	newPrice := offsetPrice(mark, -5000-64)
-	mod, err := client.ModifyOrder(ctx, ack.OrderID, "BTC-USDC-PERP", &newPrice, nil, nil)
-	if err != nil {
-		log.Fatal(err)
+	if wait := cancelWait - time.Since(placedAt); wait > 0 {
+		time.Sleep(wait)
 	}
-	fmt.Println("modified success=", mod.Success)
-
-	can, err := client.CancelOrder(ctx, ack.OrderID, "BTC-USDC-PERP")
+	newPrice, err := envloader.PostOnlyBuy(mark, 1)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "modify price: %v\n", err)
+		cancelOwn(ctx, client, ack.OrderID, placedAt)
+		return 1
 	}
-	fmt.Println("cancelled success=", can.Success)
+	mod, err := client.ModifyOrder(ctx, ack.OrderID, symbol, &newPrice, nil, nil)
+	if err != nil {
+		envloader.PrintOrderError("ModifyOrder", err)
+		if cerr := cancelOwn(ctx, client, ack.OrderID, placedAt); cerr != nil {
+			envloader.PrintOrderError("CancelOrder", cerr)
+		}
+		return 1
+	}
+	fmt.Println("modified success=", mod.Success, "price=", newPrice)
+
+	if err := cancelOwn(ctx, client, ack.OrderID, placedAt); err != nil {
+		envloader.PrintOrderError("CancelOrder", err)
+		return 1
+	}
+	return 0
+}
+
+func retryRead(fn func() error) error {
+	var err error
+	for i := 0; i < 3; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	return err
+}
+
+func cancelOwn(ctx context.Context, client *godark.GodarkRestClient, orderID string, placedAt time.Time) error {
+	if wait := cancelWait - time.Since(placedAt); wait > 0 {
+		time.Sleep(wait)
+	}
+	can, err := client.CancelOrder(ctx, orderID, symbol)
+	if err != nil {
+		return err
+	}
+	fmt.Println("cancelled success=", can.Success, "order_id=", orderID)
+	return nil
 }
